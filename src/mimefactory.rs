@@ -1125,7 +1125,7 @@ impl MimeFactory {
                             mail_builder::headers::raw::Raw::new("[...]").into(),
                         ));
                     }
-                    "auto-submitted" | "chat-version" | "autocrypt-setup-message" => {
+                    "chat-version" | "autocrypt-setup-message" => {
                         unprotected_headers.push(header.clone());
                     }
                     _ => {
