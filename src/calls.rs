@@ -328,20 +328,19 @@ impl Context {
             return Ok(());
         };
         if !call.is_accepted() && !call.is_ended() {
+            let (msg_id, chat_id) = (call_id, call.msg.chat_id);
             if call.is_incoming() {
                 call.mark_as_canceled(&context).await?;
                 let missed_call_str = stock_str::missed_call(&context).await;
                 call.update_text(&context, &missed_call_str).await?;
+                context.emit_event(EventType::CallMissed { msg_id, chat_id });
             } else {
                 call.mark_as_ended(&context).await?;
                 let canceled_call_str = stock_str::canceled_call(&context).await;
                 call.update_text(&context, &canceled_call_str).await?;
+                context.emit_event(EventType::CallEnded { msg_id, chat_id });
             }
             context.emit_msgs_changed(call.msg.chat_id, call_id);
-            context.emit_event(EventType::CallEnded {
-                msg_id: call.msg.id,
-                chat_id: call.msg.chat_id,
-            });
         }
         Ok(())
     }
@@ -362,7 +361,10 @@ impl Context {
                 if call.is_stale() {
                     let missed_call_str = stock_str::missed_call(self).await;
                     call.update_text(self, &missed_call_str).await?;
-                    self.emit_incoming_msg(call.msg.chat_id, call_id); // notify missed call
+                    // TODO: Don't notify for blocked contacts
+                    let (msg_id, chat_id) = (call_id, call.msg.chat_id);
+                    self.emit_event(EventType::CallMissed { msg_id, chat_id });
+                    self.emit_msgs_changed(chat_id, msg_id);
                 } else {
                     let incoming_call_str =
                         stock_str::incoming_call(self, call.has_video_initially()).await;
@@ -454,16 +456,19 @@ impl Context {
                         return Ok(());
                     }
 
+                    let (msg_id, chat_id) = (call_id, call.msg.chat_id);
                     if !call.is_accepted() {
                         if call.is_incoming() {
                             if from_id == ContactId::SELF {
                                 call.mark_as_ended(self).await?;
                                 let declined_call_str = stock_str::declined_call(self).await;
                                 call.update_text(self, &declined_call_str).await?;
+                                self.emit_event(EventType::CallEnded { msg_id, chat_id });
                             } else {
                                 call.mark_as_canceled(self).await?;
                                 let missed_call_str = stock_str::missed_call(self).await;
                                 call.update_text(self, &missed_call_str).await?;
+                                self.emit_event(EventType::CallMissed { msg_id, chat_id });
                             }
                         } else {
                             // outgoing
@@ -476,17 +481,15 @@ impl Context {
                                 let declined_call_str = stock_str::declined_call(self).await;
                                 call.update_text(self, &declined_call_str).await?;
                             }
+                            self.emit_event(EventType::CallEnded { msg_id, chat_id });
                         }
                     } else {
                         call.mark_as_ended(self).await?;
                         call.update_text_duration(self).await?;
+                        self.emit_event(EventType::CallEnded { msg_id, chat_id });
                     }
 
                     self.emit_msgs_changed(call.msg.chat_id, call_id);
-                    self.emit_event(EventType::CallEnded {
-                        msg_id: call.msg.id,
-                        chat_id: call.msg.chat_id,
-                    });
                 }
                 _ => {}
             }
