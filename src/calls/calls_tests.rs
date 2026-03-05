@@ -436,36 +436,43 @@ async fn test_caller_cancels_call() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_stale_call() -> Result<()> {
     let mut tcm = TestContextManager::new();
-    let alice = &tcm.alice().await;
-    let bob = &tcm.bob().await;
+    for accepted in [false, true] {
+        let alice = &tcm.alice().await;
+        let bob = &tcm.bob().await;
 
-    let alice_chat = alice.create_chat(bob).await;
-    alice
-        .place_outgoing_call(alice_chat.id, PLACE_INFO.to_string(), true)
-        .await?;
-    let sent1 = alice.pop_sent_msg().await;
+        if accepted {
+            bob.create_chat(alice).await;
+        }
+        let alice_chat = alice.create_chat(bob).await;
+        alice
+            .place_outgoing_call(alice_chat.id, PLACE_INFO.to_string(), true)
+            .await?;
+        let sent1 = alice.pop_sent_msg().await;
 
-    SystemTime::shift(Duration::from_secs(3600));
-    let bob_call = bob.recv_msg(&sent1).await;
-    bob.evtracker
-        .get_matching(|evt| matches!(evt, EventType::CallMissed { .. }))
-        .await;
-    let EventType::MsgsChanged { msg_id, chat_id } = bob
-        .evtracker
-        .get_matching(|evt| matches!(evt, EventType::MsgsChanged { .. }))
-        .await
-    else {
-        unreachable!();
-    };
-    assert_eq!(msg_id, bob_call.id);
-    assert_eq!(chat_id, bob_call.chat_id);
-    assert_text(bob, bob_call.id, "Missed call").await?;
-    assert_eq!(call_state(bob, bob_call.id).await?, CallState::Missed);
+        SystemTime::shift(Duration::from_secs(3600));
+        let bob_call = bob.recv_msg(&sent1).await;
+        if accepted {
+            bob.evtracker
+                .get_matching(|evt| matches!(evt, EventType::CallMissed { .. }))
+                .await;
+        }
+        let EventType::MsgsChanged { msg_id, chat_id } = bob
+            .evtracker
+            .get_matching(|evt| matches!(evt, EventType::MsgsChanged { .. } | EventType::CallMissed { .. }))
+            .await
+        else {
+            unreachable!();
+        };
+        assert_eq!(msg_id, bob_call.id);
+        assert_eq!(chat_id, bob_call.chat_id);
+        assert_text(bob, bob_call.id, "Missed call").await?;
+        assert_eq!(call_state(bob, bob_call.id).await?, CallState::Missed);
 
-    // Test that message summary says it is a missed call.
-    let bob_call_msg = Message::load_from_db(bob, bob_call.id).await?;
-    let summary = bob_call_msg.get_summary(bob, None).await?;
-    assert_eq!(summary.text, "🎥 Missed call");
+        // Test that message summary says it is a missed call.
+        let bob_call_msg = Message::load_from_db(bob, bob_call.id).await?;
+        let summary = bob_call_msg.get_summary(bob, None).await?;
+        assert_eq!(summary.text, "🎥 Missed call");
+    }
     Ok(())
 }
 
