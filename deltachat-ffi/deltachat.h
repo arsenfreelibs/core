@@ -7609,6 +7609,12 @@ void dc_event_unref(dc_event_t* event);
 /// "Incoming video call"
 #define DC_STR_INCOMING_VIDEO_CALL 235
 
+/// "You changed the group description."
+#define DC_STR_GROUP_DESCRIPTION_CHANGED_BY_YOU 240
+
+/// "%1$s changed the group description."
+#define DC_STR_GROUP_DESCRIPTION_CHANGED_BY_OTHER 241
+
 /**
  * @}
  */
