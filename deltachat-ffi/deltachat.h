@@ -4667,6 +4667,7 @@ uint32_t        dc_msg_get_info_contact_id    (const dc_msg_t* msg);
 #define         DC_INFO_INVALID_UNENCRYPTED_MAIL  13
 #define         DC_INFO_WEBXDC_INFO_MESSAGE       32
 #define         DC_INFO_CHAT_E2EE                 50
+#define         DC_INFO_GROUP_DESCRIPTION_CHANGED 70
 
 
 /**
