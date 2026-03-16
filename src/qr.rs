@@ -24,8 +24,8 @@ use crate::token;
 use crate::tools::{time, validate_id};
 
 const OPENPGP4FPR_SCHEME: &str = "OPENPGP4FPR:"; // yes: uppercase
-const IDELTACHAT_SCHEME: &str = "https://altchat.me/#";
-const IDELTACHAT_NOSLASH_SCHEME: &str = "https://altchat.me#";
+const IDELTACHAT_SCHEME: &str = "https://alt-chat.me/#";
+const IDELTACHAT_NOSLASH_SCHEME: &str = "https://alt-chat.me#";
 const DCACCOUNT_SCHEME: &str = "DCACCOUNT:";
 pub(super) const DCLOGIN_SCHEME: &str = "DCLOGIN:";
 const TG_SOCKS_SCHEME: &str = "https://t.me/socks";
@@ -644,7 +644,7 @@ fn decode_name(param: &BTreeMap<&str, &str>, key: &str) -> Result<Option<String>
     }
 }
 
-/// scheme: `https://altchat.me[/]#FINGERPRINT&a=ADDR[&OPTIONAL_PARAMS]`
+/// scheme: `https://alt-chat.me[/]#FINGERPRINT&a=ADDR[&OPTIONAL_PARAMS]`
 async fn decode_ideltachat(context: &Context, prefix: &str, qr: &str) -> Result<Qr> {
     let qr = qr.replacen(prefix, OPENPGP4FPR_SCHEME, 1);
     let qr = qr.replacen('&', "#", 1);
