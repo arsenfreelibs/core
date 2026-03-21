@@ -21,6 +21,7 @@ use deltachat::contact::{may_be_valid_addr, Contact, ContactId, Origin};
 use deltachat::context::get_info;
 use deltachat::ephemeral::Timer;
 use deltachat::imex;
+use deltachat::key::{DcKey, load_self_public_key, load_self_secret_key};
 use deltachat::location;
 use deltachat::message::{
     self, delete_msgs_ex, get_existing_msg_ids, get_msg_read_receipt_count, get_msg_read_receipts,
@@ -598,6 +599,20 @@ impl CommandApi {
             passphrase,
         )
         .await
+    }
+
+    /// Returns the ASCII-armored public key for the account, read directly from the DB.
+    async fn get_self_public_key_armored(&self, account_id: u32) -> Result<String> {
+        let ctx = self.get_context(account_id).await?;
+        let key = load_self_public_key(&ctx).await?;
+        Ok(key.to_asc(None))
+    }
+
+    /// Returns the ASCII-armored private key for the account, read directly from the DB.
+    async fn get_self_private_key_armored(&self, account_id: u32) -> Result<String> {
+        let ctx = self.get_context(account_id).await?;
+        let key = load_self_secret_key(&ctx).await?;
+        Ok(key.to_asc(None))
     }
 
     /// Returns the message IDs of all _fresh_ messages of any chat.
