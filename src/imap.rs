@@ -1561,7 +1561,9 @@ impl Session {
             return Ok(());
         };
 
-        if self.can_metadata() && self.can_push() {
+        // XDELTAPUSH capability implies SETMETADATA support for /private/devicetoken
+        // even if the server does not explicitly advertise the METADATA extension.
+        if self.can_push() {
             let old_encrypted_device_token =
                 context.get_config(Config::EncryptedDeviceToken).await?;
 
