@@ -41,16 +41,17 @@ pub struct PushSubscriber {
 /// and public key was extracted with `rsop extract-cert`.
 const NOTIFIERS_PUBLIC_KEY: &str = "-----BEGIN PGP PUBLIC KEY BLOCK-----
 
-xioGZ03cdhsAAAAg6PasQQylEuWAp9N5PXN93rqjZdqOqN3s9RJEU/K8FZzCsAYf
-GwoAAABBBQJnTdx2AhsDAh4JCAsJCAcKDQwLBRUKCQgLAhYCIiEGiJJktnCmEtXa
-qsSIGRJtupMnxycz/yT0xZK9ez+YkmIAAAAAUfgg/sg0sR2mytzADFBpNAaY0Hyu
-aru8ics3eUkeNn2ziL4ZsIMx+4mcM5POvD0PG9LtH8Rz/y9iItD0c2aoRBab7iri
-/gDm6aQuj3xXgtAiXdaN9s+QPxR9gY/zG1t9iXgBzioGZ03cdhkAAAAgwJ0wQFsk
-MGH4jklfK1fFhYoQZMjEFCRBIk+r1S+WaSDClQYYGwgAAAAsBQJnTdx2AhsMIiEG
-iJJktnCmEtXaqsSIGRJtupMnxycz/yT0xZK9ez+YkmIAAAAKCRCIkmS2cKYS1WdP
-EFerccH2BoIPNbrxi6hwvxxy7G1mHg//ofD90fqmeY9xTfKMYl16bqQh4R1PiYd5
-LMc5VqgXHgioqTYKbltlOtWC+HDt/PrymQsN4q/aEmsM
-=5jvt
+mDMEab7mWxYJKwYBBAHaRw8BAQdAio08NeDM7rB3XN/LrDf4txEkliLkBMaspoZ5
+mbk2XmK0CU5vdGlmaWVyc4ivBBMWCgBXFiEE43M8WVSO+jV0BWLegyxrqLUO+NMF
+Amm+5lsbFIAAAAAABAAObWFudTIsMi41KzEuMTIsMCwzAhsjBQsJCAcCAiICBhUK
+CQgLAgQWAgMBAh4HAheAAAoJEIMsa6i1DvjTgu4BAK8ZT2PDg6P7rpLLZjQGTx/X
+TT3gKozKXEtL6qP79NTYAQCUICm5UqvdX0KOOxRJVsqngam2GeNRAOMnfba0OMDE
+C7g4BGm+5lsSCisGAQQBl1UBBQEBB0Bm7lSDBH+Iv1f4fZjep54Apf/QTObJm8pr
+TubBZX3KOAMBCAeIlAQYFgoAPBYhBONzPFlUjvo1dAVi3oMsa6i1DvjTBQJpvuZb
+GxSAAAAAAAQADm1hbnUyLDIuNSsxLjEyLDAsMwIbDAAKCRCDLGuotQ7406ANAQCI
+fRaPrUXzW3M16Qq65g9aRFttSASgDBV6EP7jYFyVNwEAv/8ZgM4wM/N+nQFgvCg0
+PH6CpoER6QdzJ2WxLZdiNQY=
+=+Bga
 -----END PGP PUBLIC KEY BLOCK-----";
 
 /// Pads the token with spaces.
@@ -138,7 +139,7 @@ impl PushSubscriber {
 
         if http::post_string(
             context,
-            "https://notifications.delta.chat/register",
+            "https://notifications.alt-to.online/register",
             format!("{{\"token\":\"{token}\"}}"),
         )
         .await?

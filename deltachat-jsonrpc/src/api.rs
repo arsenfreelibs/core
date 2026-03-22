@@ -615,6 +615,13 @@ impl CommandApi {
         Ok(key.to_asc(None))
     }
 
+    /// Returns the hex fingerprint of own public key, read directly from the DB.
+    async fn get_self_fingerprint_hex(&self, account_id: u32) -> Result<String> {
+        let ctx = self.get_context(account_id).await?;
+        let key = load_self_public_key(&ctx).await?;
+        Ok(key.dc_fingerprint().hex())
+    }
+
     /// Returns the message IDs of all _fresh_ messages of any chat.
     /// Typically used for implementing notification summaries
     /// or badge counters e.g. on the app icon.

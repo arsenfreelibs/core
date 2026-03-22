@@ -32,7 +32,7 @@ pub(crate) struct Capabilities {
     /// True if the server supports XDELTAPUSH capability.
     /// This capability means setting /private/devicetoken IMAP METADATA
     /// on the INBOX results in new mail notifications
-    /// via notifications.delta.chat service.
+    /// via notifications.alt-to.online service.
     /// This is supported by <https://github.com/deltachat/chatmail>
     pub can_push: bool,
 
