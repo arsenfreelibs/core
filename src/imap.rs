@@ -1554,12 +1554,17 @@ impl Session {
     /// Stores device token into /private/devicetoken IMAP METADATA of the Inbox.
     pub(crate) async fn register_token(&mut self, context: &Context) -> Result<()> {
         if context.push_subscribed.load(Ordering::Relaxed) {
+            info!(context, "register_token: already subscribed, skipping.");
             return Ok(());
         }
 
         let Some(device_token) = context.push_subscriber.device_token().await else {
+            info!(context, "register_token: no device token yet, skipping.");
             return Ok(());
         };
+
+        info!(context, "register_token: device_token={}", device_token);
+        info!(context, "register_token: got device token, can_push={}", self.can_push());
 
         // XDELTAPUSH capability implies SETMETADATA support for /private/devicetoken
         // even if the server does not explicitly advertise the METADATA extension.
@@ -1571,6 +1576,8 @@ impl Session {
             let device_token_changed = old_encrypted_device_token.is_none()
                 || context.get_config(Config::DeviceToken).await?.as_ref() != Some(&device_token);
 
+            info!(context, "register_token: device_token_changed={}", device_token_changed);
+
             let new_encrypted_device_token;
             if device_token_changed {
                 let encrypted_device_token = encrypt_device_token(&device_token)
@@ -1580,6 +1587,7 @@ impl Session {
                 // has non-synchronizing literals support as well:
                 // <https://www.rfc-editor.org/rfc/rfc7888>.
                 let encrypted_device_token_len = encrypted_device_token.len();
+                info!(context, "register_token: encrypted token len={}", encrypted_device_token_len);
 
                 // Store device token saved on the server
                 // to prevent storing duplicate tokens.
@@ -1612,6 +1620,7 @@ impl Session {
                     new_encrypted_device_token = None;
                 }
             } else {
+                info!(context, "register_token: token unchanged, reusing old encrypted token");
                 new_encrypted_device_token = old_encrypted_device_token;
             }
 
@@ -1623,19 +1632,26 @@ impl Session {
                     .await?
                     .context("INBOX is not configured")?;
 
-                self.run_command_and_check_ok(&format_setmetadata(
-                    &folder,
-                    &encrypted_device_token,
-                ))
+                let setmetadata_cmd = format_setmetadata(&folder, &encrypted_device_token);
+                info!(context, "register_token: sending SETMETADATA to folder={}", folder);
+                info!(context, "register_token: encrypted_device_token={}", encrypted_device_token);
+                info!(context, "register_token: SETMETADATA command={}", setmetadata_cmd);
+                self.run_command_and_check_ok(&setmetadata_cmd)
                 .await
                 .context("SETMETADATA command failed")?;
 
+                info!(context, "register_token: SETMETADATA OK, push_subscribed=true");
                 context.push_subscribed.store(true, Ordering::Relaxed);
+            } else {
+                info!(context, "register_token: no encrypted token to send.");
             }
-        } else if !context.push_subscriber.heartbeat_subscribed().await {
-            let context = context.clone();
-            // Subscribe for heartbeat notifications.
-            tokio::spawn(async move { context.push_subscriber.subscribe(&context).await });
+        } else {
+            info!(context, "register_token: server does not support XDELTAPUSH, falling back to heartbeat.");
+            if !context.push_subscriber.heartbeat_subscribed().await {
+                let context = context.clone();
+                // Subscribe for heartbeat notifications.
+                tokio::spawn(async move { context.push_subscriber.subscribe(&context).await });
+            }
         }
 
         Ok(())
