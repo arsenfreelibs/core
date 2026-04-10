@@ -30,7 +30,6 @@ use crate::location::delete_poi_location;
 use crate::log::warn;
 use crate::mimeparser::{SystemMessage, parse_message_id};
 use crate::param::{Param, Params};
-use crate::pgp::split_armored_data;
 use crate::reaction::get_msg_reactions;
 use crate::sql;
 use crate::summary::Summary;
@@ -599,7 +598,7 @@ impl Message {
 
         if let Some(msg) = &mut msg {
             msg.additional_text =
-                Self::get_additional_text(context, msg.download_state, &msg.param).await?;
+                Self::get_additional_text(context, msg.download_state, &msg.param)?;
         }
 
         Ok(msg)
@@ -608,7 +607,7 @@ impl Message {
     /// Returns additional text which is appended to the message's text field
     /// when it is loaded from the database.
     /// Currently this is used to add infomation to pre-messages of what the download will be and how large it is
-    async fn get_additional_text(
+    fn get_additional_text(
         context: &Context,
         download_state: DownloadState,
         param: &Params,
@@ -631,7 +630,7 @@ impl Message {
             return match viewtype {
                 Viewtype::File => Ok(format!(" [{file_name} – {file_size}]")),
                 _ => {
-                    let translated_viewtype = viewtype.to_locale_string(context).await;
+                    let translated_viewtype = viewtype.to_locale_string(context);
                     Ok(format!(" [{translated_viewtype} – {file_size}]"))
                 }
             };
@@ -816,7 +815,11 @@ impl Message {
 
     /// Returns the timestamp of the message for sorting.
     pub fn get_sort_timestamp(&self) -> i64 {
-        self.timestamp_sort
+        if self.timestamp_sort != 0 {
+            self.timestamp_sort
+        } else {
+            self.timestamp_sent
+        }
     }
 
     /// Returns the text of the message.
@@ -1057,34 +1060,6 @@ impl Message {
     pub fn is_system_message(&self) -> bool {
         let cmd = self.param.get_cmd();
         cmd != SystemMessage::Unknown
-    }
-
-    /// Returns true if the message is an Autocrypt Setup Message.
-    pub fn is_setupmessage(&self) -> bool {
-        if self.viewtype != Viewtype::File {
-            return false;
-        }
-
-        self.param.get_cmd() == SystemMessage::AutocryptSetupMessage
-    }
-
-    /// Returns the first characters of the setup code.
-    ///
-    /// This is used to pre-fill the first entry field of the setup code.
-    pub async fn get_setupcodebegin(&self, context: &Context) -> Option<String> {
-        if !self.is_setupmessage() {
-            return None;
-        }
-
-        if let Some(filename) = self.get_file(context)
-            && let Ok(ref buf) = read_file(context, &filename).await
-            && let Ok((typ, headers, _)) = split_armored_data(buf)
-            && typ == pgp::armor::BlockType::Message
-        {
-            return headers.get(crate::pgp::HEADER_SETUPCODE).cloned();
-        }
-
-        None
     }
 
     /// Sets or unsets message text.
@@ -1344,7 +1319,7 @@ impl Message {
     }
 
     /// Force the message to be sent in plain text.
-    pub fn force_plaintext(&mut self) {
+    pub(crate) fn force_plaintext(&mut self) {
         self.param.set_int(Param::ForcePlaintext, 1);
     }
 
@@ -1934,10 +1909,22 @@ pub async fn markseen_msgs(context: &Context, msg_ids: Vec<MsgId>) -> Result<()>
             // We also don't send read receipts for contact requests.
             // Read receipts will not be sent even after accepting the chat.
             let to_id = if curr_blocked == Blocked::Not
+                && !curr_hidden
                 && curr_param.get_bool(Param::WantsMdn).unwrap_or_default()
                 && curr_param.get_cmd() == SystemMessage::Unknown
                 && context.should_send_mdns().await?
             {
+                // Clear WantsMdn to not handle a MDN twice
+                // if the state later is InFresh again as markfresh_chat() was called.
+                // BccSelf MDN messages in the next branch may be sent twice for syncing.
+                context
+                    .sql
+                    .execute(
+                        "UPDATE msgs SET param=? WHERE id=?",
+                        (curr_param.clone().remove(Param::WantsMdn).to_string(), id),
+                    )
+                    .await
+                    .context("failed to clear WantsMdn")?;
                 Some(curr_from_id)
             } else if context.get_config_bool(Config::BccSelf).await? {
                 Some(ContactId::SELF)
@@ -1955,6 +1942,7 @@ pub async fn markseen_msgs(context: &Context, msg_ids: Vec<MsgId>) -> Result<()>
                     .context("failed to insert into smtp_mdns")?;
                 context.scheduler.interrupt_smtp().await;
             }
+
             if !curr_hidden {
                 updated_chat_ids.insert(curr_chat_id);
             }

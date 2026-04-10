@@ -6,7 +6,7 @@ use std::path::Path;
 use std::str;
 use std::str::FromStr;
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result, bail, ensure};
 use deltachat_contact_tools::{addr_cmp, addr_normalize, sanitize_bidi_characters};
 use deltachat_derive::{FromSql, ToSql};
 use format_flowed::unformat_flowed;
@@ -18,14 +18,15 @@ use crate::authres::handle_authres;
 use crate::blob::BlobObject;
 use crate::chat::ChatId;
 use crate::config::Config;
-use crate::contact::ContactId;
+use crate::constants;
+use crate::contact::{ContactId, import_public_key};
 use crate::context::Context;
-use crate::decrypt::{get_encrypted_pgp_message, validate_detached_signature};
+use crate::decrypt::{self, validate_detached_signature};
 use crate::dehtml::dehtml;
 use crate::download::PostMsgMetadata;
 use crate::events::EventType;
 use crate::headerdef::{HeaderDef, HeaderDefMap};
-use crate::key::{self, DcKey, Fingerprint, SignedPublicKey, load_self_secret_keyring};
+use crate::key::{self, DcKey, Fingerprint, SignedPublicKey};
 use crate::log::warn;
 use crate::message::{self, Message, MsgId, Viewtype, get_vcard_summary, set_msg_failed};
 use crate::param::{Param, Params};
@@ -35,7 +36,6 @@ use crate::tools::{
     get_filemeta, parse_receive_headers, smeared_time, time, truncate_msg_text, validate_id,
 };
 use crate::{chatlist_events, location, tools};
-use crate::{constants, token};
 
 /// Public key extracted from `Autocrypt-Gossip`
 /// header with associated information.
@@ -86,7 +86,9 @@ pub(crate) struct MimeMessage {
     /// messages to this address to post them to the list.
     pub list_post: Option<String>,
     pub chat_disposition_notification_to: Option<SingleInfo>,
-    pub decrypting_failed: bool,
+
+    /// Decryption error if decryption of the message has failed.
+    pub decryption_error: Option<String>,
 
     /// Valid signature fingerprint if a message is an
     /// Autocrypt encrypted and signed message and corresponding intended recipient fingerprints
@@ -199,6 +201,9 @@ pub enum SystemMessage {
     MemberRemovedFromGroup = 5,
 
     /// Autocrypt Setup Message.
+    ///
+    /// Deprecated as of 2026-03-15, such messages should not be created
+    /// but may exist in the database.
     AutocryptSetupMessage = 6,
 
     /// Secure-join message.
@@ -258,8 +263,6 @@ pub enum SystemMessage {
     /// Group or broadcast channel description changed.
     GroupDescriptionChanged = 70,
 }
-
-const MIME_AC_SETUP_FILE: &str = "application/autocrypt-setup";
 
 impl MimeMessage {
     /// Parse a mime message.
@@ -363,7 +366,6 @@ impl MimeMessage {
         Self::remove_secured_headers(&mut headers, &mut headers_removed, encrypted);
 
         let mut from = from.context("No from in message")?;
-        let private_keyring = load_self_secret_keyring(context).await?;
 
         let dkim_results = handle_authres(context, &mail, &from.addr).await?;
 
@@ -371,7 +373,7 @@ impl MimeMessage {
         hop_info += "\n\n";
         hop_info += &dkim_results.to_string();
 
-        let incoming = !context.is_self_addr(&from.addr).await?;
+        let from_is_not_self_addr = !context.is_self_addr(&from.addr).await?;
 
         let mut aheader_values = mail.headers.get_all_values(HeaderDef::Autocrypt.into());
 
@@ -385,24 +387,12 @@ impl MimeMessage {
             PreMessageMode::None
         };
 
-        let encrypted_pgp_message = get_encrypted_pgp_message(&mail)?;
-
-        let secrets: Vec<String>;
-        if let Some(e) = &encrypted_pgp_message
-            && crate::pgp::check_symmetric_encryption(e).is_ok()
-        {
-            secrets = load_shared_secrets(context).await?;
-        } else {
-            secrets = vec![];
-        }
-
         let mail_raw; // Memory location for a possible decrypted message.
         let decrypted_msg; // Decrypted signed OpenPGP message.
+        let expected_sender_fingerprint: Option<String>;
 
-        let (mail, is_encrypted) = match tokio::task::block_in_place(|| {
-            encrypted_pgp_message.map(|e| crate::pgp::decrypt(e, &private_keyring, &secrets))
-        }) {
-            Some(Ok(mut msg)) => {
+        let (mail, is_encrypted) = match decrypt::decrypt(context, &mail).await {
+            Ok(Some((mut msg, expected_sender_fp))) => {
                 mail_raw = msg.as_data_vec().unwrap_or_default();
 
                 let decrypted_mail = mailparse::parse_mail(&mail_raw)?;
@@ -429,23 +419,26 @@ impl MimeMessage {
                     aheader_values = protected_aheader_values;
                 }
 
+                expected_sender_fingerprint = expected_sender_fp;
                 (Ok(decrypted_mail), true)
             }
-            None => {
+            Ok(None) => {
                 mail_raw = Vec::new();
                 decrypted_msg = None;
+                expected_sender_fingerprint = None;
                 (Ok(mail), false)
             }
-            Some(Err(err)) => {
+            Err(err) => {
                 mail_raw = Vec::new();
                 decrypted_msg = None;
+                expected_sender_fingerprint = None;
                 warn!(context, "decryption failed: {:#}", err);
                 (Err(err), false)
             }
         };
 
         let mut autocrypt_header = None;
-        if incoming {
+        if from_is_not_self_addr {
             // See `get_all_addresses_from_header()` for why we take the last valid header.
             for val in aheader_values.iter().rev() {
                 autocrypt_header = match Aheader::from_str(val) {
@@ -468,28 +461,15 @@ impl MimeMessage {
 
         let autocrypt_fingerprint = if let Some(autocrypt_header) = &autocrypt_header {
             let fingerprint = autocrypt_header.public_key.dc_fingerprint().hex();
-            let inserted = context
-                .sql
-                .execute(
-                    "INSERT INTO public_keys (fingerprint, public_key)
-                                 VALUES (?, ?)
-                                 ON CONFLICT (fingerprint)
-                                 DO NOTHING",
-                    (&fingerprint, autocrypt_header.public_key.to_bytes()),
-                )
-                .await?;
-            if inserted > 0 {
-                info!(
-                    context,
-                    "Saved key with fingerprint {fingerprint} from the Autocrypt header"
-                );
-            }
+            import_public_key(context, &autocrypt_header.public_key)
+                .await
+                .context("Failed to import public key from the Autocrypt header")?;
             Some(fingerprint)
         } else {
             None
         };
 
-        let mut public_keyring = if incoming {
+        let mut public_keyring = if from_is_not_self_addr {
             if let Some(autocrypt_header) = autocrypt_header {
                 vec![autocrypt_header.public_key]
             } else {
@@ -552,6 +532,22 @@ impl MimeMessage {
             signatures.extend(signatures_detached);
             content
         });
+
+        if let Some(expected_sender_fingerprint) = expected_sender_fingerprint {
+            ensure!(
+                !signatures.is_empty(),
+                "Unsigned message is not allowed to be encrypted with this shared secret"
+            );
+            ensure!(
+                signatures.len() == 1,
+                "Too many signatures on symm-encrypted message"
+            );
+            ensure!(
+                signatures.contains_key(&expected_sender_fingerprint.parse()?),
+                "This sender is not allowed to encrypt with this secret key"
+            );
+        }
+
         if let (Ok(mail), true) = (mail, is_encrypted) {
             if !signatures.is_empty() {
                 // Unsigned "Subject" mustn't be prepended to messages shown as encrypted
@@ -658,6 +654,15 @@ impl MimeMessage {
             .into_iter()
             .last()
             .map(|(fp, recipient_fps)| (fp, recipient_fps.into_iter().collect::<HashSet<_>>()));
+
+        let incoming = if let Some((ref sig_fp, _)) = signature {
+            sig_fp.hex() != key::self_fingerprint(context).await?
+        } else {
+            // rare case of getting a cleartext message
+            // so we determine 'incoming' flag by From-address
+            from_is_not_self_addr
+        };
+
         let mut parser = MimeMessage {
             parts: Vec::new(),
             headers,
@@ -670,7 +675,7 @@ impl MimeMessage {
             from,
             incoming,
             chat_disposition_notification_to,
-            decrypting_failed: mail.is_err(),
+            decryption_error: mail.err().map(|err| format!("{err:#}")),
 
             // only non-empty if it was a valid autocrypt message
             signature,
@@ -749,20 +754,8 @@ impl MimeMessage {
     }
 
     /// Parses system messages.
-    fn parse_system_message_headers(&mut self, context: &Context) {
-        if self.get_header(HeaderDef::AutocryptSetupMessage).is_some() && !self.incoming {
-            self.parts.retain(|part| {
-                part.mimetype
-                    .as_ref()
-                    .is_none_or(|mimetype| mimetype.as_ref() == MIME_AC_SETUP_FILE)
-            });
-
-            if self.parts.len() == 1 {
-                self.is_system_message = SystemMessage::AutocryptSetupMessage;
-            } else {
-                warn!(context, "could not determine ASM mime-part");
-            }
-        } else if let Some(value) = self.get_header(HeaderDef::ChatContent) {
+    fn parse_system_message_headers(&mut self) {
+        if let Some(value) = self.get_header(HeaderDef::ChatContent) {
             if value == "location-streaming-enabled" {
                 self.is_system_message = SystemMessage::LocationStreamingEnabled;
             } else if value == "ephemeral-timer-changed" {
@@ -912,7 +905,7 @@ impl MimeMessage {
     }
 
     async fn parse_headers(&mut self, context: &Context) -> Result<()> {
-        self.parse_system_message_headers(context);
+        self.parse_system_message_headers();
         self.parse_avatar_headers(context)?;
         self.parse_videochat_headers();
         if self.delivery_report.is_none() {
@@ -923,7 +916,7 @@ impl MimeMessage {
             && let Some(ref subject) = self.get_subject()
         {
             let mut prepend_subject = true;
-            if !self.decrypting_failed {
+            if self.decryption_error.is_none() {
                 let colon = subject.find(':');
                 if colon == Some(2)
                     || colon == Some(3)
@@ -964,7 +957,7 @@ impl MimeMessage {
         self.parse_attachments();
 
         // See if an MDN is requested from the other side
-        if !self.decrypting_failed
+        if self.decryption_error.is_none()
             && !self.parts.is_empty()
             && let Some(ref dn_to) = self.chat_disposition_notification_to
         {
@@ -1096,7 +1089,7 @@ impl MimeMessage {
     #[cfg(test)]
     /// Returns whether the decrypted data contains the given `&str`.
     pub(crate) fn decoded_data_contains(&self, s: &str) -> bool {
-        assert!(!self.decrypting_failed);
+        assert!(self.decryption_error.is_none());
         let decoded_str = str::from_utf8(&self.decoded_data).unwrap();
         decoded_str.contains(s)
     }
@@ -1653,24 +1646,12 @@ impl MimeMessage {
             }
             Ok(key) => key,
         };
-        if let Err(err) = key.verify_bindings() {
-            warn!(context, "Attached PGP key verification failed: {err:#}.");
+        if let Err(err) = import_public_key(context, &key).await {
+            warn!(context, "Attached PGP key import failed: {err:#}.");
             return Ok(false);
         }
 
-        let fingerprint = key.dc_fingerprint().hex();
-        context
-            .sql
-            .execute(
-                "INSERT INTO public_keys (fingerprint, public_key)
-                 VALUES (?, ?)
-                 ON CONFLICT (fingerprint)
-                 DO NOTHING",
-                (&fingerprint, key.to_bytes()),
-            )
-            .await?;
-
-        info!(context, "Imported PGP key {fingerprint} from attachment.");
+        info!(context, "Imported PGP key from attachment.");
         Ok(true)
     }
 
@@ -2110,35 +2091,6 @@ impl MimeMessage {
     }
 }
 
-/// Loads all the shared secrets
-/// that will be tried to decrypt a symmetrically-encrypted message
-async fn load_shared_secrets(context: &Context) -> Result<Vec<String>> {
-    // First, try decrypting using the bobstate,
-    // because usually there will only be 1 or 2 of it,
-    // so, it should be fast
-    let mut secrets: Vec<String> = context
-        .sql
-        .query_map_vec("SELECT invite FROM bobstate", (), |row| {
-            let invite: crate::securejoin::QrInvite = row.get(0)?;
-            Ok(invite.authcode().to_string())
-        })
-        .await?;
-    // Then, try decrypting using broadcast secrets
-    secrets.extend(
-        context
-            .sql
-            .query_map_vec("SELECT secret FROM broadcast_secrets", (), |row| {
-                let secret: String = row.get(0)?;
-                Ok(secret)
-            })
-            .await?,
-    );
-    // Finally, try decrypting using AUTH tokens
-    // There can be a lot of AUTH tokens, because a new one is generated every time a QR code is shown
-    secrets.extend(token::lookup_all(context, token::Namespace::Auth).await?);
-    Ok(secrets)
-}
-
 fn rm_legacy_display_elements(text: &str) -> String {
     let mut res = None;
     for l in text.lines() {
@@ -2208,17 +2160,9 @@ async fn parse_gossip_headers(
             continue;
         }
 
-        let fingerprint = header.public_key.dc_fingerprint().hex();
-        context
-            .sql
-            .execute(
-                "INSERT INTO public_keys (fingerprint, public_key)
-                             VALUES (?, ?)
-                             ON CONFLICT (fingerprint)
-                             DO NOTHING",
-                (&fingerprint, header.public_key.to_bytes()),
-            )
-            .await?;
+        import_public_key(context, &header.public_key)
+            .await
+            .context("Failed to import Autocrypt-Gossip key")?;
 
         let gossiped_key = GossipedKey {
             public_key: header.public_key,
@@ -2656,3 +2600,5 @@ async fn handle_ndn(
 
 #[cfg(test)]
 mod mimeparser_tests;
+#[cfg(test)]
+mod shared_secret_decryption_tests;

@@ -1,7 +1,7 @@
 //! # Chat module.
 
 use std::cmp;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::io::Cursor;
 use std::marker::Sync;
@@ -42,6 +42,7 @@ use crate::message::{self, Message, MessageState, MsgId, Viewtype};
 use crate::mimefactory::{MimeFactory, RenderedEmail};
 use crate::mimeparser::SystemMessage;
 use crate::param::{Param, Params};
+use crate::pgp::addresses_from_public_key;
 use crate::receive_imf::ReceivedMsg;
 use crate::smtp::{self, send_msg_to_smtp};
 use crate::stock_str;
@@ -257,7 +258,11 @@ impl ChatId {
                         ChatIdBlocked::get_for_contact(context, contact_id, create_blocked)
                             .await
                             .map(|chat| chat.id)?;
-                    ContactId::scaleup_origin(context, &[contact_id], Origin::CreateChat).await?;
+                    if create_blocked != Blocked::Yes {
+                        info!(context, "Scale up origin of {contact_id} to CreateChat.");
+                        ContactId::scaleup_origin(context, &[contact_id], Origin::CreateChat)
+                            .await?;
+                    }
                     chat_id
                 } else {
                     warn!(
@@ -471,14 +476,40 @@ impl ChatId {
 
     /// Adds message "Messages are end-to-end encrypted".
     pub(crate) async fn add_e2ee_notice(self, context: &Context, timestamp: i64) -> Result<()> {
-        let text = stock_str::messages_e2e_encrypted(context).await;
+        let text = stock_str::messages_e2ee_info_msg(context);
+
+        // Sort this notice to the very beginning of the chat.
+        // We don't want any message to appear before this notice
+        // which is normally added when encrypted chat is created.
+        let sort_timestamp = 0;
         add_info_msg_with_cmd(
             context,
             self,
             &text,
             SystemMessage::ChatE2ee,
-            Some(timestamp),
+            Some(sort_timestamp),
             timestamp,
+            None,
+            None,
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Adds info message to the beginning of the chat.
+    ///
+    /// Used for messages such as
+    /// "Others will only see this group after you sent a first message."
+    pub(crate) async fn add_start_info_message(self, context: &Context, text: &str) -> Result<()> {
+        let sort_timestamp = 0;
+        add_info_msg_with_cmd(
+            context,
+            self,
+            text,
+            SystemMessage::Unknown,
+            Some(sort_timestamp),
+            time(),
             None,
             None,
             None,
@@ -664,7 +695,7 @@ SELECT id, rfc724_mid, pre_rfc724_mid, timestamp, ?, 1 FROM msgs WHERE chat_id=?
         }
 
         if chat.is_self_talk() {
-            let mut msg = Message::new_text(stock_str::self_deleted_msg_body(context).await);
+            let mut msg = Message::new_text(stock_str::self_deleted_msg_body(context));
             add_device_msg(context, None, Some(&mut msg)).await?;
         }
         chatlist_events::emit_chatlist_changed(context);
@@ -920,6 +951,17 @@ SELECT id, rfc724_mid, pre_rfc724_mid, timestamp, ?, 1 FROM msgs WHERE chat_id=?
             .unwrap_or(0))
     }
 
+    /// Returns timestamp of us joining the chat if we are the member of the chat.
+    pub(crate) async fn join_timestamp(self, context: &Context) -> Result<Option<i64>> {
+        context
+            .sql
+            .query_get_value(
+                "SELECT add_timestamp FROM chats_contacts WHERE chat_id=? AND contact_id=?",
+                (self, ContactId::SELF),
+            )
+            .await
+    }
+
     /// Returns timestamp of the latest message in the chat,
     /// including hidden messages or a draft if there is one.
     pub(crate) async fn get_timestamp(self, context: &Context) -> Result<Option<i64>> {
@@ -1150,10 +1192,10 @@ SELECT id, rfc724_mid, pre_rfc724_mid, timestamp, ?, 1 FROM msgs WHERE chat_id=?
     pub async fn get_encryption_info(self, context: &Context) -> Result<String> {
         let chat = Chat::load_from_db(context, self).await?;
         if !chat.is_encrypted(context).await? {
-            return Ok(stock_str::encr_none(context).await);
+            return Ok(stock_str::encr_none(context));
         }
 
-        let mut ret = stock_str::messages_e2e_encrypted(context).await + "\n";
+        let mut ret = stock_str::messages_are_e2ee(context) + "\n";
 
         for &contact_id in get_chat_contacts(context, self)
             .await?
@@ -1170,8 +1212,13 @@ SELECT id, rfc724_mid, pre_rfc724_mid, timestamp, ?, 1 FROM msgs WHERE chat_id=?
             let fingerprint = contact
                 .fingerprint()
                 .context("Contact does not have a fingerprint in encrypted chat")?;
-            if contact.public_key(context).await?.is_some() {
-                ret += &format!("\n{addr}\n{fingerprint}\n");
+            if let Some(public_key) = contact.public_key(context).await? {
+                if let Some(relay_addrs) = addresses_from_public_key(&public_key) {
+                    let relays = relay_addrs.join(",");
+                    ret += &format!("\n{addr}({relays})\n{fingerprint}\n");
+                } else {
+                    ret += &format!("\n{addr}\n{fingerprint}\n");
+                }
             } else {
                 ret += &format!("\n{addr}\n(key missing)\n{fingerprint}\n");
             }
@@ -1202,15 +1249,11 @@ SELECT id, rfc724_mid, pre_rfc724_mid, timestamp, ?, 1 FROM msgs WHERE chat_id=?
     /// corresponding event in case of a system message (usually the current system time).
     /// `always_sort_to_bottom` makes this adjust the returned timestamp up so that the message goes
     /// to the chat bottom.
-    /// `received` -- whether the message is received. Otherwise being sent.
-    /// `incoming` -- whether the message is incoming.
     pub(crate) async fn calc_sort_timestamp(
         self,
         context: &Context,
         message_timestamp: i64,
         always_sort_to_bottom: bool,
-        received: bool,
-        incoming: bool,
     ) -> Result<i64> {
         let mut sort_timestamp = cmp::min(message_timestamp, smeared_time(context));
 
@@ -1230,38 +1273,6 @@ SELECT id, rfc724_mid, pre_rfc724_mid, timestamp, ?, 1 FROM msgs WHERE chat_id=?
                     (self, MessageState::OutDraft),
                 )
                 .await?
-        } else if received {
-            // Received messages shouldn't mingle with just sent ones and appear somewhere in the
-            // middle of the chat, so we go after the newest non fresh message.
-            //
-            // But if a received outgoing message is older than some seen message, better sort the
-            // received message purely by timestamp. We could place it just before that seen
-            // message, but anyway the user may not notice it.
-            //
-            // NB: Received outgoing messages may break sorting of fresh incoming ones, but this
-            // shouldn't happen frequently. Seen incoming messages don't really break sorting of
-            // fresh ones, they rather mean that older incoming messages are actually seen as well.
-            context
-                .sql
-                .query_row_optional(
-                    "SELECT MAX(timestamp), MAX(IIF(state=?,timestamp_sent,0))
-                     FROM msgs
-                     WHERE chat_id=? AND hidden=0 AND state>?
-                     HAVING COUNT(*) > 0",
-                    (MessageState::InSeen, self, MessageState::InFresh),
-                    |row| {
-                        let ts: i64 = row.get(0)?;
-                        let ts_sent_seen: i64 = row.get(1)?;
-                        Ok((ts, ts_sent_seen))
-                    },
-                )
-                .await?
-                .and_then(|(ts, ts_sent_seen)| {
-                    match incoming || ts_sent_seen <= message_timestamp {
-                        true => Some(ts),
-                        false => None,
-                    }
-                })
         } else {
             None
         };
@@ -1272,7 +1283,16 @@ SELECT id, rfc724_mid, pre_rfc724_mid, timestamp, ?, 1 FROM msgs WHERE chat_id=?
             sort_timestamp = last_msg_time;
         }
 
-        Ok(sort_timestamp)
+        if let Some(join_timestamp) = self.join_timestamp(context).await? {
+            // If we are the member of the chat, don't add messages
+            // before the timestamp of us joining it.
+            // This is needed to avoid sorting "Member added"
+            // or automatically sent bot welcome messages
+            // above SecureJoin system messages.
+            Ok(std::cmp::max(sort_timestamp, join_timestamp))
+        } else {
+            Ok(sort_timestamp)
+        }
     }
 }
 
@@ -1382,7 +1402,7 @@ impl Chat {
             .context(format!("Failed loading chat {chat_id} from database"))?;
 
         if chat.id.is_archived_link() {
-            chat.name = stock_str::archived_chats(context).await;
+            chat.name = stock_str::archived_chats(context);
         } else {
             if chat.typ == Chattype::Single && chat.name.is_empty() {
                 // chat.name is set to contact.display_name on changes,
@@ -1406,9 +1426,9 @@ impl Chat {
                 chat.name = chat_name;
             }
             if chat.param.exists(Param::Selftalk) {
-                chat.name = stock_str::saved_messages(context).await;
+                chat.name = stock_str::saved_messages(context);
             } else if chat.param.exists(Param::Devicetalk) {
-                chat.name = stock_str::device_messages(context).await;
+                chat.name = stock_str::device_messages(context);
             }
         }
 
@@ -1772,16 +1792,6 @@ impl Chat {
                 .set_i64(Param::GroupNameTimestamp, msg.timestamp_sort)
                 .set_i64(Param::GroupDescriptionTimestamp, msg.timestamp_sort);
             self.update_param(context).await?;
-            // TODO: Remove this compat code needed because Core <= v1.143:
-            // - doesn't accept synchronization of QR code tokens for unpromoted groups, so we also
-            //   send them when the group is promoted.
-            // - doesn't sync QR code tokens for unpromoted groups and the group might be created
-            //   before an upgrade.
-            context
-                .sync_qr_code_tokens(Some(self.grpid.as_str()))
-                .await
-                .log_err(context)
-                .ok();
         }
 
         let is_bot = context.get_config_bool(Config::Bot).await?;
@@ -2306,15 +2316,10 @@ pub(crate) async fn update_special_chat_names(context: &Context) -> Result<()> {
     update_special_chat_name(
         context,
         ContactId::DEVICE,
-        stock_str::device_messages(context).await,
+        stock_str::device_messages(context),
     )
     .await?;
-    update_special_chat_name(
-        context,
-        ContactId::SELF,
-        stock_str::saved_messages(context).await,
-    )
-    .await?;
+    update_special_chat_name(context, ContactId::SELF, stock_str::saved_messages(context)).await?;
     Ok(())
 }
 
@@ -2844,19 +2849,12 @@ pub(crate) async fn create_send_msg_jobs(context: &Context, msg: &mut Message) -
     let lowercase_from = from.to_lowercase();
 
     recipients.retain(|x| x.to_lowercase() != lowercase_from);
-    if context.get_config_bool(Config::BccSelf).await?
-        || msg.param.get_cmd() == SystemMessage::AutocryptSetupMessage
+
+    // Default Webxdc integrations are hidden messages and must not be sent out:
+    if (msg.param.get_int(Param::WebxdcIntegration).is_some() && msg.hidden)
+        // This may happen eg. for groups with only SELF and bcc_self disabled:
+        || (!context.get_config_bool(Config::BccSelf).await? && recipients.is_empty())
     {
-        smtp::add_self_recipients(context, &mut recipients, needs_encryption).await?;
-    }
-
-    // Default Webxdc integrations are hidden messages and must not be sent out
-    if msg.param.get_int(Param::WebxdcIntegration).is_some() && msg.hidden {
-        recipients.clear();
-    }
-
-    if recipients.is_empty() {
-        // may happen eg. for groups with only SELF and bcc_self disabled
         info!(
             context,
             "Message {} has no recipient, skipping smtp-send.", msg.id
@@ -2893,6 +2891,10 @@ pub(crate) async fn create_send_msg_jobs(context: &Context, msg: &mut Message) -
             msg.id,
             format_size(rendered_msg.message.len(), BINARY),
         );
+    }
+
+    if context.get_config_bool(Config::BccSelf).await? {
+        smtp::add_self_recipients(context, &mut recipients, rendered_msg.is_encrypted).await?;
     }
 
     if needs_encryption && !rendered_msg.is_encrypted {
@@ -3071,7 +3073,7 @@ async fn donation_request_maybe(context: &Context) -> Result<()> {
     let ts = if ts == 0 || msg_cnt.await? < 100 {
         now.saturating_add(secs_between_checks)
     } else {
-        let mut msg = Message::new_text(stock_str::donation_request(context).await);
+        let mut msg = Message::new_text(stock_str::donation_request(context));
         add_device_msg(context, None, Some(&mut msg)).await?;
         i64::MAX
     };
@@ -3406,6 +3408,38 @@ pub(crate) async fn mark_old_messages_as_noticed(
     Ok(())
 }
 
+/// Marks last incoming message in a chat as fresh.
+pub async fn markfresh_chat(context: &Context, chat_id: ChatId) -> Result<()> {
+    let affected_rows = context
+        .sql
+        .execute(
+            "UPDATE msgs
+                SET state=?1
+              WHERE id=(SELECT id
+                          FROM msgs
+                         WHERE state IN (?1, ?2, ?3) AND hidden=0 AND chat_id=?4
+                      ORDER BY timestamp DESC, id DESC
+                         LIMIT 1)
+                AND state!=?1",
+            (
+                MessageState::InFresh,
+                MessageState::InNoticed,
+                MessageState::InSeen,
+                chat_id,
+            ),
+        )
+        .await?;
+
+    if affected_rows == 0 {
+        return Ok(());
+    }
+
+    context.emit_msgs_changed_without_msg_id(chat_id);
+    chatlist_events::emit_chatlist_item_changed(context, chat_id);
+
+    Ok(())
+}
+
 /// Returns all database message IDs of the given types.
 ///
 /// If `chat_id` is None, return messages from any chat.
@@ -3593,12 +3627,12 @@ pub(crate) async fn create_group_ex(
     {
         let text = if !grpid.is_empty() {
             // Add "Others will only see this group after you sent a first message." message.
-            stock_str::new_group_send_first_message(context).await
+            stock_str::new_group_send_first_message(context)
         } else {
             // Add "Messages in this chat use classic email and are not encrypted." message.
-            stock_str::chat_unencrypted_explanation(context).await
+            stock_str::chat_unencrypted_explanation(context)
         };
-        add_info_msg(context, chat_id, &text).await?;
+        chat_id.add_start_info_message(context, &text).await?;
     }
     if let (true, true) = (sync.into(), !grpid.is_empty()) {
         let id = SyncId::Grpid(grpid);
@@ -3894,8 +3928,6 @@ pub(crate) async fn add_contact_to_chat_ex(
         );
         return Ok(false);
     }
-
-    let sync_qr_code_tokens;
     if from_handshake && chat.param.get_int(Param::Unpromoted).unwrap_or_default() == 1 {
         let smeared_time = smeared_time(context);
         chat.param
@@ -3903,11 +3935,7 @@ pub(crate) async fn add_contact_to_chat_ex(
             .set_i64(Param::GroupNameTimestamp, smeared_time)
             .set_i64(Param::GroupDescriptionTimestamp, smeared_time);
         chat.update_param(context).await?;
-        sync_qr_code_tokens = true;
-    } else {
-        sync_qr_code_tokens = false;
     }
-
     if context.is_self_addr(contact.get_addr()).await? {
         // ourself is added using ContactId::SELF, do not add this address explicitly.
         // if SELF is not in the group, members cannot be added at all.
@@ -3956,20 +3984,6 @@ pub(crate) async fn add_contact_to_chat_ex(
         send_msg(context, chat_id, &mut msg).await?;
 
         sync = Nosync;
-        // TODO: Remove this compat code needed because Core <= v1.143:
-        // - doesn't accept synchronization of QR code tokens for unpromoted groups, so we also send
-        //   them when the group is promoted.
-        // - doesn't sync QR code tokens for unpromoted groups and the group might be created before
-        //   an upgrade.
-        if sync_qr_code_tokens
-            && context
-                .sync_qr_code_tokens(Some(chat.grpid.as_str()))
-                .await
-                .log_err(context)
-                .is_ok()
-        {
-            context.scheduler.interrupt_smtp().await;
-        }
     }
     context.emit_event(EventType::ChatModified(chat_id));
     if sync.into() {
@@ -4188,7 +4202,7 @@ async fn send_member_removal_msg(
 
     if contact_id == ContactId::SELF {
         if chat.typ == Chattype::InBroadcast {
-            msg.text = stock_str::msg_you_left_broadcast(context).await;
+            msg.text = stock_str::msg_you_left_broadcast(context);
         } else {
             msg.text = stock_str::msg_group_left_local(context, ContactId::SELF).await;
         }
@@ -4348,8 +4362,11 @@ async fn rename_ex(
                 && sanitize_single_line(&chat.name) != new_name
             {
                 msg.viewtype = Viewtype::Text;
-                msg.text =
-                    stock_str::msg_grp_name(context, &chat.name, &new_name, ContactId::SELF).await;
+                msg.text = if chat.typ == Chattype::OutBroadcast {
+                    stock_str::msg_broadcast_name_changed(context, &chat.name, &new_name)
+                } else {
+                    stock_str::msg_grp_name(context, &chat.name, &new_name, ContactId::SELF).await
+                };
                 msg.param.set_cmd(SystemMessage::GroupNameChanged);
                 if !chat.name.is_empty() {
                     msg.param.set(Param::Arg, &chat.name);
@@ -4410,7 +4427,11 @@ pub async fn set_chat_profile_image(
     if new_image.is_empty() {
         chat.param.remove(Param::ProfileImage);
         msg.param.remove(Param::Arg);
-        msg.text = stock_str::msg_grp_img_deleted(context, ContactId::SELF).await;
+        msg.text = if chat.typ == Chattype::OutBroadcast {
+            stock_str::msg_broadcast_img_changed(context)
+        } else {
+            stock_str::msg_grp_img_deleted(context, ContactId::SELF).await
+        };
     } else {
         let mut image_blob = BlobObject::create_and_deduplicate(
             context,
@@ -4420,7 +4441,11 @@ pub async fn set_chat_profile_image(
         image_blob.recode_to_avatar_size(context).await?;
         chat.param.set(Param::ProfileImage, image_blob.as_name());
         msg.param.set(Param::Arg, image_blob.as_name());
-        msg.text = stock_str::msg_grp_img_changed(context, ContactId::SELF).await;
+        msg.text = if chat.typ == Chattype::OutBroadcast {
+            stock_str::msg_broadcast_img_changed(context)
+        } else {
+            stock_str::msg_grp_img_changed(context, ContactId::SELF).await
+        };
     }
     chat.update_param(context).await?;
     if chat.is_promoted() {
@@ -4923,15 +4948,8 @@ pub(crate) async fn add_info_msg_with_cmd(
         ts
     } else {
         let sort_to_bottom = true;
-        let (received, incoming) = (false, false);
         chat_id
-            .calc_sort_timestamp(
-                context,
-                smeared_time(context),
-                sort_to_bottom,
-                received,
-                incoming,
-            )
+            .calc_sort_timestamp(context, smeared_time(context), sort_to_bottom)
             .await?
     };
 
@@ -5057,18 +5075,18 @@ async fn set_contacts_by_fingerprints(
         matches!(chat.typ, Chattype::Group | Chattype::OutBroadcast),
         "{id} is not a group or broadcast",
     );
-    let mut contacts = HashSet::new();
+    let mut contacts = BTreeSet::new();
     for (fingerprint, addr) in fingerprint_addrs {
         let contact = Contact::add_or_lookup_ex(context, "", addr, fingerprint, Origin::Hidden)
             .await?
             .0;
         contacts.insert(contact);
     }
-    let contacts_old = HashSet::<ContactId>::from_iter(get_chat_contacts(context, id).await?);
+    let contacts_old = BTreeSet::<ContactId>::from_iter(get_chat_contacts(context, id).await?);
     if contacts == contacts_old {
         return Ok(());
     }
-    context
+    let broadcast_contacts_added = context
         .sql
         .transaction(move |transaction| {
             // For broadcast channels, we only add members,
@@ -5085,12 +5103,31 @@ async fn set_contacts_by_fingerprints(
             let mut statement = transaction.prepare(
                 "INSERT OR IGNORE INTO chats_contacts (chat_id, contact_id) VALUES (?, ?)",
             )?;
+            let mut broadcast_contacts_added = Vec::new();
             for contact_id in &contacts {
-                statement.execute((id, contact_id))?;
+                if statement.execute((id, contact_id))? > 0 && chat.typ == Chattype::OutBroadcast {
+                    broadcast_contacts_added.push(*contact_id);
+                }
             }
-            Ok(())
+            Ok(broadcast_contacts_added)
         })
         .await?;
+    let timestamp = smeared_time(context);
+    for added_id in broadcast_contacts_added {
+        let msg = stock_str::msg_add_member_local(context, added_id, ContactId::UNDEFINED).await;
+        add_info_msg_with_cmd(
+            context,
+            id,
+            &msg,
+            SystemMessage::MemberAddedToGroup,
+            Some(timestamp),
+            timestamp,
+            None,
+            Some(ContactId::SELF),
+            Some(added_id),
+        )
+        .await?;
+    }
     context.emit_event(EventType::ChatModified(id));
     Ok(())
 }

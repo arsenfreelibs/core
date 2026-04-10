@@ -17,8 +17,7 @@ use crate::aheader::{Aheader, EncryptPreference};
 use crate::blob::BlobObject;
 use crate::chat::{self, Chat, PARAM_BROADCAST_SECRET, load_broadcast_secret};
 use crate::config::Config;
-use crate::constants::{ASM_SUBJECT, BROADCAST_INCOMPATIBILITY_MSG};
-use crate::constants::{Chattype, DC_FROM_HANDSHAKE};
+use crate::constants::{BROADCAST_INCOMPATIBILITY_MSG, Chattype, DC_FROM_HANDSHAKE};
 use crate::contact::{Contact, ContactId, Origin};
 use crate::context::Context;
 use crate::download::PostMsgMetadata;
@@ -33,7 +32,7 @@ use crate::message::{Message, MsgId, Viewtype};
 use crate::mimeparser::{SystemMessage, is_hidden};
 use crate::param::Param;
 use crate::peer_channels::{create_iroh_header, get_iroh_topic_for_msg};
-use crate::pgp::SeipdVersion;
+use crate::pgp::{SeipdVersion, addresses_from_public_key, pubkey_supports_seipdv2};
 use crate::simplify::escape_message_footer_marks;
 use crate::stock_str;
 use crate::tools::{
@@ -233,11 +232,7 @@ impl MimeFactory {
         if chat.is_self_talk() {
             to.push((from_displayname.to_string(), from_addr.to_string()));
 
-            encryption_pubkeys = if msg.param.get_bool(Param::ForcePlaintext).unwrap_or(false) {
-                None
-            } else {
-                Some(Vec::new())
-            };
+            encryption_pubkeys = Some(Vec::new());
         } else if chat.is_mailing_list() {
             let list_post = chat
                 .param
@@ -274,10 +269,13 @@ impl MimeFactory {
                 .await?
                 .context("Can't send member addition/removal: missing key")?;
 
-            recipients.push(addr.clone());
+            let public_key = SignedPublicKey::from_slice(&public_key_bytes)?;
+
+            let relays =
+                addresses_from_public_key(&public_key).unwrap_or_else(|| vec![addr.clone()]);
+            recipients.extend(relays);
             to.push((authname, addr.clone()));
 
-            let public_key = SignedPublicKey::from_slice(&public_key_bytes)?;
             encryption_pubkeys = Some(vec![(addr, public_key)]);
         } else {
             let email_to_remove = if msg.param.get_cmd() == SystemMessage::MemberRemovedFromGroup {
@@ -354,9 +352,23 @@ impl MimeFactory {
                                 false => "".to_string(),
                             };
                             if add_timestamp >= remove_timestamp {
+                                let relays = if let Some(public_key) = public_key_opt {
+                                    let addrs = addresses_from_public_key(&public_key);
+                                    keys.push((addr.clone(), public_key));
+                                    addrs
+                                } else if id != ContactId::SELF && !should_encrypt_symmetrically(&msg, &chat) {
+                                    missing_key_addresses.insert(addr.clone());
+                                    if is_encrypted {
+                                        warn!(context, "Missing key for {addr}");
+                                    }
+                                    None
+                                } else {
+                                    None
+                                }.unwrap_or_else(|| vec![addr.clone()]);
+
                                 if !recipients_contain_addr(&to, &addr) {
                                     if id != ContactId::SELF {
-                                        recipients.push(addr.clone());
+                                        recipients.extend(relays);
                                     }
                                     if !undisclosed_recipients {
                                         to.push((name, addr.clone()));
@@ -367,42 +379,38 @@ impl MimeFactory {
                                             } else if id == ContactId::SELF {
                                                 member_fingerprints.push(self_fingerprint.to_string());
                                             } else {
-                                                ensure_and_debug_assert!(member_fingerprints.is_empty(), "If some past member is a key-contact, all other past members should be key-contacts too");
+                                                ensure_and_debug_assert!(member_fingerprints.is_empty(), "If some member is a key-contact, all other members should be key-contacts too");
                                             }
                                         }
                                         member_timestamps.push(add_timestamp);
                                     }
                                 }
                                 recipient_ids.insert(id);
-
-                                if let Some(public_key) = public_key_opt {
-                                    keys.push((addr.clone(), public_key))
-                                } else if id != ContactId::SELF && !should_encrypt_symmetrically(&msg, &chat) {
-                                    missing_key_addresses.insert(addr.clone());
-                                    if is_encrypted {
-                                        warn!(context, "Missing key for {addr}");
-                                    }
-                                }
                             } else if remove_timestamp.saturating_add(60 * 24 * 3600) > now {
                                 // Row is a tombstone,
                                 // member is not actually part of the group.
                                 if !recipients_contain_addr(&past_members, &addr) {
                                     if let Some(email_to_remove) = email_to_remove
                                         && email_to_remove == addr {
-                                            // This is a "member removed" message,
-                                            // we need to notify removed member
-                                            // that it was removed.
-                                            if id != ContactId::SELF {
-                                                recipients.push(addr.clone());
-                                            }
-
-                                            if let Some(public_key) = public_key_opt {
-                                                keys.push((addr.clone(), public_key))
+                                            let relays = if let Some(public_key) = public_key_opt {
+                                                let addrs = addresses_from_public_key(&public_key);
+                                                keys.push((addr.clone(), public_key));
+                                                addrs
                                             } else if id != ContactId::SELF && !should_encrypt_symmetrically(&msg, &chat)  {
                                                 missing_key_addresses.insert(addr.clone());
                                                 if is_encrypted {
                                                     warn!(context, "Missing key for {addr}");
                                                 }
+                                                None
+                                            } else {
+                                                None
+                                            }.unwrap_or_else(|| vec![addr.clone()]);
+
+                                            // This is a "member removed" message,
+                                            // we need to notify removed member
+                                            // that it was removed.
+                                            if id != ContactId::SELF {
+                                                recipients.extend(relays);
                                             }
                                         }
                                     if !undisclosed_recipients {
@@ -456,9 +464,16 @@ impl MimeFactory {
                 .filter(|id| *id != ContactId::SELF)
                 .collect();
             if recipient_ids.len() == 1
-                && msg.param.get_cmd() != SystemMessage::MemberRemovedFromGroup
-                && chat.typ != Chattype::OutBroadcast
+                && !matches!(
+                    msg.param.get_cmd(),
+                    SystemMessage::MemberRemovedFromGroup | SystemMessage::SecurejoinMessage
+                )
+                && !matches!(chat.typ, Chattype::OutBroadcast | Chattype::InBroadcast)
             {
+                info!(
+                    context,
+                    "Scale up origin of {} recipients to OutgoingTo.", chat.id
+                );
                 ContactId::scaleup_origin(context, &recipient_ids, Origin::OutgoingTo).await?;
             }
 
@@ -713,7 +728,7 @@ impl MimeFactory {
                     Some(name) => name,
                     None => context.get_config(Config::Addr).await?.unwrap_or_default(),
                 };
-                stock_str::subject_for_new_contact(context, self_name).await
+                stock_str::subject_for_new_contact(context, self_name)
             }
             Loaded::Mdn { .. } => "Receipt Notification".to_string(), // untranslated to no reveal sender's language
         };
@@ -833,7 +848,13 @@ impl MimeFactory {
 
         let rfc724_mid = match &self.loaded {
             Loaded::Message { msg, .. } => match &self.pre_message_mode {
-                PreMessageMode::Pre { .. } => create_outgoing_rfc724_mid(),
+                PreMessageMode::Pre { .. } => {
+                    if msg.pre_rfc724_mid.is_empty() {
+                        create_outgoing_rfc724_mid()
+                    } else {
+                        msg.pre_rfc724_mid.clone()
+                    }
+                }
                 _ => msg.rfc724_mid.clone(),
             },
             Loaded::Mdn { .. } => create_outgoing_rfc724_mid(),
@@ -1143,17 +1164,6 @@ impl MimeFactory {
                 _ => None,
             };
 
-            // Do not anonymize OpenPGP recipients.
-            //
-            // This is disabled to avoid interoperability problems
-            // with old core versions <1.160.0 that do not support
-            // receiving messages with wildcard Key IDs:
-            // <https://github.com/chatmail/core/issues/7378>
-            //
-            // The option should be changed to true
-            // once new core versions are sufficiently deployed.
-            let anonymous_recipients = false;
-
             if context.get_config_bool(Config::TestHooks).await?
                 && let Some(hook) = &*context.pre_encrypt_mime_hook.lock()
             {
@@ -1168,14 +1178,13 @@ impl MimeFactory {
             } else {
                 // Asymmetric encryption
 
-                let seipd_version = if encryption_pubkeys.is_empty() {
-                    // If message is sent only to self,
-                    // use v2 SEIPD.
+                // Use SEIPDv2 if all recipients support it.
+                let seipd_version = if encryption_pubkeys
+                    .iter()
+                    .all(|(_addr, pubkey)| pubkey_supports_seipdv2(pubkey))
+                {
                     SeipdVersion::V2
                 } else {
-                    // If message is sent to others,
-                    // they may not support v2 SEIPD yet,
-                    // so use v1 SEIPD.
                     SeipdVersion::V1
                 };
 
@@ -1191,7 +1200,6 @@ impl MimeFactory {
                         encryption_keyring,
                         message,
                         compress,
-                        anonymous_recipients,
                         seipd_version,
                     )
                     .await?
@@ -1409,9 +1417,9 @@ impl MimeFactory {
                             .await?
                             .unwrap_or_default()
                     {
-                        placeholdertext = Some("I left the group.".to_string());
+                        placeholdertext = Some(format!("{email_to_remove} left the group."));
                     } else {
-                        placeholdertext = Some(format!("I removed member {email_to_remove}."));
+                        placeholdertext = Some(format!("Member {email_to_remove} was removed."));
                     };
 
                     if !email_to_remove.is_empty() {
@@ -1434,7 +1442,7 @@ impl MimeFactory {
                     let email_to_add = msg.param.get(Param::Arg).unwrap_or_default();
                     let fingerprint_to_add = msg.param.get(Param::Arg4).unwrap_or_default();
 
-                    placeholdertext = Some(format!("I added member {email_to_add}."));
+                    placeholdertext = Some(format!("Member {email_to_add} was added."));
 
                     if !email_to_add.is_empty() {
                         headers.push((
@@ -1459,6 +1467,7 @@ impl MimeFactory {
                     }
                 }
                 SystemMessage::GroupNameChanged => {
+                    placeholdertext = Some("Chat name changed.".to_string());
                     let old_name = msg.param.get(Param::Arg).unwrap_or_default().to_string();
                     headers.push((
                         "Chat-Group-Name-Changed",
@@ -1475,6 +1484,7 @@ impl MimeFactory {
                     ));
                 }
                 SystemMessage::GroupImageChanged => {
+                    placeholdertext = Some("Chat image changed.".to_string());
                     headers.push((
                         "Chat-Content",
                         mail_builder::headers::text::Text::new("group-avatar-changed").into(),
@@ -1486,7 +1496,24 @@ impl MimeFactory {
                         ));
                     }
                 }
-                _ => {}
+                SystemMessage::Unknown => {}
+                SystemMessage::AutocryptSetupMessage => {}
+                SystemMessage::SecurejoinMessage => {}
+                SystemMessage::LocationStreamingEnabled => {}
+                SystemMessage::LocationOnly => {}
+                SystemMessage::EphemeralTimerChanged => {}
+                SystemMessage::ChatProtectionEnabled => {}
+                SystemMessage::ChatProtectionDisabled => {}
+                SystemMessage::InvalidUnencryptedMail => {}
+                SystemMessage::SecurejoinWait => {}
+                SystemMessage::SecurejoinWaitTimeout => {}
+                SystemMessage::MultiDeviceSync => {}
+                SystemMessage::WebxdcStatusUpdate => {}
+                SystemMessage::WebxdcInfoMessage => {}
+                SystemMessage::IrohNodeAddr => {}
+                SystemMessage::ChatE2ee => {}
+                SystemMessage::CallAccepted => {}
+                SystemMessage::CallEnded => {}
             }
 
             if command == SystemMessage::GroupDescriptionChanged
@@ -1499,7 +1526,7 @@ impl MimeFactory {
                 let description = chat::get_chat_description(context, chat.id).await?;
                 headers.push((
                     "Chat-Group-Description",
-                    mail_builder::headers::text::Text::new(description.clone()).into(),
+                    mail_builder::headers::raw::Raw::new(b_encode(&description)).into(),
                 ));
                 if let Some(ts) = chat.param.get_i64(Param::GroupDescriptionTimestamp) {
                     headers.push((
@@ -1527,25 +1554,14 @@ impl MimeFactory {
             | SystemMessage::MultiDeviceSync
             | SystemMessage::WebxdcStatusUpdate => {
                 // This should prevent automatic replies,
-                // such as non-delivery reports.
+                // such as non-delivery reports,
+                // if the message is unencrypted.
                 //
                 // See <https://tools.ietf.org/html/rfc3834>
-                //
-                // Adding this header without encryption leaks some
-                // information about the message contents, but it can
-                // already be easily guessed from message timing and size.
                 headers.push((
                     "Auto-Submitted",
                     mail_builder::headers::raw::Raw::new("auto-generated").into(),
                 ));
-            }
-            SystemMessage::AutocryptSetupMessage => {
-                headers.push((
-                    "Autocrypt-Setup-Message",
-                    mail_builder::headers::raw::Raw::new("v1").into(),
-                ));
-
-                placeholdertext = Some(ASM_SUBJECT.to_string());
             }
             SystemMessage::SecurejoinMessage => {
                 let step = msg.param.get(Param::Arg).unwrap_or_default();
@@ -1935,7 +1951,7 @@ impl MimeFactory {
 }
 
 /// Stores the unprotected headers on the outer message, and renders it.
-fn render_outer_message(
+pub(crate) fn render_outer_message(
     unprotected_headers: Vec<(&'static str, HeaderType<'static>)>,
     outer_message: MimePart<'static>,
 ) -> String {
@@ -1953,7 +1969,7 @@ fn render_outer_message(
 
 /// Takes the encrypted part, wraps it in a MimePart,
 /// and sets the appropriate Content-Type for the outer message
-fn wrap_encrypted_part(encrypted: String) -> MimePart<'static> {
+pub(crate) fn wrap_encrypted_part(encrypted: String) -> MimePart<'static> {
     // XXX: additional newline is needed
     // to pass filtermail at
     // <https://github.com/deltachat/chatmail/blob/4d915f9800435bf13057d41af8d708abd34dbfa8/chatmaild/src/chatmaild/filtermail.py#L84-L86>:
@@ -2164,12 +2180,7 @@ fn group_headers_by_confidentiality(
                         mail_builder::headers::raw::Raw::new("[...]").into(),
                     ));
                 }
-                "in-reply-to"
-                | "references"
-                | "auto-submitted"
-                | "chat-version"
-                | "autocrypt-setup-message"
-                | "chat-is-post-message" => {
+                "chat-version" | "autocrypt-setup-message" | "chat-is-post-message" => {
                     unprotected_headers.push(header.clone());
                 }
                 _ => {
@@ -2304,6 +2315,7 @@ pub(crate) async fn render_symm_encrypted_securejoin_message(
     rfc724_mid: &str,
     attach_self_pubkey: bool,
     auth: &str,
+    shared_secret: &str,
 ) -> Result<String> {
     info!(context, "Sending secure-join message {step:?}.");
 
@@ -2396,7 +2408,7 @@ pub(crate) async fn render_symm_encrypted_securejoin_message(
         // Only sign the message if we attach the pubkey.
         let sign = attach_self_pubkey;
         let encrypted = encrypt_helper
-            .encrypt_symmetrically(context, auth, message, compress, sign)
+            .encrypt_symmetrically(context, shared_secret, message, compress, sign)
             .await?;
 
         wrap_encrypted_part(encrypted)

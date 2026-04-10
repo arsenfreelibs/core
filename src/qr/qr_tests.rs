@@ -721,7 +721,9 @@ async fn test_decode_account() -> Result<()> {
 
     for text in [
         "DCACCOUNT:example.org",
+        "DCACCOUNT://example.org",
         "dcaccount:example.org",
+        "dcaccount://example.org",
         "DCACCOUNT:https://example.org/new_email?t=1w_7wDjgjelxeX884x96v3",
         "dcaccount:https://example.org/new_email?t=1w_7wDjgjelxeX884x96v3",
     ] {
@@ -732,6 +734,21 @@ async fn test_decode_account() -> Result<()> {
                 domain: "example.org".to_string()
             }
         );
+    }
+
+    Ok(())
+}
+
+/// Tests that decoding empty `dcaccount://` URL results in an error.
+/// We should not suggest trying to configure an account in this case.
+/// Such links may be created by copy-paste error or because of incorrect parsing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_decode_empty_account() -> Result<()> {
+    let ctx = TestContext::new().await;
+
+    for text in ["DCACCOUNT:", "dcaccount:", "dcaccount://", "dcaccount:///"] {
+        let qr = check_qr(&ctx.ctx, text).await;
+        assert!(qr.is_err(), "Invalid {text:?} is parsed as dcaccount URL");
     }
 
     Ok(())
@@ -870,6 +887,32 @@ async fn test_set_proxy_config_from_qr() -> Result<()> {
             "socks5://1.2.3.4:1080\nss://YWVzLTEyOC1nY206dGVzdA@192.168.100.1:8888#Example1\nsocks5://foo:666\nsocks5://Da:x%26%25%24X@jau:1080"
                 .to_string()
         )
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_dont_encode_hyphen_in_proxy_hostnames() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let t = &tcm.alice().await;
+
+    let qr_text = "socks5://my-proxy.example.org";
+
+    let qr = check_qr(t, qr_text).await?;
+    assert_eq!(
+        qr,
+        Qr::Proxy {
+            url: "socks5://my-proxy.example.org".to_string(),
+            host: "my-proxy.example.org".to_string(),
+            port: 1080,
+        }
+    );
+
+    set_config_from_qr(t, "socks5://my-proxy.example.org").await?;
+    assert_eq!(
+        t.get_config(Config::ProxyUrl).await?,
+        Some("socks5://my-proxy.example.org:1080".to_string())
     );
 
     Ok(())

@@ -282,7 +282,7 @@ async fn test_add_or_lookup() {
 
     // check SELF
     let contact = Contact::get_by_id(&t, ContactId::SELF).await.unwrap();
-    assert_eq!(contact.get_name(), stock_str::self_msg(&t).await);
+    assert_eq!(contact.get_name(), stock_str::self_msg(&t));
     assert_eq!(contact.get_addr(), "alice@example.org");
     assert!(!contact.is_blocked());
 }
@@ -420,12 +420,16 @@ async fn test_delete() -> Result<()> {
     Contact::delete(&alice, contact_id).await?;
     let contact = Contact::get_by_id(&alice, contact_id).await?;
     assert_eq!(contact.origin, Origin::Hidden);
+
+    // Hidden contacts are found when searching by email address
     assert_eq!(
         Contact::get_all(&alice, 0, Some("bob@example.net"))
             .await?
             .len(),
-        0
+        1
     );
+    // Hidden contacts are not found by a non-address query
+    assert_eq!(Contact::get_all(&alice, 0, Some("bob")).await?.len(), 0);
 
     // Delete chat.
     chat.get_id().delete(&alice).await?;
@@ -483,7 +487,7 @@ async fn test_delete_and_recreate_contact() -> Result<()> {
         Contact::get_all(&t, 0, Some("bob@example.net"))
             .await?
             .len(),
-        0
+        1
     );
 
     let contact_id3 = t.add_or_lookup_contact_id(&bob).await;
@@ -841,7 +845,10 @@ Me (alice@example.org):
 
 bob@example.net (bob@example.net):
 CCCB 5AA9 F6E1 141C 9431
-65F1 DB18 B18C BCF7 0487"
+65F1 DB18 B18C BCF7 0487
+
+Relays:
+bob@example.net"
     );
     let contact = Contact::get_by_id(alice, contact_bob_id).await?;
     assert!(contact.e2ee_avail(alice).await?);
@@ -1145,8 +1152,11 @@ async fn test_make_n_import_vcard() -> Result<()> {
     let alice = &tcm.alice().await;
     let bob = &tcm.bob().await;
     bob.set_config(Config::Displayname, Some("Bob")).await?;
-    bob.set_config(Config::Selfstatus, Some("It's me, bob"))
-        .await?;
+    bob.set_config(
+        Config::Selfstatus,
+        Some("It's me,\nbob; and here's a backslash: \\"),
+    )
+    .await?;
     let avatar_path = bob.dir.path().join("avatar.png");
     let avatar_bytes = include_bytes!("../../test-data/image/avatar64x64.png");
     let avatar_base64 = base64::engine::general_purpose::STANDARD.encode(avatar_bytes);

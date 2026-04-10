@@ -45,6 +45,7 @@ use crate::securejoin::{
     self, get_secure_join_step, handle_securejoin_handshake, observe_securejoin_on_other_device,
 };
 use crate::simplify;
+use crate::smtp::msg_has_pending_smtp_job;
 use crate::stats::STATISTICS_BOT_EMAIL;
 use crate::stock_str;
 use crate::sync::Sync::*;
@@ -582,14 +583,7 @@ pub(crate) async fn receive_imf_inner(
                 (rfc724_mid_orig, &self_addr),
             )
             .await?;
-        if !context
-            .sql
-            .exists(
-                "SELECT COUNT(*) FROM smtp WHERE rfc724_mid=?",
-                (rfc724_mid_orig,),
-            )
-            .await?
-        {
+        if !msg_has_pending_smtp_job(context, msg_id).await? {
             msg_id.set_delivered(context).await?;
         }
         return Ok(None);
@@ -727,10 +721,9 @@ pub(crate) async fn receive_imf_inner(
         let show_emails = ShowEmails::from_i32(context.get_config_int(Config::ShowEmails).await?)
             .unwrap_or_default();
 
-        let allow_creation = if mime_parser.decrypting_failed {
+        let allow_creation = if mime_parser.decryption_error.is_some() {
             false
-        } else if mime_parser.is_system_message != SystemMessage::AutocryptSetupMessage
-            && is_dc_message == MessengerMessage::No
+        } else if is_dc_message == MessengerMessage::No
             && !context.get_config_bool(Config::IsChatmail).await?
         {
             // the message is a classic email in a classic profile
@@ -861,6 +854,10 @@ UPDATE config SET value=? WHERE keyname='configured_addr' AND value!=?1
                 if transport_changed {
                     info!(context, "Primary transport changed to {from_addr:?}.");
                     context.sql.uncache_raw_config("configured_addr").await;
+
+                    // Regenerate User ID in V4 keys.
+                    context.self_public_key.lock().await.take();
+
                     context.emit_event(EventType::TransportsModified);
                 }
             } else {
@@ -876,15 +873,26 @@ UPDATE config SET value=? WHERE keyname='configured_addr' AND value!=?1
         let instance = if mime_parser
             .parts
             .first()
-            .filter(|part| part.typ == Viewtype::Webxdc)
-            .is_some()
+            .is_some_and(|part| part.typ == Viewtype::Webxdc)
         {
             can_info_msg = false;
-            Some(
-                Message::load_from_db(context, insert_msg_id)
-                    .await
-                    .context("Failed to load just created webxdc instance")?,
-            )
+            if mime_parser.pre_message == PreMessageMode::Post
+                && let Some(msg_id) = message::rfc724_mid_exists(context, rfc724_mid_orig).await?
+            {
+                // The messsage is a post-message and pre-message exists.
+                // Assign status update to existing message because just received post-message will be trashed.
+                Some(
+                    Message::load_from_db(context, msg_id)
+                        .await
+                        .context("Failed to load webxdc instance that we just checked exists")?,
+                )
+            } else {
+                Some(
+                    Message::load_from_db(context, insert_msg_id)
+                        .await
+                        .context("Failed to load just created webxdc instance")?,
+                )
+            }
         } else if let Some(field) = mime_parser.get_header(HeaderDef::InReplyTo) {
             if let Some(instance) =
                 message::get_by_rfc724_mids(context, &parse_message_ids(field)).await?
@@ -1008,11 +1016,11 @@ UPDATE config SET value=? WHERE keyname='configured_addr' AND value!=?1
                         && msg.chat_visibility == ChatVisibility::Archived;
                     updated_chats
                         .entry(msg.chat_id)
-                        .and_modify(|ts| *ts = cmp::max(*ts, msg.timestamp_sort))
-                        .or_insert(msg.timestamp_sort);
+                        .and_modify(|pos| *pos = cmp::max(*pos, (msg.timestamp_sort, msg.id)))
+                        .or_insert((msg.timestamp_sort, msg.id));
                 }
             }
-            for (chat_id, timestamp_sort) in updated_chats {
+            for (chat_id, (timestamp_sort, msg_id)) in updated_chats {
                 context
                     .sql
                     .execute(
@@ -1021,12 +1029,13 @@ UPDATE msgs SET state=? WHERE
     state=? AND
     hidden=0 AND
     chat_id=? AND
-    timestamp<?",
+    (timestamp,id)<(?,?)",
                         (
                             MessageState::InNoticed,
                             MessageState::InFresh,
                             chat_id,
                             timestamp_sort,
+                            msg_id,
                         ),
                     )
                     .await
@@ -1209,14 +1218,18 @@ async fn decide_chat_assignment(
     {
         info!(context, "Call state changed (TRASH).");
         true
-    } else if mime_parser.decrypting_failed && !mime_parser.incoming {
+    } else if let Some(ref decryption_error) = mime_parser.decryption_error
+        && !mime_parser.incoming
+    {
         // Outgoing undecryptable message.
         let last_time = context
             .get_config_i64(Config::LastCantDecryptOutgoingMsgs)
             .await?;
         let now = tools::time();
         let update_config = if last_time.saturating_add(24 * 60 * 60) <= now {
-            let txt = "⚠️ It seems you are using Delta Chat on multiple devices that cannot decrypt each other's outgoing messages. To fix this, on the older device use \"Settings / Add Second Device\" and follow the instructions.";
+            let txt = format!(
+                "⚠️ It seems you are using Delta Chat on multiple devices that cannot decrypt each other's outgoing messages. To fix this, on the older device use \"Settings / Add Second Device\" and follow the instructions. (Error: {decryption_error}, {rfc724_mid})."
+            );
             let mut msg = Message::new_text(txt.to_string());
             chat::add_device_msg(context, None, Some(&mut msg))
                 .await
@@ -1318,15 +1331,35 @@ async fn decide_chat_assignment(
     // no database row and ChatId yet.
     let mut num_recipients = 0;
     let mut has_self_addr = false;
-    for recipient in &mime_parser.recipients {
-        has_self_addr |= context.is_self_addr(&recipient.addr).await?;
-        if addr_cmp(&recipient.addr, &mime_parser.from.addr) {
-            continue;
+
+    if let Some((sender_fingerprint, intended_recipient_fingerprints)) = mime_parser
+        .signature
+        .as_ref()
+        .filter(|(_sender_fingerprint, fps)| !fps.is_empty())
+    {
+        // The message is signed and has intended recipient fingerprints.
+
+        // If the message has intended recipient fingerprint and is not trashed already,
+        // then it is intended for us.
+        has_self_addr = true;
+
+        num_recipients = intended_recipient_fingerprints
+            .iter()
+            .filter(|fp| *fp != sender_fingerprint)
+            .count();
+    } else {
+        // Message has no intended recipient fingerprints
+        // or is not signed, count the `To` field recipients.
+        for recipient in &mime_parser.recipients {
+            has_self_addr |= context.is_self_addr(&recipient.addr).await?;
+            if addr_cmp(&recipient.addr, &mime_parser.from.addr) {
+                continue;
+            }
+            num_recipients += 1;
         }
-        num_recipients += 1;
-    }
-    if from_id != ContactId::SELF && !has_self_addr {
-        num_recipients += 1;
+        if from_id != ContactId::SELF && !has_self_addr {
+            num_recipients += 1;
+        }
     }
     let mut can_be_11_chat_log = String::new();
     let mut l = |cond: bool, s: String| {
@@ -1813,6 +1846,16 @@ async fn add_parts(
         }
     }
 
+    // Sort message to the bottom if we are not in the chat
+    // so if we are added via QR code scan
+    // the message about our addition goes after all the info messages.
+    // Info messages are sorted by local smeared_timestamp()
+    // which advances quickly during SecureJoin,
+    // while "member added" message may have older timestamp
+    // corresponding to the sender clock.
+    // In practice inviter clock may even be slightly in the past.
+    let sort_to_bottom = !chat.is_self_in_chat(context).await?;
+
     let is_location_kml = mime_parser.location_kml.is_some();
     let mut group_changes = match chat.typ {
         _ if chat.id.is_special() => GroupChangesInfo::default(),
@@ -1863,16 +1906,8 @@ async fn add_parts(
     };
     let in_fresh = state == MessageState::InFresh;
 
-    let sort_to_bottom = false;
-    let received = true;
     let sort_timestamp = chat_id
-        .calc_sort_timestamp(
-            context,
-            mime_parser.timestamp_sent,
-            sort_to_bottom,
-            received,
-            mime_parser.incoming,
-        )
+        .calc_sort_timestamp(context, mime_parser.timestamp_sent, sort_to_bottom)
         .await?;
 
     // Apply ephemeral timer changes to the chat.
@@ -2268,7 +2303,7 @@ RETURNING id
                     if trash { 0 } else { ephemeral_timestamp },
                     if trash {
                         DownloadState::Done
-                    } else if mime_parser.decrypting_failed {
+                    } else if mime_parser.decryption_error.is_some() {
                         DownloadState::Undecipherable
                     } else if let PreMessageMode::Pre {..} = mime_parser.pre_message {
                         DownloadState::Available
@@ -2332,7 +2367,7 @@ RETURNING id
 
     info!(
         context,
-        "Message has {icnt} parts and is assigned to chat #{chat_id}."
+        "Message has {icnt} parts and is assigned to chat #{chat_id}, timestamp={sort_timestamp}."
     );
 
     if !chat_id.is_trash() && !hidden {
@@ -2681,7 +2716,7 @@ async fn lookup_or_create_adhoc_group(
     allow_creation: bool,
     create_blocked: Blocked,
 ) -> Result<Option<(ChatId, Blocked, bool)>> {
-    if mime_parser.decrypting_failed {
+    if mime_parser.decryption_error.is_some() {
         warn!(
             context,
             "Not creating ad-hoc group for message that cannot be decrypted."
@@ -2903,7 +2938,7 @@ async fn create_group(
 
     if let Some(chat_id) = chat_id {
         Ok(Some((chat_id, chat_id_blocked)))
-    } else if mime_parser.decrypting_failed {
+    } else if mime_parser.decryption_error.is_some() {
         // It is possible that the message was sent to a valid,
         // yet unknown group, which was rejected because
         // Chat-Group-Name, which is in the encrypted part, was
@@ -3332,8 +3367,13 @@ async fn apply_chat_name_avatar_and_description_changes(
             .is_some()
         {
             let old_name = &sanitize_single_line(old_name);
-            better_msg
-                .get_or_insert(stock_str::msg_grp_name(context, old_name, grpname, from_id).await);
+            better_msg.get_or_insert(
+                if matches!(chat.typ, Chattype::InBroadcast | Chattype::OutBroadcast) {
+                    stock_str::msg_broadcast_name_changed(context, old_name, grpname)
+                } else {
+                    stock_str::msg_grp_name(context, old_name, grpname, from_id).await
+                },
+            );
         }
     }
 
@@ -3390,10 +3430,18 @@ async fn apply_chat_name_avatar_and_description_changes(
     {
         // this is just an explicit message containing the group-avatar,
         // apart from that, the group-avatar is send along with various other messages
-        better_msg.get_or_insert(match avatar_action {
-            AvatarAction::Delete => stock_str::msg_grp_img_deleted(context, from_id).await,
-            AvatarAction::Change(_) => stock_str::msg_grp_img_changed(context, from_id).await,
-        });
+        better_msg.get_or_insert(
+            if matches!(chat.typ, Chattype::InBroadcast | Chattype::OutBroadcast) {
+                stock_str::msg_broadcast_img_changed(context)
+            } else {
+                match avatar_action {
+                    AvatarAction::Delete => stock_str::msg_grp_img_deleted(context, from_id).await,
+                    AvatarAction::Change(_) => {
+                        stock_str::msg_grp_img_changed(context, from_id).await
+                    }
+                }
+            },
+        );
     }
 
     if let Some(avatar_action) = &mime_parser.group_avatar {
@@ -3526,7 +3574,14 @@ async fn create_or_lookup_mailinglist_or_broadcast(
             chattype,
             &listid,
             name,
-            create_blocked,
+            if chattype == Chattype::InBroadcast {
+                // If we joined the broadcast, we have scanned a QR code.
+                // Even if 1:1 chat does not exist or is in a contact request,
+                // create the channel as unblocked.
+                Blocked::Not
+            } else {
+                create_blocked
+            },
             param,
             mime_parser.timestamp_sent,
         )
@@ -3824,7 +3879,7 @@ async fn apply_in_broadcast_changes(
             info!(context, "No-op broadcast 'Member added' message (TRASH)");
             "".to_string()
         } else {
-            stock_str::msg_you_joined_broadcast(context).await
+            stock_str::msg_you_joined_broadcast(context)
         };
 
         better_msg.get_or_insert(msg);
@@ -3840,7 +3895,7 @@ async fn apply_in_broadcast_changes(
         chat::delete_broadcast_secret(context, chat.id).await?;
 
         if from_id == ContactId::SELF {
-            better_msg.get_or_insert(stock_str::msg_you_left_broadcast(context).await);
+            better_msg.get_or_insert(stock_str::msg_you_left_broadcast(context));
         } else {
             better_msg.get_or_insert(
                 stock_str::msg_del_member_local(context, ContactId::SELF, from_id).await,

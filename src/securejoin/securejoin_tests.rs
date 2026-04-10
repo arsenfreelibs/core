@@ -12,7 +12,7 @@ use crate::key::self_fingerprint;
 use crate::mimeparser::{GossipedKey, SystemMessage};
 use crate::qr::Qr;
 use crate::receive_imf::receive_imf;
-use crate::stock_str::{self, messages_e2e_encrypted};
+use crate::stock_str::{self, messages_e2ee_info_msg};
 use crate::test_utils::{
     AVATAR_64x64_BYTES, AVATAR_64x64_DEDUPLICATED, TestContext, TestContextManager,
     TimeShiftFalsePositiveNote, get_chat_msg, sync,
@@ -109,10 +109,10 @@ async fn test_setup_contact_ex(case: SetupContactCase) {
     let mut i = 0..msg_cnt;
     let msg = get_chat_msg(&bob, bob_chat.get_id(), i.next().unwrap(), msg_cnt).await;
     assert!(msg.is_info());
-    assert_eq!(msg.get_text(), messages_e2e_encrypted(&bob).await);
+    assert_eq!(msg.get_text(), messages_e2ee_info_msg(&bob));
     let msg = get_chat_msg(&bob, bob_chat.get_id(), i.next().unwrap(), msg_cnt).await;
     assert!(msg.is_info());
-    assert_eq!(msg.get_text(), stock_str::securejoin_wait(&bob).await);
+    assert_eq!(msg.get_text(), stock_str::securejoin_wait(&bob));
 
     let contact_alice_id = bob.add_or_lookup_contact_no_key(&alice).await.id;
     let sent = bob.pop_sent_msg().await;
@@ -138,14 +138,15 @@ async fn test_setup_contact_ex(case: SetupContactCase) {
     );
 
     let sent = alice.pop_sent_msg().await;
-    assert_eq!(
-        sent.payload.contains("Auto-Submitted: auto-generated"),
-        alice_auto_submitted_hdr
-    );
+    assert_eq!(sent.payload.contains("Auto-Submitted:"), false);
     assert!(!sent.payload.contains("Alice Exampleorg"));
     let msg = bob.parse_msg(&sent).await;
     assert!(msg.was_encrypted());
     assert_eq!(msg.get_header(HeaderDef::SecureJoin).unwrap(), "vc-pubkey");
+    assert_eq!(
+        msg.get_header(HeaderDef::AutoSubmitted),
+        alice_auto_submitted_hdr.then_some("auto-generated")
+    );
 
     let bob_chat = bob.get_chat(&alice).await;
     assert_eq!(bob_chat.can_send(&bob).await.unwrap(), true);
@@ -249,7 +250,7 @@ async fn test_setup_contact_ex(case: SetupContactCase) {
         let chat = alice.get_chat(&bob).await;
         let msg = get_chat_msg(&alice, chat.get_id(), 0, 1).await;
         assert!(msg.is_info());
-        let expected_text = messages_e2e_encrypted(&alice).await;
+        let expected_text = messages_e2ee_info_msg(&alice);
         assert_eq!(msg.get_text(), expected_text);
     }
 
@@ -266,7 +267,7 @@ async fn test_setup_contact_ex(case: SetupContactCase) {
     let sent = alice.pop_sent_msg().await;
     assert_eq!(
         sent.payload.contains("Auto-Submitted: auto-generated"),
-        alice_auto_submitted_hdr
+        false
     );
     assert!(!sent.payload.contains("Alice Exampleorg"));
     let msg = bob.parse_msg(&sent).await;
@@ -294,7 +295,7 @@ async fn test_setup_contact_ex(case: SetupContactCase) {
     // The `SecurejoinWait` info message has been removed, but the e2ee notice remains.
     let msg = get_chat_msg(&bob, bob_chat.get_id(), 0, 1).await;
     assert!(msg.is_info());
-    assert_eq!(msg.get_text(), messages_e2e_encrypted(&bob).await);
+    assert_eq!(msg.get_text(), messages_e2ee_info_msg(&bob));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -624,7 +625,7 @@ async fn test_secure_join_group_ex(v3: bool, remove_invite: bool) -> Result<()> 
         // - You added member bob@example.net
         let msg = get_chat_msg(&alice, alice_chatid, 0, 2).await;
         assert!(msg.is_info());
-        let expected_text = messages_e2e_encrypted(&alice).await;
+        let expected_text = messages_e2ee_info_msg(&alice);
         assert_eq!(msg.get_text(), expected_text);
     }
 

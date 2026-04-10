@@ -1,4 +1,5 @@
 import argparse
+import functools
 import os
 import re
 import sys
@@ -189,9 +190,6 @@ class futuremethod:  # noqa: N801
         self._func = func
 
     def __get__(self, instance, owner=None):
-        if instance is None:
-            return self
-
         def future(*args):
             generator = self._func(instance, *args)
             res = next(generator)
@@ -204,6 +202,7 @@ class futuremethod:  # noqa: N801
 
             return f
 
+        @functools.wraps(self._func)
         def wrapper(*args):
             f = future(*args)
             return f()

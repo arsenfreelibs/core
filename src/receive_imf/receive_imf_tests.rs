@@ -13,9 +13,10 @@ use crate::constants::DC_GCL_FOR_FORWARDING;
 use crate::contact;
 use crate::imap::prefetch_should_download;
 use crate::imex::{ImexMode, imex};
+use crate::key;
 use crate::securejoin::get_securejoin_qr;
 use crate::test_utils::{
-    E2EE_INFO_MSGS, TestContext, TestContextManager, get_chat_msg, mark_as_verified,
+    E2EE_INFO_MSGS, TestContext, TestContextManager, alice_keypair, get_chat_msg, mark_as_verified,
 };
 use crate::tools::{SystemTime, time};
 
@@ -819,9 +820,12 @@ async fn load_imf_email(context: &Context, imf_raw: &[u8]) -> Message {
         .set_config(Config::ShowEmails, Some("2"))
         .await
         .unwrap();
-    receive_imf(context, imf_raw, false).await.unwrap();
-    let chats = Chatlist::try_load(context, 0, None, None).await.unwrap();
-    let msg_id = chats.get_msg_id(0).unwrap().unwrap();
+    let received_msg = receive_imf(context, imf_raw, false)
+        .await
+        .expect("receive_imf failure")
+        .expect("No message received");
+    assert_eq!(received_msg.msg_ids.len(), 1);
+    let msg_id = received_msg.msg_ids[0];
     Message::load_from_db(context, msg_id).await.unwrap()
 }
 
@@ -2872,9 +2876,8 @@ async fn test_rfc1847_encapsulation() -> Result<()> {
 
     // Alice sends a message to Bob using Thunderbird.
     let raw = include_bytes!("../../test-data/message/rfc1847_encapsulation.eml");
-    receive_imf(bob, raw, false).await?;
 
-    let msg = bob.get_last_msg().await;
+    let msg = load_imf_email(bob, raw).await;
     assert!(msg.get_showpadlock());
 
     Ok(())
@@ -3082,8 +3085,8 @@ async fn test_auto_accept_for_bots() -> Result<()> {
 async fn test_auto_accept_group_for_bots() -> Result<()> {
     let t = TestContext::new_alice().await;
     t.set_config(Config::Bot, Some("1")).await.unwrap();
-    receive_imf(&t, GRP_MAIL, false).await?;
-    let msg = t.get_last_msg().await;
+    let msg = load_imf_email(&t, GRP_MAIL).await;
+
     let chat = chat::Chat::load_from_db(&t, msg.chat_id).await?;
     assert!(!chat.is_contact_request());
     Ok(())
@@ -3327,7 +3330,7 @@ async fn test_outgoing_undecryptable() -> Result<()> {
     assert!(
         dev_msg
             .text
-            .contains("⚠️ It seems you are using Delta Chat on multiple devices that cannot decrypt each other's outgoing messages. To fix this, on the older device use \"Settings / Add Second Device\" and follow the instructions.")
+            .starts_with("⚠️ It seems you are using Delta Chat on multiple devices that cannot decrypt each other's outgoing messages. To fix this, on the older device use \"Settings / Add Second Device\" and follow the instructions. (Error:")
     );
 
     let raw = include_bytes!("../../test-data/message/thunderbird_encrypted_signed.eml");
@@ -3556,9 +3559,9 @@ async fn test_messed_up_message_id() -> Result<()> {
     let t = TestContext::new_bob().await;
 
     let raw = include_bytes!("../../test-data/message/messed_up_message_id.eml");
-    receive_imf(&t, raw, false).await?;
+    let msg = load_imf_email(&t, raw).await;
     assert_eq!(
-        t.get_last_msg().await.rfc724_mid,
+        msg.rfc724_mid,
         "0bb9ffe1-2596-d997-95b4-1fef8cc4808e@example.org"
     );
 
@@ -5108,97 +5111,75 @@ async fn test_dont_verify_by_verified_by_unknown() -> Result<()> {
     Ok(())
 }
 
+/// Tests that second device assigns outgoing encrypted messages
+/// to 1:1 chat with key-contact even if the key of the contact is unknown.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_recv_outgoing_msg_before_securejoin() -> Result<()> {
     let mut tcm = TestContextManager::new();
     let bob = &tcm.bob().await;
-    let a0 = &tcm.elena().await;
-    let a1 = &tcm.elena().await;
-
-    tcm.execute_securejoin(bob, a0).await;
-    let chat_id_a0_bob = a0.create_chat_id(bob).await;
-    let sent_msg = a0.send_text(chat_id_a0_bob, "Hi").await;
-    bob.recv_msg(&sent_msg).await;
-    let msg_a1 = a1.recv_msg(&sent_msg).await;
-    assert!(msg_a1.get_showpadlock());
-    let chat_a1 = Chat::load_from_db(a1, msg_a1.chat_id).await?;
-    assert_eq!(chat_a1.typ, Chattype::Group);
-    assert!(!chat_a1.is_encrypted(a1).await?);
-    assert_eq!(
-        chat::get_chat_contacts(a1, chat_a1.id).await?,
-        [a1.add_or_lookup_address_contact_id(bob).await]
-    );
-    assert_eq!(
-        chat_a1.why_cant_send(a1).await?,
-        Some(CantSendReason::NotAMember)
-    );
-
-    let sent_msg = a0.send_text(chat_id_a0_bob, "Hi again").await;
-    bob.recv_msg(&sent_msg).await;
-    let msg_a1 = a1.recv_msg(&sent_msg).await;
-    assert!(msg_a1.get_showpadlock());
-    assert_eq!(msg_a1.chat_id, chat_a1.id);
-    let chat_a1 = Chat::load_from_db(a1, msg_a1.chat_id).await?;
-    assert_eq!(
-        chat_a1.why_cant_send(a1).await?,
-        Some(CantSendReason::NotAMember)
-    );
-
-    let msg_a1 = tcm.send_recv(bob, a1, "Hi back").await;
-    assert!(msg_a1.get_showpadlock());
-    let chat_a1 = Chat::load_from_db(a1, msg_a1.chat_id).await?;
-    assert_eq!(chat_a1.typ, Chattype::Single);
-    assert!(chat_a1.is_encrypted(a1).await?);
-    // Weird, but fine, anyway the bigger problem is the conversation split into two chats.
-    assert_eq!(
-        chat_a1.why_cant_send(a1).await?,
-        Some(CantSendReason::ContactRequest)
-    );
-
     let a0 = &tcm.alice().await;
     let a1 = &tcm.alice().await;
+
     tcm.execute_securejoin(bob, a0).await;
     let chat_id_a0_bob = a0.create_chat_id(bob).await;
     let sent_msg = a0.send_text(chat_id_a0_bob, "Hi").await;
-    bob.recv_msg(&sent_msg).await;
+
+    // Device a1 does not have Bob's key.
+    // Message is still received in an encrypted 1:1 chat with Bob.
+    // a1 learns the fingerprint of Bob from the Intended Recipient Fingerprint packet,
+    // but not the key.
     let msg_a1 = a1.recv_msg(&sent_msg).await;
     assert!(msg_a1.get_showpadlock());
     let chat_a1 = Chat::load_from_db(a1, msg_a1.chat_id).await?;
     assert_eq!(chat_a1.typ, Chattype::Single);
     assert!(chat_a1.is_encrypted(a1).await?);
+
+    // Cannot send because a1 does not have Bob's key.
+    assert!(!chat_a1.can_send(a1).await?);
+    assert_eq!(
+        chat_a1.why_cant_send(a1).await?,
+        Some(CantSendReason::MissingKey)
+    );
+
     assert_eq!(
         chat::get_chat_contacts(a1, chat_a1.id).await?,
-        [a1.add_or_lookup_contact_id(bob).await]
+        [a1.add_or_lookup_contact_id_no_key(bob).await]
     );
-    assert!(chat_a1.can_send(a1).await?);
+    assert!(!chat_a1.can_send(a1).await?);
+
+    let a1_chat_id = a1.create_chat_id(bob).await;
+    assert_eq!(a1_chat_id, msg_a1.chat_id);
     Ok(())
 }
 
+/// Tests that outgoing message cannot be assigned to 1:1 chat
+/// without the intended recipient fingerprint.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_recv_outgoing_msg_before_having_key_and_after() -> Result<()> {
+async fn test_recv_outgoing_msg_no_intended_recipient_fingerprint() -> Result<()> {
     let mut tcm = TestContextManager::new();
-    let a0 = &tcm.elena().await;
-    let a1 = &tcm.elena().await;
-    let bob = &tcm.bob().await;
+    let alice = &tcm.alice().await;
 
-    tcm.execute_securejoin(bob, a0).await;
-    let chat_id_a0_bob = a0.create_chat_id(bob).await;
-    let sent_msg = a0.send_text(chat_id_a0_bob, "Hi").await;
-    let msg_a1 = a1.recv_msg(&sent_msg).await;
-    assert!(msg_a1.get_showpadlock());
-    let chat_a1 = Chat::load_from_db(a1, msg_a1.chat_id).await?;
-    assert_eq!(chat_a1.typ, Chattype::Group);
-    assert!(!chat_a1.is_encrypted(a1).await?);
+    let payload = include_bytes!(
+        "../../test-data/message/alice_to_bob_no_intended_recipient_fingerprint.eml"
+    );
 
-    // Device a1 somehow learns Bob's key and creates the corresponding chat. However, this doesn't
-    // help because we only look up key contacts by address in a particular chat and the new chat
-    // isn't referenced by the received message. This is fixed by sending and receiving Intended
-    // Recipient Fingerprint subpackets which elena doesn't send.
-    a1.create_chat_id(bob).await;
-    let sent_msg = a0.send_text(chat_id_a0_bob, "Hi again").await;
-    let msg_a1 = a1.recv_msg(&sent_msg).await;
-    assert!(msg_a1.get_showpadlock());
-    assert_eq!(msg_a1.chat_id, chat_a1.id);
+    // Alice does not have Bob's key.
+    // Message is encrypted, but is received in ad hoc group with Bob's address.
+    let rcvd_msg = receive_imf(alice, payload, false).await?.unwrap();
+    let msg_alice = Message::load_from_db(alice, rcvd_msg.msg_ids[0]).await?;
+
+    assert!(msg_alice.get_showpadlock());
+    let chat_alice = Chat::load_from_db(alice, msg_alice.chat_id).await?;
+    assert_eq!(chat_alice.typ, Chattype::Group);
+    assert!(!chat_alice.is_encrypted(alice).await?);
+
+    // Cannot send because Bob's key is unknown.
+    assert!(!chat_alice.can_send(alice).await?);
+    assert_eq!(
+        chat_alice.why_cant_send(alice).await?,
+        Some(CantSendReason::NotAMember)
+    );
+
     Ok(())
 }
 
@@ -5380,6 +5361,46 @@ async fn test_outgoing_unencrypted_chat_assignment() {
 
     let chat = alice.create_email_chat(bob).await;
     assert_eq!(received.chat_id, chat.id);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_incoming_reply_with_date_in_past() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+
+    let msg0 = receive_imf(
+        alice,
+        b"From: bob@example.net\n\
+          To: alice@example.org\n\
+          Message-ID: <message@example.net>\n\
+          Date: Sun, 22 Mar 2020 22:22:22 +0000\n\
+          \n\
+          This device has an atomic clock\n",
+        false,
+    )
+    .await?
+    .unwrap();
+
+    let msg1 = receive_imf(
+        alice,
+        b"From: bob@example.net\n\
+          To: alice@example.org\n\
+          Message-ID: <message1@example.net>\n\
+          In-Reply-To: <message@example.net>\n\
+          Date: Sun, 22 Mar 2020 11:11:11 +0000\n\
+          \n\
+          And this one has a wind-up clock\n",
+        false,
+    )
+    .await?
+    .unwrap();
+    assert_eq!(msg1.chat_id, msg0.chat_id);
+    assert!(msg1.sort_timestamp >= msg0.sort_timestamp);
+    assert_eq!(
+        alice.get_last_msg_in(msg0.chat_id).await.id,
+        *msg1.msg_ids.last().unwrap()
+    );
+    Ok(())
 }
 
 /// Tests Bob receiving a message from Alice
@@ -5580,4 +5601,91 @@ async fn test_calendar_alternative() -> Result<()> {
     assert_eq!(html, "<b>Hello!</b>");
 
     Ok(())
+}
+
+/// Tests that outgoing encrypted messages are detected
+/// by verifying own signature, completely ignoring From address.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_outgoing_determined_by_signature() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+
+    // alice_dev2: same key, different address.
+    let different_from = "very@different.from";
+    assert!(!alice.is_self_addr(different_from).await?);
+    let alice_dev2 = &tcm.unconfigured().await;
+    alice_dev2.configure_addr(different_from).await;
+    key::store_self_keypair(alice_dev2, &alice_keypair()).await?;
+    assert_ne!(
+        alice.get_config(Config::Addr).await?.unwrap(),
+        different_from
+    );
+
+    // Send message from alice_dev2 and check alice sees it as outgoing
+    let chat_id = alice_dev2.create_chat_id(bob).await;
+    let sent_msg = alice_dev2.send_text(chat_id, "hello from new device").await;
+    let msg = alice.recv_msg(&sent_msg).await;
+    assert_eq!(msg.state, MessageState::OutDelivered);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_mark_message_as_delivered_only_after_sent_out_fully() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+    alice.set_config_bool(Config::BccSelf, true).await?;
+    let alice_chat_id = alice.create_chat_id(bob).await;
+
+    let file_bytes = include_bytes!("../../test-data/image/screenshot.gif");
+    let mut msg = Message::new(Viewtype::Image);
+    msg.set_file_from_bytes(alice, "a.jpg", file_bytes, None)?;
+    let msg_id = chat::send_msg(alice, alice_chat_id, &mut msg)
+        .await
+        .unwrap();
+
+    let (pre_msg_id, pre_msg_payload) = first_row_in_smtp_queue(alice).await;
+    assert_eq!(msg_id, pre_msg_id);
+    assert!(pre_msg_payload.len() < file_bytes.len());
+
+    assert_eq!(msg_id.get_state(alice).await?, MessageState::OutPending);
+    // Alice receives her own pre-message because of bcc_self
+    // This should not yet mark the message as delivered,
+    // because not everything was sent,
+    // but it does remove the pre-message from the SMTP queue
+    receive_imf(alice, pre_msg_payload.as_bytes(), false).await?;
+    assert_eq!(msg_id.get_state(alice).await?, MessageState::OutPending);
+
+    let (post_msg_id, post_msg_payload) = first_row_in_smtp_queue(alice).await;
+    assert_eq!(msg_id, post_msg_id);
+    assert!(post_msg_payload.len() > file_bytes.len());
+
+    assert_eq!(msg_id.get_state(alice).await?, MessageState::OutPending);
+    // Alice receives her own post-message because of bcc_self
+    // This should now mark the message as delivered,
+    // because everything was sent by now.
+    receive_imf(alice, post_msg_payload.as_bytes(), false).await?;
+    assert_eq!(msg_id.get_state(alice).await?, MessageState::OutDelivered);
+
+    Ok(())
+}
+
+/// Queries the first sent message in the SMTP queue
+/// without removing it from the SMTP queue.
+/// This simulates the case that a message is successfully sent out,
+/// but the 'OK' answer from the server doesn't arrive,
+/// so that the SMTP row stays in the database.
+pub(crate) async fn first_row_in_smtp_queue(alice: &TestContext) -> (MsgId, String) {
+    alice
+        .sql
+        .query_row_optional("SELECT msg_id, mime FROM smtp ORDER BY id", (), |row| {
+            let msg_id: MsgId = row.get(0)?;
+            let mime: String = row.get(1)?;
+            Ok((msg_id, mime))
+        })
+        .await
+        .expect("query_row_optional failed")
+        .expect("No SMTP row found")
 }

@@ -17,7 +17,7 @@ use crate::context::Context;
 use crate::e2ee::ensure_secret_key_exists;
 use crate::events::EventType;
 use crate::headerdef::HeaderDef;
-use crate::key::{DcKey, Fingerprint, load_self_public_key};
+use crate::key::{DcKey, Fingerprint, load_self_public_key, self_fingerprint};
 use crate::log::LogExt as _;
 use crate::log::warn;
 use crate::message::{self, Message, MsgId, Viewtype};
@@ -450,10 +450,8 @@ pub(crate) async fn handle_securejoin_handshake(
     ) {
         let mut self_found = false;
         let self_fingerprint = load_self_public_key(context).await?.dc_fingerprint();
-        for (addr, key) in &mime_message.gossiped_keys {
-            if key.public_key.dc_fingerprint() == self_fingerprint
-                && context.is_self_addr(addr).await?
-            {
+        for key in mime_message.gossiped_keys.values() {
+            if key.public_key.dc_fingerprint() == self_fingerprint {
                 self_found = true;
                 break;
             }
@@ -540,12 +538,15 @@ pub(crate) async fn handle_securejoin_handshake(
             let rfc724_mid = create_outgoing_rfc724_mid();
             let addr = ContactAddress::new(&mime_message.from.addr)?;
             let attach_self_pubkey = true;
+            let self_fp = self_fingerprint(context).await?;
+            let shared_secret = format!("securejoin/{self_fp}/{auth}");
             let rendered_message = mimefactory::render_symm_encrypted_securejoin_message(
                 context,
                 "vc-pubkey",
                 &rfc724_mid,
                 attach_self_pubkey,
                 auth,
+                &shared_secret,
             )
             .await?;
 
@@ -641,15 +642,12 @@ pub(crate) async fn handle_securejoin_handshake(
                 mark_contact_id_as_verified(context, contact_id, Some(ContactId::SELF)).await?;
             }
             contact_id.regossip_keys(context).await?;
-            ContactId::scaleup_origin(context, &[contact_id], Origin::SecurejoinInvited).await?;
             // for setup-contact, make Alice's one-to-one chat with Bob visible
             // (secure-join-information are shown in the group chat)
             if grpid.is_empty() {
                 ChatId::create_for_contact(context, contact_id).await?;
             }
-            context.emit_event(EventType::ContactsChanged(Some(contact_id)));
             if let Some(joining_chat_id) = joining_chat_id {
-                // Join group.
                 chat::add_contact_to_chat_ex(context, Nosync, joining_chat_id, contact_id, true)
                     .await?;
 
@@ -659,6 +657,10 @@ pub(crate) async fn handle_securejoin_handshake(
                     // We don't use the membership consistency algorithm for broadcast channels,
                     // so, sync the memberlist when adding a contact
                     chat.sync_contacts(context).await.log_err(context).ok();
+                } else {
+                    ContactId::scaleup_origin(context, &[contact_id], Origin::SecurejoinInvited)
+                        .await?;
+                    context.emit_event(EventType::ContactsChanged(Some(contact_id)));
                 }
 
                 inviter_progress(context, contact_id, joining_chat_id, chat.typ)?;
@@ -835,13 +837,6 @@ pub(crate) async fn observe_securejoin_on_other_device(
         // so we pass invalid chat ID here.
         let chat_id = ChatId::new(0);
         inviter_progress(context, contact_id, chat_id, chat_type)?;
-    }
-
-    if matches!(step, SecureJoinStep::RequestWithAuth) {
-        // This actually reflects what happens on the first device (which does the secure
-        // join) and causes a subsequent "vg-member-added" message to create an unblocked
-        // verified group.
-        ChatId::create_for_contact_with_blocked(context, contact_id, Blocked::Not).await?;
     }
 
     if matches!(step, SecureJoinStep::MemberAdded) {

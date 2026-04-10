@@ -11,8 +11,8 @@ use deltachat::blob::BlobObject;
 use deltachat::calls::ice_servers;
 use deltachat::chat::{
     self, add_contact_to_chat, forward_msgs, forward_msgs_2ctx, get_chat_media, get_chat_msgs,
-    get_chat_msgs_ex, marknoticed_all_chats, marknoticed_chat, remove_contact_from_chat, Chat,
-    ChatId, ChatItem, MessageListOptions,
+    get_chat_msgs_ex, markfresh_chat, marknoticed_all_chats, marknoticed_chat,
+    remove_contact_from_chat, Chat, ChatId, ChatItem, MessageListOptions,
 };
 use deltachat::chatlist::Chatlist;
 use deltachat::config::{get_all_ui_config_keys, Config};
@@ -31,7 +31,7 @@ use deltachat::peer_channels::{
 };
 use deltachat::provider::get_provider_info;
 use deltachat::qr::{self, Qr};
-use deltachat::qr_code_generator::{generate_backup_qr, get_securejoin_qr_svg};
+use deltachat::qr_code_generator::{create_qr_svg, generate_backup_qr, get_securejoin_qr_svg};
 use deltachat::reaction::{get_msg_reactions, send_reaction};
 use deltachat::securejoin;
 use deltachat::stock_str::StockMessage;
@@ -68,6 +68,7 @@ use self::types::{
     },
 };
 use crate::api::types::chat_list::{get_chat_list_item_by_id, ChatListItemFetchResult};
+use crate::api::types::login_param::TransportListEntry;
 use crate::api::types::qr::{QrObject, SecurejoinSource, SecurejoinUiPath};
 
 #[derive(Debug)]
@@ -472,9 +473,7 @@ impl CommandApi {
         let accounts = self.accounts.read().await;
         for (stock_id, stock_message) in strings {
             if let Some(stock_id) = StockMessage::from_u32(stock_id) {
-                accounts
-                    .set_stock_translation(stock_id, stock_message)
-                    .await?;
+                accounts.set_stock_translation(stock_id, stock_message)?;
             }
         }
         Ok(())
@@ -528,6 +527,7 @@ impl CommandApi {
     ///   from a server encoded in a QR code.
     /// - [Self::list_transports()] to get a list of all configured transports.
     /// - [Self::delete_transport()] to remove a transport.
+    /// - [Self::set_transport_unpublished()] to set whether contacts see this transport.
     async fn add_or_update_transport(
         &self,
         account_id: u32,
@@ -553,7 +553,23 @@ impl CommandApi {
     /// Returns the list of all email accounts that are used as a transport in the current profile.
     /// Use [Self::add_or_update_transport()] to add or change a transport
     /// and [Self::delete_transport()] to delete a transport.
+    /// Use [Self::list_transports_ex()] to additionally query
+    /// whether the transports are marked as 'unpublished'.
     async fn list_transports(&self, account_id: u32) -> Result<Vec<EnteredLoginParam>> {
+        let ctx = self.get_context(account_id).await?;
+        let res = ctx
+            .list_transports()
+            .await?
+            .into_iter()
+            .map(|t| t.param.into())
+            .collect();
+        Ok(res)
+    }
+
+    /// Returns the list of all email accounts that are used as a transport in the current profile.
+    /// Use [Self::add_or_update_transport()] to add or change a transport
+    /// and [Self::delete_transport()] to delete a transport.
+    async fn list_transports_ex(&self, account_id: u32) -> Result<Vec<TransportListEntry>> {
         let ctx = self.get_context(account_id).await?;
         let res = ctx
             .list_transports()
@@ -569,6 +585,26 @@ impl CommandApi {
     async fn delete_transport(&self, account_id: u32, addr: String) -> Result<()> {
         let ctx = self.get_context(account_id).await?;
         ctx.delete_transport(&addr).await
+    }
+
+    /// Change whether the transport is unpublished.
+    ///
+    /// Unpublished transports are not advertised to contacts,
+    /// and self-sent messages are not sent there,
+    /// so that we don't cause extra messages to the corresponding inbox,
+    /// but can still receive messages from contacts who don't know our new transport addresses yet.
+    ///
+    /// The default is false, but when the user updates from a version that didn't have this flag,
+    /// existing secondary transports are set to unpublished,
+    /// so that an existing transport address doesn't suddenly get spammed with a lot of messages.
+    async fn set_transport_unpublished(
+        &self,
+        account_id: u32,
+        addr: String,
+        unpublished: bool,
+    ) -> Result<()> {
+        let ctx = self.get_context(account_id).await?;
+        ctx.set_transport_unpublished(&addr, unpublished).await
     }
 
     /// Signal an ongoing process to stop.
@@ -697,25 +733,6 @@ impl CommandApi {
     ) -> Result<usize> {
         let ctx = self.get_context(account_id).await?;
         message::estimate_deletion_cnt(&ctx, from_server, seconds).await
-    }
-
-    // ---------------------------------------------
-    //  autocrypt
-    // ---------------------------------------------
-
-    async fn initiate_autocrypt_key_transfer(&self, account_id: u32) -> Result<String> {
-        let ctx = self.get_context(account_id).await?;
-        deltachat::imex::initiate_key_transfer(&ctx).await
-    }
-
-    async fn continue_autocrypt_key_transfer(
-        &self,
-        account_id: u32,
-        message_id: u32,
-        setup_code: String,
-    ) -> Result<()> {
-        let ctx = self.get_context(account_id).await?;
-        deltachat::imex::continue_key_transfer(&ctx, MsgId::new(message_id), &setup_code).await
     }
 
     // ---------------------------------------------
@@ -863,6 +880,8 @@ impl CommandApi {
     /// The scanning device will pass the scanned content to `checkQr()` then;
     /// if `checkQr()` returns `askVerifyContact` or `askVerifyGroup`
     /// an out-of-band-verification can be joined using `secure_join()`
+    ///
+    /// @deprecated as of 2026-03; use create_qr_svg(get_chat_securejoin_qr_code()) instead.
     ///
     /// chat_id: If set to a group-chat-id,
     ///     the Verified-Group-Invite protocol is offered in the QR code;
@@ -1228,6 +1247,15 @@ impl CommandApi {
     async fn marknoticed_chat(&self, account_id: u32, chat_id: u32) -> Result<()> {
         let ctx = self.get_context(account_id).await?;
         marknoticed_chat(&ctx, ChatId::new(chat_id)).await
+    }
+
+    /// Marks the last incoming message in the chat as _fresh_.
+    ///
+    /// UI can use this to offer a "mark unread" option,
+    /// so that already noticed chats get a badge counter again.
+    async fn markfresh_chat(&self, account_id: u32, chat_id: u32) -> Result<()> {
+        let ctx = self.get_context(account_id).await?;
+        markfresh_chat(&ctx, ChatId::new(chat_id)).await
     }
 
     /// Returns the message that is immediately followed by the last seen
@@ -1980,6 +2008,8 @@ impl CommandApi {
     /// even if there is no concurrent call to [`CommandApi::provide_backup`],
     /// but will fail after 60 seconds to avoid deadlocks.
     ///
+    /// @deprecated as of 2026-03; use `create_qr_svg(get_backup_qr())` instead.
+    ///
     /// Returns the QR code rendered as an SVG image.
     async fn get_backup_qr_svg(&self, account_id: u32) -> Result<String> {
         let ctx = self.get_context(account_id).await?;
@@ -1991,6 +2021,11 @@ impl CommandApi {
         .context("Backup provider did not start in time")?
         .context("Failed to get backup QR code")?;
         generate_backup_qr(&ctx, &qr).await
+    }
+
+    /// Renders the given text as a QR code SVG image.
+    async fn create_qr_svg(&self, text: String) -> Result<String> {
+        create_qr_svg(&text)
     }
 
     /// Gets a backup from a remote provider.

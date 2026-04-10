@@ -49,8 +49,14 @@ pub(super) async fn start_protocol(context: &Context, invite: QrInvite) -> Resul
     // receive_imf.
     let private_chat_id = private_chat_id(context, &invite).await?;
 
-    ContactId::scaleup_origin(context, &[invite.contact_id()], Origin::SecurejoinJoined).await?;
-    context.emit_event(EventType::ContactsChanged(None));
+    match invite {
+        QrInvite::Group { .. } | QrInvite::Contact { .. } => {
+            ContactId::scaleup_origin(context, &[invite.contact_id()], Origin::SecurejoinJoined)
+                .await?;
+            context.emit_event(EventType::ContactsChanged(None));
+        }
+        QrInvite::Broadcast { .. } => {}
+    }
 
     let has_key = context
         .sql
@@ -152,7 +158,7 @@ pub(super) async fn start_protocol(context: &Context, invite: QrInvite) -> Resul
                 chat::add_info_msg_with_cmd(
                     context,
                     private_chat_id,
-                    &stock_str::securejoin_wait(context).await,
+                    &stock_str::securejoin_wait(context),
                     SystemMessage::SecurejoinWait,
                     None,
                     time(),
@@ -306,13 +312,17 @@ pub(crate) async fn send_handshake_message(
         let rfc724_mid = create_outgoing_rfc724_mid();
         let contact = Contact::get_by_id(context, invite.contact_id()).await?;
         let recipient = contact.get_addr();
+        let alice_fp = invite.fingerprint().hex();
+        let auth = invite.authcode();
+        let shared_secret = format!("securejoin/{alice_fp}/{auth}");
         let attach_self_pubkey = false;
         let rendered_message = mimefactory::render_symm_encrypted_securejoin_message(
             context,
             "vc-request-pubkey",
             &rfc724_mid,
             attach_self_pubkey,
-            invite.authcode(),
+            auth,
+            &shared_secret,
         )
         .await?;
 
