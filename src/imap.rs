@@ -18,7 +18,6 @@ use async_channel::{self, Receiver, Sender};
 use async_imap::types::{Fetch, Flag, Name, NameAttribute, UnsolicitedResponse};
 use futures::{FutureExt as _, TryStreamExt};
 use futures_lite::FutureExt;
-use num_traits::FromPrimitive;
 use ratelimit::Ratelimit;
 use url::Url;
 
@@ -28,7 +27,7 @@ use crate::calls::{
 use crate::chat::{self, ChatId, ChatIdBlocked, add_device_msg};
 use crate::chatlist_events;
 use crate::config::Config;
-use crate::constants::{self, Blocked, DC_VERSION_STR, ShowEmails};
+use crate::constants::{self, Blocked, DC_VERSION_STR};
 use crate::contact::ContactId;
 use crate::context::Context;
 use crate::events::EventType;
@@ -208,6 +207,7 @@ impl<T: Iterator<Item = (i64, u32, String)>> Iterator for UidGrouper<T> {
     // Tuple of folder, row IDs, and UID range as a string.
     type Item = (String, Vec<i64>, String);
 
+    #[expect(clippy::arithmetic_side_effects)]
     fn next(&mut self) -> Option<Self::Item> {
         let (_, _, folder) = self.inner.peek().cloned()?;
 
@@ -296,6 +296,11 @@ impl Imap {
         Ok(imap)
     }
 
+    /// Returns transport ID of the IMAP client.
+    pub fn transport_id(&self) -> u32 {
+        self.transport_id
+    }
+
     /// Connects to IMAP server and returns a new IMAP session.
     ///
     /// Calling this function is not enough to perform IMAP operations. Use [`Imap::prepare`]
@@ -356,10 +361,10 @@ impl Imap {
                 context,
                 self.proxy_config.clone(),
                 self.strict_tls,
-                connection_candidate,
+                &connection_candidate,
             )
             .await
-            .context("IMAP failed to connect")
+            .with_context(|| format!("IMAP failed to connect to {connection_candidate}"))
             {
                 Ok(client) => client,
                 Err(err) => {
@@ -437,7 +442,7 @@ impl Imap {
 
                 Err(err) => {
                     let imap_user = lp.user.to_owned();
-                    let message = stock_str::cannot_login(context, &imap_user).await;
+                    let message = stock_str::cannot_login(context, &imap_user);
 
                     warn!(context, "IMAP failed to login: {err:#}.");
                     first_error.get_or_insert(format_err!("{message} ({err:#})"));
@@ -543,6 +548,7 @@ impl Imap {
     /// Fetches new messages.
     ///
     /// Returns true if at least one message was fetched.
+    #[expect(clippy::arithmetic_side_effects)]
     pub(crate) async fn fetch_new_messages(
         &mut self,
         context: &Context,
@@ -550,8 +556,13 @@ impl Imap {
         folder: &str,
         folder_meaning: FolderMeaning,
     ) -> Result<bool> {
+        let transport_id = session.transport_id();
+
         if should_ignore_folder(context, folder, folder_meaning).await? {
-            info!(context, "Not fetching from {folder:?}.");
+            info!(
+                context,
+                "Transport {transport_id}: Not fetching from {folder:?}."
+            );
             session.new_mail = false;
             return Ok(false);
         }
@@ -560,15 +571,21 @@ impl Imap {
             .select_with_uidvalidity(context, folder)
             .await
             .with_context(|| format!("Failed to select folder {folder:?}"))?;
+
+        if !session.new_mail {
+            info!(
+                context,
+                "Transport {transport_id}: No new emails in folder {folder:?}."
+            );
+            return Ok(false);
+        }
+        // Make sure not to return before setting new_mail to false
+        // Otherwise, we will skip IDLE and go into an infinite loop
+        session.new_mail = false;
+
         if !folder_exists {
             return Ok(false);
         }
-
-        if !session.new_mail {
-            info!(context, "No new emails in folder {folder:?}.");
-            return Ok(false);
-        }
-        session.new_mail = false;
 
         let mut read_cnt = 0;
         loop {
@@ -583,6 +600,7 @@ impl Imap {
     }
 
     /// Returns number of messages processed and whether the function should be called again.
+    #[expect(clippy::arithmetic_side_effects)]
     async fn fetch_new_msg_batch(
         &mut self,
         context: &Context,
@@ -604,6 +622,7 @@ impl Imap {
             .await
             .context("prefetch")?;
         let read_cnt = msgs.len();
+        let _fetch_msgs_lock_guard = context.fetch_msgs_mutex.lock().await;
 
         let mut uids_fetch: Vec<u32> = Vec::new();
         let mut available_post_msgs: Vec<String> = Vec::new();
@@ -711,10 +730,19 @@ impl Imap {
                     info!(context, "{message_id:?} is a post-message.");
                     available_post_msgs.push(message_id.clone());
 
-                    if download_limit.is_none_or(|download_limit| size <= download_limit) {
-                        download_later.push(message_id.clone());
+                    let is_bot = context.get_config_bool(Config::Bot).await?;
+                    if is_bot && download_limit.is_none_or(|download_limit| size <= download_limit)
+                    {
+                        uids_fetch.push(uid);
+                        uid_message_ids.insert(uid, message_id);
+                    } else {
+                        if download_limit.is_none_or(|download_limit| size <= download_limit) {
+                            // Download later after all the small messages are downloaded,
+                            // so that large messages don't delay receiving small messages
+                            download_later.push(message_id.clone());
+                        }
+                        largest_uid_skipped = Some(uid);
                     }
-                    largest_uid_skipped = Some(uid);
                 } else {
                     info!(context, "{message_id:?} is not a post-message.");
                     if download_limit.is_none_or(|download_limit| size <= download_limit) {
@@ -1084,15 +1112,22 @@ impl Session {
             return Ok(());
         }
 
+        context
+            .sql
+            .execute(
+                "DELETE FROM imap_markseen WHERE id NOT IN (SELECT imap.id FROM imap)",
+                (),
+            )
+            .await?;
+
         let transport_id = self.transport_id();
-        let rows = context
+        let mut rows = context
             .sql
             .query_map_vec(
                 "SELECT imap.id, uid, folder FROM imap, imap_markseen
                  WHERE imap.id = imap_markseen.id
                  AND imap.transport_id=?
-                 AND target = folder
-                 ORDER BY folder, uid",
+                 AND target = folder",
                 (transport_id,),
                 |row| {
                     let rowid: i64 = row.get(0)?;
@@ -1102,6 +1137,16 @@ impl Session {
                 },
             )
             .await?;
+
+        // Number of SQL results is expected to be low as
+        // we usually don't have many messages to mark on IMAP at once.
+        // We are sorting outside of SQL to avoid SQLite constructing a query plan
+        // that scans the whole `imap` table. Scanning `imap_markseen` is fine
+        // as it should not have many items.
+        // If you change the SQL query, test it with `EXPLAIN QUERY PLAN`.
+        rows.sort_unstable_by(|(_rowid1, uid1, folder1), (_rowid2, uid2, folder2)| {
+            (folder1, uid1).cmp(&(folder2, uid2))
+        });
 
         for (folder, rowid_set, uid_set) in UidGrouper::from(rows) {
             let folder_exists = match self.select_with_uidvalidity(context, &folder).await {
@@ -1234,6 +1279,7 @@ impl Session {
             // have been modified while our request was in progress.
             // We may or may not have these new flags as a part of the response,
             // so better skip next IDLE and do another round of flag synchronization.
+            info!(context, "Got unsolicited fetch, will skip idle");
             self.new_mail = true;
         }
 
@@ -1265,6 +1311,7 @@ impl Session {
     ///
     /// If the message is incorrect or there is a failure to write a message to the database,
     /// it is skipped and the error is logged.
+    #[expect(clippy::arithmetic_side_effects)]
     pub(crate) async fn fetch_many_msgs(
         &mut self,
         context: &Context,
@@ -1429,6 +1476,7 @@ impl Session {
     /// We get [`/shared/comment`](https://www.rfc-editor.org/rfc/rfc5464#section-6.2.1)
     /// and [`/shared/admin`](https://www.rfc-editor.org/rfc/rfc5464#section-6.2.2)
     /// metadata.
+    #[expect(clippy::arithmetic_side_effects)]
     pub(crate) async fn update_metadata(&mut self, context: &Context) -> Result<()> {
         let mut lock = context.metadata.write().await;
 
@@ -1558,6 +1606,8 @@ impl Session {
             return Ok(());
         }
 
+        let transport_id = self.transport_id();
+
         let Some(device_token) = context.push_subscriber.device_token().await else {
             info!(context, "register_token: no device token yet, skipping.");
             return Ok(());
@@ -1566,9 +1616,13 @@ impl Session {
         info!(context, "register_token: device_token={}", device_token);
         info!(context, "register_token: got device token, can_push={}", self.can_push());
 
-        // XDELTAPUSH capability implies SETMETADATA support for /private/devicetoken
-        // even if the server does not explicitly advertise the METADATA extension.
-        if self.can_push() {
+        if self.can_metadata() && self.can_push() {
+            info!(
+                context,
+                "Transport {transport_id}: Subscribing for push notifications."
+            );
+
+
             let old_encrypted_device_token =
                 context.get_config(Config::EncryptedDeviceToken).await?;
 
@@ -1987,15 +2041,6 @@ async fn needs_move_to_mvbox(
         return Ok(false);
     }
 
-    if headers
-        .get_header_value(HeaderDef::AutocryptSetupMessage)
-        .is_some()
-    {
-        // do not move setup messages;
-        // there may be a non-delta device that wants to handle it
-        return Ok(false);
-    }
-
     if has_chat_version {
         Ok(true)
     } else if let Some(parent) = get_prefetch_parent_message(context, headers).await? {
@@ -2144,16 +2189,11 @@ pub(crate) async fn prefetch_should_download(
         false
     };
 
-    // Autocrypt Setup Message should be shown even if it is from non-chat client.
-    let is_autocrypt_setup_message = headers
-        .get_header_value(HeaderDef::AutocryptSetupMessage)
-        .is_some();
-
     let from = match mimeparser::get_from(headers) {
         Some(f) => f,
         None => return Ok(false),
     };
-    let (_from_id, blocked_contact, origin) =
+    let (_from_id, blocked_contact, _origin) =
         match from_field_to_contact_id(context, &from, None, true, true).await? {
             Some(res) => res,
             None => return Ok(false),
@@ -2166,28 +2206,7 @@ pub(crate) async fn prefetch_should_download(
         return Ok(false);
     }
 
-    let is_chat_message = headers.get_header_value(HeaderDef::ChatVersion).is_some();
-    let accepted_contact = origin.is_known();
-    let is_reply_to_chat_message = get_prefetch_parent_message(context, headers)
-        .await?
-        .is_some_and(|parent| match parent.is_dc_message {
-            MessengerMessage::No => false,
-            MessengerMessage::Yes | MessengerMessage::Reply => true,
-        });
-
-    let show_emails =
-        ShowEmails::from_i32(context.get_config_int(Config::ShowEmails).await?).unwrap_or_default();
-
-    let show = is_autocrypt_setup_message
-        || match show_emails {
-            ShowEmails::Off => is_chat_message || is_reply_to_chat_message,
-            ShowEmails::AcceptedContacts => {
-                is_chat_message || is_reply_to_chat_message || accepted_contact
-            }
-            ShowEmails::All => true,
-        };
-
-    let should_download = (show && !blocked_contact) || maybe_ndn;
+    let should_download = (!blocked_contact) || maybe_ndn;
     Ok(should_download)
 }
 
@@ -2382,6 +2401,7 @@ async fn should_ignore_folder(
 /// Builds a list of sequence/uid sets. The returned sets have each no more than around 1000
 /// characters because according to <https://tools.ietf.org/html/rfc2683#section-3.2.1.5>
 /// command lines should not be much more than 1000 chars (servers should allow at least 8000 chars)
+#[expect(clippy::arithmetic_side_effects)]
 fn build_sequence_sets(uids: &[u32]) -> Result<Vec<(Vec<u32>, String)>> {
     // first, try to find consecutive ranges:
     let mut ranges: Vec<UidRange> = vec![];

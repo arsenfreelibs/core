@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use anyhow::{Result, bail, ensure};
 use async_channel::{self as channel, Receiver, Sender};
+use pgp::composed::SignedPublicKey;
 use ratelimit::Ratelimit;
 use tokio::sync::{Mutex, Notify, RwLock};
 
@@ -233,12 +234,21 @@ pub struct InnerContext {
     /// This is a global mutex-like state for operations which should be modal in the
     /// clients.
     running_state: RwLock<RunningState>,
-    /// Mutex to avoid generating the key for the user more than once.
-    pub(crate) generating_key_mutex: Mutex<()>,
     /// Mutex to enforce only a single running oauth2 is running.
     pub(crate) oauth2_mutex: Mutex<()>,
     /// Mutex to prevent a race condition when a "your pw is wrong" warning is sent, resulting in multiple messages being sent.
     pub(crate) wrong_pw_warning_mutex: Mutex<()>,
+    /// Mutex to prevent running housekeeping from multiple threads at once.
+    pub(crate) housekeeping_mutex: Mutex<()>,
+
+    /// Mutex to prevent multiple IMAP loops from fetching the messages at once.
+    ///
+    /// Without this mutex IMAP loops may waste traffic downloading the same message
+    /// from multiple IMAP servers and create multiple copies of the same message
+    /// in the database if the check for duplicates and creating a message
+    /// happens in separate database transactions.
+    pub(crate) fetch_msgs_mutex: Mutex<()>,
+
     pub(crate) translated_stockstrings: StockStrings,
     pub(crate) events: Events,
 
@@ -306,6 +316,13 @@ pub struct InnerContext {
     /// the standard library's OnceLock is enough, and it's a lot smaller in memory.
     pub(crate) self_fingerprint: OnceLock<String>,
 
+    /// OpenPGP certificate aka Transferrable Public Key.
+    ///
+    /// It is generated on first use from the secret key stored in the database.
+    ///
+    /// Mutex is also held while generating the key to avoid generating the key twice.
+    pub(crate) self_public_key: Mutex<Option<SignedPublicKey>>,
+
     /// `Connectivity` values for mailboxes, unordered. Used to compute the aggregate connectivity,
     /// see [`Context::get_connectivity()`].
     pub(crate) connectivities: parking_lot::Mutex<Vec<ConnectivityStore>>,
@@ -342,6 +359,7 @@ enum RunningState {
 /// actual keys and their values which will be present are not
 /// guaranteed.  Calling [Context::get_info] also includes information
 /// about the context on top of the information here.
+#[expect(clippy::arithmetic_side_effects)]
 pub fn get_info() -> BTreeMap<&'static str, String> {
     let mut res = BTreeMap::new();
 
@@ -474,9 +492,10 @@ impl Context {
             running_state: RwLock::new(Default::default()),
             sql: Sql::new(dbfile),
             smeared_timestamp: SmearedTimestamp::new(),
-            generating_key_mutex: Mutex::new(()),
             oauth2_mutex: Mutex::new(()),
             wrong_pw_warning_mutex: Mutex::new(()),
+            housekeeping_mutex: Mutex::new(()),
+            fetch_msgs_mutex: Mutex::new(()),
             translated_stockstrings: stockstrings,
             events,
             scheduler: SchedulerState::new(),
@@ -494,6 +513,7 @@ impl Context {
             tls_session_store: TlsSessionStore::new(),
             iroh: Arc::new(RwLock::new(None)),
             self_fingerprint: OnceLock::new(),
+            self_public_key: Mutex::new(None),
             connectivities: parking_lot::Mutex::new(Vec::new()),
             pre_encrypt_mime_hook: None.into(),
         };
@@ -1122,10 +1142,17 @@ ORDER BY m.timestamp DESC,m.id DESC",
         Ok(list)
     }
 
-    /// Returns a list of messages with database ID higher than requested.
+    /// (deprecated) Returns a list of messages with database ID higher than requested.
     ///
     /// Blocked contacts and chats are excluded,
     /// but self-sent messages and contact requests are included in the results.
+    ///
+    /// Deprecated 2026-04: This returns the message's id as soon as the first part arrives,
+    /// even if it is not fully downloaded yet.
+    /// The bot needs to wait for the message to be fully downloaded.
+    /// Since this is usually not the desired behavior,
+    /// bots should instead use the [`EventType::IncomingMsg`]
+    /// event for getting notified about new messages.
     pub async fn get_next_msgs(&self) -> Result<Vec<MsgId>> {
         let last_msg_id = match self.get_config(Config::LastMsgId).await? {
             Some(s) => MsgId::new(s.parse()?),
@@ -1174,7 +1201,7 @@ ORDER BY m.timestamp DESC,m.id DESC",
         Ok(list)
     }
 
-    /// Returns a list of messages with database ID higher than last marked as seen.
+    /// (deprecated) Returns a list of messages with database ID higher than last marked as seen.
     ///
     /// This function is supposed to be used by bot to request messages
     /// that are not processed yet.
@@ -1184,6 +1211,13 @@ ORDER BY m.timestamp DESC,m.id DESC",
     /// shortly after notification or notification is manually triggered
     /// to interrupt waiting.
     /// Notification may be manually triggered by calling [`Self::stop_io`].
+    ///
+    /// Deprecated 2026-04: This returns the message's id as soon as the first part arrives,
+    /// even if it is not fully downloaded yet.
+    /// The bot needs to wait for the message to be fully downloaded.
+    /// Since this is usually not the desired behavior,
+    /// bots should instead use the #DC_EVENT_INCOMING_MSG / [`EventType::IncomingMsg`]
+    /// event for getting notified about new messages.
     pub async fn wait_next_msgs(&self) -> Result<Vec<MsgId>> {
         self.new_msgs_notify.notified().await;
         let list = self.get_next_msgs().await?;

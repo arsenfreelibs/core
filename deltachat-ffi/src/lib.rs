@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use std::convert::TryFrom;
 use std::fmt::Write;
 use std::future::Future;
+use std::mem::ManuallyDrop;
 use std::ptr;
 use std::str::FromStr;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -305,20 +306,17 @@ pub unsafe extern "C" fn dc_set_stock_translation(
     let msg = to_string_lossy(stock_msg);
     let ctx = &*context;
 
-    block_on(async move {
-        match StockMessage::from_u32(stock_id)
-            .with_context(|| format!("Invalid stock message ID {stock_id}"))
+    match StockMessage::from_u32(stock_id)
+        .with_context(|| format!("Invalid stock message ID {stock_id}"))
+        .log_err(ctx)
+    {
+        Ok(id) => ctx
+            .set_stock_translation(id, msg)
+            .context("set_stock_translation failed")
             .log_err(ctx)
-        {
-            Ok(id) => ctx
-                .set_stock_translation(id, msg)
-                .await
-                .context("set_stock_translation failed")
-                .log_err(ctx)
-                .is_ok() as libc::c_int,
-            Err(_) => 0,
-        }
-    })
+            .is_ok() as libc::c_int,
+        Err(_) => 0,
+    }
 }
 
 #[no_mangle]
@@ -679,7 +677,6 @@ pub unsafe extern "C" fn dc_event_get_data2_int(event: *mut dc_event_t) -> libc:
         | EventType::ChatModified(_)
         | EventType::ChatDeleted { .. }
         | EventType::WebxdcRealtimeAdvertisementReceived { .. }
-        | EventType::IncomingCallAccepted { .. }
         | EventType::OutgoingCallAccepted { .. }
         | EventType::CallEnded { .. }
         | EventType::EventChannelOverflow { .. }
@@ -702,6 +699,9 @@ pub unsafe extern "C" fn dc_event_get_data2_int(event: *mut dc_event_t) -> libc:
         } => status_update_serial.to_u32() as libc::c_int,
         EventType::WebxdcRealtimeData { data, .. } => data.len() as libc::c_int,
         EventType::IncomingCall { has_video, .. } => *has_video as libc::c_int,
+        EventType::IncomingCallAccepted {
+            from_this_device, ..
+        } => *from_this_device as libc::c_int,
 
         #[allow(unreachable_patterns)]
         #[cfg(test)]
@@ -1515,6 +1515,23 @@ pub unsafe extern "C" fn dc_marknoticed_chat(context: *mut dc_context_t, chat_id
         chat::marknoticed_chat(ctx, ChatId::new(chat_id))
             .await
             .context("Failed marknoticed chat")
+            .log_err(ctx)
+            .unwrap_or(())
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_markfresh_chat(context: *mut dc_context_t, chat_id: u32) {
+    if context.is_null() {
+        eprintln!("ignoring careless call to dc_markfresh_chat()");
+        return;
+    }
+    let ctx = &*context;
+
+    block_on(async move {
+        chat::markfresh_chat(ctx, ChatId::new(chat_id))
+            .await
+            .context("Failed markfresh chat")
             .log_err(ctx)
             .unwrap_or(())
     })
@@ -2427,45 +2444,6 @@ pub unsafe extern "C" fn dc_imex_has_backup(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dc_initiate_key_transfer(context: *mut dc_context_t) -> *mut libc::c_char {
-    if context.is_null() {
-        eprintln!("ignoring careless call to dc_initiate_key_transfer()");
-        return ptr::null_mut(); // NULL explicitly defined as "error"
-    }
-    let ctx = &*context;
-
-    match block_on(imex::initiate_key_transfer(ctx))
-        .context("dc_initiate_key_transfer()")
-        .log_err(ctx)
-    {
-        Ok(res) => res.strdup(),
-        Err(_) => ptr::null_mut(),
-    }
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn dc_continue_key_transfer(
-    context: *mut dc_context_t,
-    msg_id: u32,
-    setup_code: *const libc::c_char,
-) -> libc::c_int {
-    if context.is_null() || msg_id <= constants::DC_MSG_ID_LAST_SPECIAL || setup_code.is_null() {
-        eprintln!("ignoring careless call to dc_continue_key_transfer()");
-        return 0;
-    }
-    let ctx = &*context;
-
-    block_on(imex::continue_key_transfer(
-        ctx,
-        MsgId::new(msg_id),
-        &to_string_lossy(setup_code),
-    ))
-    .context("dc_continue_key_transfer")
-    .log_err(ctx)
-    .is_ok() as libc::c_int
-}
-
-#[no_mangle]
 pub unsafe extern "C" fn dc_stop_ongoing_process(context: *mut dc_context_t) {
     if context.is_null() {
         eprintln!("ignoring careless call to dc_stop_ongoing_process()");
@@ -2848,7 +2826,7 @@ pub unsafe extern "C" fn dc_array_search_id(
 // Returns 1 if location belongs to the track of the user,
 // 0 if location was reported independently.
 #[no_mangle]
-pub unsafe fn dc_array_is_independent(
+pub unsafe extern "C" fn dc_array_is_independent(
     array: *const dc_array_t,
     index: libc::size_t,
 ) -> libc::c_int {
@@ -3788,16 +3766,6 @@ pub unsafe extern "C" fn dc_msg_get_webxdc_href(msg: *mut dc_msg_t) -> *mut libc
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dc_msg_is_setupmessage(msg: *mut dc_msg_t) -> libc::c_int {
-    if msg.is_null() {
-        eprintln!("ignoring careless call to dc_msg_is_setupmessage()");
-        return 0;
-    }
-    let ffi_msg = &*msg;
-    ffi_msg.message.is_setupmessage().into()
-}
-
-#[no_mangle]
 pub unsafe extern "C" fn dc_msg_has_html(msg: *mut dc_msg_t) -> libc::c_int {
     if msg.is_null() {
         eprintln!("ignoring careless call to dc_msg_has_html()");
@@ -3805,20 +3773,6 @@ pub unsafe extern "C" fn dc_msg_has_html(msg: *mut dc_msg_t) -> libc::c_int {
     }
     let ffi_msg = &*msg;
     ffi_msg.message.has_html().into()
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn dc_msg_get_setupcodebegin(msg: *mut dc_msg_t) -> *mut libc::c_char {
-    if msg.is_null() {
-        eprintln!("ignoring careless call to dc_msg_get_setupcodebegin()");
-        return "".strdup();
-    }
-    let ffi_msg = &*msg;
-    let ctx = &*ffi_msg.context;
-
-    block_on(ffi_msg.message.get_setupcodebegin(ctx))
-        .unwrap_or_default()
-        .strdup()
 }
 
 #[no_mangle]
@@ -4098,16 +4052,6 @@ pub unsafe extern "C" fn dc_msg_get_saved_msg_id(msg: *const dc_msg_t) -> u32 {
             .map(|id| id.to_u32())
             .unwrap_or(0)
     })
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn dc_msg_force_plaintext(msg: *mut dc_msg_t) {
-    if msg.is_null() {
-        eprintln!("ignoring careless call to dc_msg_force_plaintext()");
-        return;
-    }
-    let ffi_msg = &mut *msg;
-    ffi_msg.message.force_plaintext();
 }
 
 // dc_contact_t
@@ -5150,10 +5094,10 @@ pub unsafe extern "C" fn dc_jsonrpc_init(
         return ptr::null_mut();
     }
 
-    let account_manager = Arc::from_raw(account_manager);
-    let cmd_api = block_on(deltachat_jsonrpc::api::CommandApi::from_arc(
-        account_manager.clone(),
-    ));
+    let account_manager = ManuallyDrop::new(Arc::from_raw(account_manager));
+    let cmd_api = block_on(deltachat_jsonrpc::api::CommandApi::from_arc(Arc::clone(
+        &account_manager,
+    )));
 
     let (request_handle, receiver) = RpcClient::new();
     let handle = RpcSession::new(request_handle, cmd_api);

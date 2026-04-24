@@ -47,11 +47,11 @@ pub struct Aheader {
     pub public_key: SignedPublicKey,
     pub prefer_encrypt: EncryptPreference,
 
-    // Whether `_verified` attribute is present.
-    //
-    // `_verified` attribute is an extension to `Autocrypt-Gossip`
-    // header that is used to tell that the sender
-    // marked this key as verified.
+    /// Whether `_verified` attribute is present.
+    ///
+    /// `_verified` attribute is an extension to `Autocrypt-Gossip`
+    /// header that is used to tell that the sender
+    /// marked this key as verified.
     pub verified: bool,
 }
 
@@ -73,6 +73,7 @@ impl fmt::Display for Aheader {
         let keydata = self.public_key.to_base64().chars().enumerate().fold(
             String::new(),
             |mut res, (i, c)| {
+                #[expect(clippy::arithmetic_side_effects)]
                 if i % 78 == 78 - "keydata=".len() {
                     res.push(' ')
                 }
@@ -107,13 +108,11 @@ impl FromStr for Aheader {
             .remove("keydata")
             .context("keydata attribute is not found")
             .and_then(|raw| {
-                SignedPublicKey::from_base64(&raw).context("autocrypt key cannot be decoded")
-            })
-            .and_then(|key| {
-                key.verify_bindings()
-                    .and(Ok(key))
-                    .context("Autocrypt key cannot be verified")
+                SignedPublicKey::from_base64(&raw).context("Autocrypt key cannot be decoded")
             })?;
+        public_key
+            .verify_bindings()
+            .context("Autocrypt key cannot be verified")?;
 
         let prefer_encrypt = attributes
             .remove("prefer-encrypt")

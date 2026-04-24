@@ -47,6 +47,7 @@ use crate::stock_str;
 
 /// Shortens a string to a specified length and adds "[...]" to the
 /// end of the shortened string.
+#[expect(clippy::arithmetic_side_effects)]
 pub(crate) fn truncate(buf: &str, approx_chars: usize) -> Cow<'_, str> {
     let count = buf.chars().count();
     if count <= approx_chars + DC_ELLIPSIS.len() {
@@ -77,6 +78,7 @@ pub(crate) fn truncate(buf: &str, approx_chars: usize) -> Cow<'_, str> {
 /// end of the shortened string.
 ///
 /// returns tuple with the String and a boolean whether is was truncated
+#[expect(clippy::arithmetic_side_effects)]
 pub(crate) fn truncate_by_lines(
     buf: String,
     max_lines: usize,
@@ -231,8 +233,7 @@ async fn maybe_warn_on_bad_time(context: &Context, now: i64, known_past_timestam
                 || "YY-MM-DD hh:mm:ss".to_string(),
                 |ts| ts.format("%Y-%m-%d %H:%M:%S").to_string(),
             ),
-        )
-        .await;
+        );
         if let Some(timestamp) = chrono::DateTime::<chrono::Utc>::from_timestamp(now, 0) {
             add_device_msg_with_importance(
                 context,
@@ -256,9 +257,10 @@ async fn maybe_warn_on_bad_time(context: &Context, now: i64, known_past_timestam
     false
 }
 
+#[expect(clippy::arithmetic_side_effects)]
 async fn maybe_warn_on_outdated(context: &Context, now: i64, approx_compile_time: i64) {
     if now > approx_compile_time + DC_OUTDATED_WARNING_DAYS * 24 * 60 * 60 {
-        let mut msg = Message::new_text(stock_str::update_reminder_msg_body(context).await);
+        let mut msg = Message::new_text(stock_str::update_reminder_msg_body(context));
         if let Some(timestamp) = chrono::DateTime::<chrono::Utc>::from_timestamp(now, 0) {
             add_device_msg(
                 context,
@@ -649,6 +651,7 @@ impl ToOption<String> for Option<i32> {
     }
 }
 
+#[expect(clippy::arithmetic_side_effects)]
 pub fn remove_subject_prefix(last_subject: &str) -> String {
     let subject_start = if last_subject.starts_with("Chat:") {
         0
@@ -671,6 +674,7 @@ pub fn remove_subject_prefix(last_subject: &str) -> String {
 
 // Types and methods to create hop-info for message-info
 
+#[expect(clippy::arithmetic_side_effects)]
 fn extract_address_from_receive_header<'a>(header: &'a str, start: &str) -> Option<&'a str> {
     let header_len = header.len();
     header.find(start).and_then(|mut begin| {
@@ -683,6 +687,7 @@ fn extract_address_from_receive_header<'a>(header: &'a str, start: &str) -> Opti
     })
 }
 
+#[expect(clippy::arithmetic_side_effects)]
 pub(crate) fn parse_receive_header(header: &str) -> String {
     let header = header.replace(&['\r', '\n'][..], "");
     let mut hop_info = String::from("Hop: ");
@@ -789,6 +794,7 @@ pub(crate) fn normalize_text(text: &str) -> Option<String> {
 }
 
 /// Increments `*t` and checks that it equals to `expected` after that.
+#[expect(clippy::arithmetic_side_effects)]
 pub(crate) fn inc_and_check<T: PrimInt + AddAssign + std::fmt::Debug>(
     t: &mut T,
     expected: T,

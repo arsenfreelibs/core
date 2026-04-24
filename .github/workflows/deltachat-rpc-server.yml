@@ -34,13 +34,13 @@ jobs:
         with:
           show-progress: false
           persist-credentials: false
-      - uses: cachix/install-nix-action@4e002c8ec80594ecd40e759629461e26c8abed15 # v31
+      - uses: cachix/install-nix-action@2126ae7fc54c9df00dd18f7f18754393182c73cd # v31.9.1
 
       - name: Build deltachat-rpc-server binaries
         run: nix build .#deltachat-rpc-server-${{ matrix.arch }}-linux
 
       - name: Upload binary
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: deltachat-rpc-server-${{ matrix.arch }}-linux
           path: result/bin/deltachat-rpc-server
@@ -58,13 +58,13 @@ jobs:
         with:
           show-progress: false
           persist-credentials: false
-      - uses: cachix/install-nix-action@4e002c8ec80594ecd40e759629461e26c8abed15 # v31
+      - uses: cachix/install-nix-action@2126ae7fc54c9df00dd18f7f18754393182c73cd # v31.9.1
 
       - name: Build deltachat-rpc-server wheels
         run: nix build .#deltachat-rpc-server-${{ matrix.arch }}-linux-wheel
 
       - name: Upload wheel
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: deltachat-rpc-server-${{ matrix.arch }}-linux-wheel
           path: result/*.whl
@@ -82,13 +82,13 @@ jobs:
         with:
           show-progress: false
           persist-credentials: false
-      - uses: cachix/install-nix-action@4e002c8ec80594ecd40e759629461e26c8abed15 # v31
+      - uses: cachix/install-nix-action@2126ae7fc54c9df00dd18f7f18754393182c73cd # v31.9.1
 
       - name: Build deltachat-rpc-server binaries
         run: nix build .#deltachat-rpc-server-${{ matrix.arch }}
 
       - name: Upload binary
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: deltachat-rpc-server-${{ matrix.arch }}
           path: result/bin/deltachat-rpc-server.exe
@@ -106,13 +106,13 @@ jobs:
         with:
           show-progress: false
           persist-credentials: false
-      - uses: cachix/install-nix-action@4e002c8ec80594ecd40e759629461e26c8abed15 # v31
+      - uses: cachix/install-nix-action@2126ae7fc54c9df00dd18f7f18754393182c73cd # v31.9.1
 
       - name: Build deltachat-rpc-server wheels
         run: nix build .#deltachat-rpc-server-${{ matrix.arch }}-wheel
 
       - name: Upload wheel
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: deltachat-rpc-server-${{ matrix.arch }}-wheel
           path: result/*.whl
@@ -139,7 +139,7 @@ jobs:
         run: cargo build --release --package deltachat-rpc-server --target ${{ matrix.arch }}-apple-darwin --features vendored
 
       - name: Upload binary
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: deltachat-rpc-server-${{ matrix.arch }}-macos
           path: target/${{ matrix.arch }}-apple-darwin/release/deltachat-rpc-server
@@ -157,13 +157,13 @@ jobs:
         with:
           show-progress: false
           persist-credentials: false
-      - uses: cachix/install-nix-action@4e002c8ec80594ecd40e759629461e26c8abed15 # v31
+      - uses: cachix/install-nix-action@2126ae7fc54c9df00dd18f7f18754393182c73cd # v31.9.1
 
       - name: Build deltachat-rpc-server binaries
         run: nix build .#deltachat-rpc-server-${{ matrix.arch }}-android
 
       - name: Upload binary
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: deltachat-rpc-server-${{ matrix.arch }}-android
           path: result/bin/deltachat-rpc-server
@@ -181,13 +181,13 @@ jobs:
         with:
           show-progress: false
           persist-credentials: false
-      - uses: cachix/install-nix-action@4e002c8ec80594ecd40e759629461e26c8abed15 # v31
+      - uses: cachix/install-nix-action@2126ae7fc54c9df00dd18f7f18754393182c73cd # v31.9.1
 
       - name: Build deltachat-rpc-server wheels
         run: nix build .#deltachat-rpc-server-${{ matrix.arch }}-android-wheel
 
       - name: Upload wheel
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: deltachat-rpc-server-${{ matrix.arch }}-android-wheel
           path: result/*.whl
@@ -208,7 +208,7 @@ jobs:
         with:
           show-progress: false
           persist-credentials: false
-      - uses: cachix/install-nix-action@4e002c8ec80594ecd40e759629461e26c8abed15 # v31
+      - uses: cachix/install-nix-action@2126ae7fc54c9df00dd18f7f18754393182c73cd # v31.9.1
 
       - name: Download Linux aarch64 binary
         uses: actions/download-artifact@v7
@@ -496,7 +496,7 @@ jobs:
           ls -lah
 
       - name: Upload to artifacts
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: deltachat-rpc-server-npm-package
           path: deltachat-rpc-server/npm-package/*.tgz

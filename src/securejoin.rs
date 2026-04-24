@@ -17,17 +17,17 @@ use crate::context::Context;
 use crate::e2ee::ensure_secret_key_exists;
 use crate::events::EventType;
 use crate::headerdef::HeaderDef;
-use crate::key::{DcKey, Fingerprint, load_self_public_key};
+use crate::key::{DcKey, Fingerprint, load_self_public_key, self_fingerprint};
 use crate::log::LogExt as _;
 use crate::log::warn;
-use crate::message::{Message, Viewtype};
+use crate::message::{self, Message, MsgId, Viewtype};
 use crate::mimeparser::{MimeMessage, SystemMessage};
 use crate::param::Param;
 use crate::qr::check_qr;
 use crate::securejoin::bob::JoinerProgress;
 use crate::sync::Sync::*;
-use crate::tools::{create_id, time};
-use crate::{SecurejoinSource, stats};
+use crate::tools::{create_id, create_outgoing_rfc724_mid, time};
+use crate::{SecurejoinSource, mimefactory, stats};
 use crate::{SecurejoinUiPath, token};
 
 mod bob;
@@ -127,9 +127,6 @@ pub async fn get_securejoin_qr(context: &Context, chat: Option<ChatId>) -> Resul
         None => None,
     };
     let grpid = chat.as_ref().map(|c| c.grpid.as_str());
-    let sync_token = token::lookup(context, Namespace::InviteNumber, grpid)
-        .await?
-        .is_none();
     // Invite number is used to request the inviter key.
     let invitenumber = token::lookup_or_new(context, Namespace::InviteNumber, grpid).await?;
 
@@ -156,12 +153,10 @@ pub async fn get_securejoin_qr(context: &Context, chat: Option<ChatId>) -> Resul
         .unwrap_or_default();
 
     let qr = if let Some(chat) = chat {
-        if sync_token {
-            context
-                .sync_qr_code_tokens(Some(chat.grpid.as_str()))
-                .await?;
-            context.scheduler.interrupt_smtp().await;
-        }
+        context
+            .sync_qr_code_tokens(Some(chat.grpid.as_str()))
+            .await?;
+        context.scheduler.interrupt_smtp().await;
 
         let chat_name = chat.get_name();
         let chat_name_shortened = shorten_name(chat_name, 25);
@@ -178,11 +173,11 @@ pub async fn get_securejoin_qr(context: &Context, chat: Option<ChatId>) -> Resul
         if chat.typ == Chattype::OutBroadcast {
             // For historic reansons, broadcasts currently use j instead of i for the invitenumber.
             format!(
-                "https://alt-chat.me/#{fingerprint}&x={grpid}&j={invitenumber}&s={auth}&a={self_addr_urlencoded}&n={self_name_urlencoded}&b={chat_name_urlencoded}",
+                "https://alt-chat.me/#{fingerprint}&v=3&x={grpid}&j={invitenumber}&s={auth}&a={self_addr_urlencoded}&n={self_name_urlencoded}&b={chat_name_urlencoded}",
             )
         } else {
             format!(
-                "https://alt-chat.me/#{fingerprint}&x={grpid}&i={invitenumber}&s={auth}&a={self_addr_urlencoded}&n={self_name_urlencoded}&g={chat_name_urlencoded}",
+                "https://alt-chat.me/#{fingerprint}&v=3&x={grpid}&i={invitenumber}&s={auth}&a={self_addr_urlencoded}&n={self_name_urlencoded}&g={chat_name_urlencoded}",
             )
         }
     } else {
@@ -190,12 +185,12 @@ pub async fn get_securejoin_qr(context: &Context, chat: Option<ChatId>) -> Resul
         let self_name_urlencoded = utf8_percent_encode(&self_name_shortened, DISALLOWED_CHARACTERS)
             .to_string()
             .replace("%20", "+");
-        if sync_token {
-            context.sync_qr_code_tokens(None).await?;
-            context.scheduler.interrupt_smtp().await;
-        }
+
+        context.sync_qr_code_tokens(None).await?;
+        context.scheduler.interrupt_smtp().await;
+
         format!(
-            "https://alt-chat.me/#{fingerprint}&i={invitenumber}&s={auth}&a={self_addr_urlencoded}&n={self_name_urlencoded}",
+            "https://alt-chat.me/#{fingerprint}&v=3&i={invitenumber}&s={auth}&a={self_addr_urlencoded}&n={self_name_urlencoded}",
         )
     };
 
@@ -309,7 +304,9 @@ async fn verify_sender_by_fingerprint(
     fingerprint: &Fingerprint,
     contact_id: ContactId,
 ) -> Result<bool> {
-    let contact = Contact::get_by_id(context, contact_id).await?;
+    let Some(contact) = Contact::get_by_id_optional(context, contact_id).await? else {
+        return Ok(false);
+    };
     let is_verified = contact.fingerprint().is_some_and(|fp| &fp == fingerprint);
     if is_verified {
         mark_contact_id_as_verified(context, contact_id, Some(ContactId::SELF)).await?;
@@ -346,11 +343,17 @@ pub(crate) enum HandshakeMessage {
 /// Step of Secure-Join protocol.
 #[derive(Debug, Display, PartialEq, Eq)]
 pub(crate) enum SecureJoinStep {
-    /// vc-request or vg-request
+    /// vc-request or vg-request; only used in legacy securejoin
     Request { invitenumber: String },
 
-    /// vc-auth-required or vg-auth-required
+    /// vc-auth-required or vg-auth-required; only used in legacy securejoin
     AuthRequired,
+
+    /// vc-request-pubkey; only used in securejoin v3
+    RequestPubkey,
+
+    /// vc-pubkey; only used in securejoin v3
+    Pubkey,
 
     /// vc-request-with-auth or vg-request-with-auth
     RequestWithAuth,
@@ -381,6 +384,8 @@ pub(crate) fn get_secure_join_step(mime_message: &MimeMessage) -> Option<SecureJ
         })
     } else if let Some(step) = mime_message.get_header(HeaderDef::SecureJoin) {
         match step {
+            "vc-request-pubkey" => Some(SecureJoinStep::RequestPubkey),
+            "vc-pubkey" => Some(SecureJoinStep::Pubkey),
             "vg-auth-required" | "vc-auth-required" => Some(SecureJoinStep::AuthRequired),
             "vg-request-with-auth" | "vc-request-with-auth" => {
                 Some(SecureJoinStep::RequestWithAuth)
@@ -410,6 +415,7 @@ pub(crate) fn get_secure_join_step(mime_message: &MimeMessage) -> Option<SecureJ
 ///
 /// When `handle_securejoin_handshake()` is called, the message is not yet filed in the
 /// database; this is done by `receive_imf()` later on as needed.
+#[expect(clippy::arithmetic_side_effects)]
 pub(crate) async fn handle_securejoin_handshake(
     context: &Context,
     mime_message: &mut MimeMessage,
@@ -438,13 +444,14 @@ pub(crate) async fn handle_securejoin_handshake(
     // will improve security (completely unrelated to the securejoin protocol)
     // and is something we want to do in the future:
     // https://www.rfc-editor.org/rfc/rfc9580.html#name-surreptitious-forwarding
-    if !matches!(step, SecureJoinStep::Request { .. }) {
+    if !matches!(
+        step,
+        SecureJoinStep::Request { .. } | SecureJoinStep::RequestPubkey | SecureJoinStep::Pubkey
+    ) {
         let mut self_found = false;
         let self_fingerprint = load_self_public_key(context).await?.dc_fingerprint();
-        for (addr, key) in &mime_message.gossiped_keys {
-            if key.public_key.dc_fingerprint() == self_fingerprint
-                && context.is_self_addr(addr).await?
-            {
+        for key in mime_message.gossiped_keys.values() {
+            if key.public_key.dc_fingerprint() == self_fingerprint {
                 self_found = true;
                 break;
             }
@@ -504,7 +511,57 @@ pub(crate) async fn handle_securejoin_handshake(
             ====             Bob - the joiner's side             =====
             ====   Step 4 in "Setup verified contact" protocol   =====
             ========================================================*/
-            bob::handle_auth_required(context, mime_message).await
+            bob::handle_auth_required_or_pubkey(context, mime_message).await
+        }
+        SecureJoinStep::RequestPubkey => {
+            /*========================================================
+            ====             Alice - the inviter's side          =====
+            ====   Bob requests our public key (Securejoin v3)   =====
+            ========================================================*/
+
+            debug_assert!(
+                mime_message.signature.is_none(),
+                "RequestPubkey is not supposed to be signed"
+            );
+            let Some(auth) = mime_message.get_header(HeaderDef::SecureJoinAuth) else {
+                warn!(
+                    context,
+                    "Ignoring {step} message because of missing auth code."
+                );
+                return Ok(HandshakeMessage::Ignore);
+            };
+            if !token::exists(context, token::Namespace::Auth, auth).await? {
+                warn!(context, "Secure-join denied (bad auth).");
+                return Ok(HandshakeMessage::Ignore);
+            }
+
+            let rfc724_mid = create_outgoing_rfc724_mid();
+            let addr = ContactAddress::new(&mime_message.from.addr)?;
+            let attach_self_pubkey = true;
+            let self_fp = self_fingerprint(context).await?;
+            let shared_secret = format!("securejoin/{self_fp}/{auth}");
+            let rendered_message = mimefactory::render_symm_encrypted_securejoin_message(
+                context,
+                "vc-pubkey",
+                &rfc724_mid,
+                attach_self_pubkey,
+                auth,
+                &shared_secret,
+            )
+            .await?;
+
+            let msg_id = message::insert_tombstone(context, &rfc724_mid).await?;
+            insert_into_smtp(context, &rfc724_mid, &addr, rendered_message, msg_id).await?;
+            context.scheduler.interrupt_smtp().await;
+
+            Ok(HandshakeMessage::Done)
+        }
+        SecureJoinStep::Pubkey => {
+            /*========================================================
+            ====             Bob - the joiner's side             =====
+            ====     Alice sent us her pubkey (Securejoin v3)    =====
+            ========================================================*/
+            bob::handle_auth_required_or_pubkey(context, mime_message).await
         }
         SecureJoinStep::RequestWithAuth => {
             /*==========================================================
@@ -585,15 +642,12 @@ pub(crate) async fn handle_securejoin_handshake(
                 mark_contact_id_as_verified(context, contact_id, Some(ContactId::SELF)).await?;
             }
             contact_id.regossip_keys(context).await?;
-            ContactId::scaleup_origin(context, &[contact_id], Origin::SecurejoinInvited).await?;
             // for setup-contact, make Alice's one-to-one chat with Bob visible
             // (secure-join-information are shown in the group chat)
             if grpid.is_empty() {
                 ChatId::create_for_contact(context, contact_id).await?;
             }
-            context.emit_event(EventType::ContactsChanged(Some(contact_id)));
             if let Some(joining_chat_id) = joining_chat_id {
-                // Join group.
                 chat::add_contact_to_chat_ex(context, Nosync, joining_chat_id, contact_id, true)
                     .await?;
 
@@ -603,6 +657,10 @@ pub(crate) async fn handle_securejoin_handshake(
                     // We don't use the membership consistency algorithm for broadcast channels,
                     // so, sync the memberlist when adding a contact
                     chat.sync_contacts(context).await.log_err(context).ok();
+                } else {
+                    ContactId::scaleup_origin(context, &[contact_id], Origin::SecurejoinInvited)
+                        .await?;
+                    context.emit_event(EventType::ContactsChanged(Some(contact_id)));
                 }
 
                 inviter_progress(context, contact_id, joining_chat_id, chat.typ)?;
@@ -665,6 +723,24 @@ pub(crate) async fn handle_securejoin_handshake(
     }
 }
 
+async fn insert_into_smtp(
+    context: &Context,
+    rfc724_mid: &str,
+    recipient: &str,
+    rendered_message: String,
+    msg_id: MsgId,
+) -> Result<(), Error> {
+    context
+        .sql
+        .execute(
+            "INSERT INTO smtp (rfc724_mid, recipients, mime, msg_id)
+            VALUES            (?1,         ?2,         ?3,   ?4)",
+            (&rfc724_mid, &recipient, &rendered_message, msg_id),
+        )
+        .await?;
+    Ok(())
+}
+
 /// Observe self-sent Securejoin message.
 ///
 /// In a multi-device-setup, there may be other devices that "see" the handshake messages.
@@ -696,6 +772,8 @@ pub(crate) async fn observe_securejoin_on_other_device(
     match step {
         SecureJoinStep::Request { .. }
         | SecureJoinStep::AuthRequired
+        | SecureJoinStep::RequestPubkey
+        | SecureJoinStep::Pubkey
         | SecureJoinStep::Deprecated
         | SecureJoinStep::Unknown { .. } => {
             return Ok(HandshakeMessage::Ignore);
@@ -759,13 +837,6 @@ pub(crate) async fn observe_securejoin_on_other_device(
         // so we pass invalid chat ID here.
         let chat_id = ChatId::new(0);
         inviter_progress(context, contact_id, chat_id, chat_type)?;
-    }
-
-    if matches!(step, SecureJoinStep::RequestWithAuth) {
-        // This actually reflects what happens on the first device (which does the secure
-        // join) and causes a subsequent "vg-member-added" message to create an unblocked
-        // verified group.
-        ChatId::create_for_contact_with_blocked(context, contact_id, Blocked::Not).await?;
     }
 
     if matches!(step, SecureJoinStep::MemberAdded) {

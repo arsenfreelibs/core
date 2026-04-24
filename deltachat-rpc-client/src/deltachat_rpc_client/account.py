@@ -405,7 +405,15 @@ class Account:
 
     @futuremethod
     def wait_next_messages(self) -> list[Message]:
-        """Wait for new messages and return a list of them."""
+        """(deprecated) Wait for new messages and return a list of them. Meant for bots.
+
+        Deprecated 2026-04: This returns the message's id as soon as the first part arrives,
+        even if it is not fully downloaded yet.
+        The bot needs to wait for the message to be fully downloaded.
+        Since this is usually not the desired behavior,
+        bots should instead use the `EventType.INCOMING_MSG`
+        event for getting notified about new messages.
+        """
         next_msg_ids = yield self._rpc.wait_next_msgs.future(self.id)
         return [Message(self, msg_id) for msg_id in next_msg_ids]
 
@@ -482,10 +490,6 @@ class Account:
         """Import keys."""
         passphrase = ""  # Importing passphrase-protected keys is currently not supported.
         self._rpc.import_self_keys(self.id, str(path), passphrase)
-
-    def initiate_autocrypt_key_transfer(self) -> None:
-        """Send Autocrypt Setup Message."""
-        return self._rpc.initiate_autocrypt_key_transfer(self.id)
 
     def ice_servers(self) -> list:
         """Return ICE servers for WebRTC configuration."""

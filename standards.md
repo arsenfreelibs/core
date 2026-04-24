@@ -5,7 +5,7 @@ Some of the standards chatmail is based on:
 Tasks                            | Standards
 -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 Transport                        | IMAP v4 ([RFC 3501][]), SMTP ([RFC 5321][]) and Internet Message Format (IMF, [RFC 5322][])
-Proxy                            | SOCKS5 ([RFC 1928][])
+Proxy                            | SOCKS5 ([RFC 1928][]), [Shadowsocks](https://github.com/Shadowsocks-NET/shadowsocks-specs)
 Embedded media                   | MIME Document Series ([RFC 2045][], [RFC 2046][]), Content-Disposition Header ([RFC 2183][]), Multipart/Related ([RFC 2387][])
 Text and Quote encoding          | Fixed, Flowed ([RFC 3676][])
 Reactions                        | Reaction: Indicating Summary Reaction to a Message ([RFC 9078][])
@@ -16,7 +16,7 @@ Quota                            | IMAP QUOTA extension ([RFC 2087][])
 Seen status synchronization      | IMAP CONDSTORE extension ([RFC 7162][])
 Client/server identification     | IMAP ID extension ([RFC 2971][])
 Authorization                    | OAuth2 ([RFC 6749][])
-End-to-end encryption            | [Autocrypt Level 1][], OpenPGP ([RFC 4880][]), Security Multiparts for MIME ([RFC 1847][]) and [“Mixed Up” Encryption repairing](https://tools.ietf.org/id/draft-dkg-openpgp-pgpmime-message-mangling-00.html)
+End-to-end encryption            | [Autocrypt Level 1][], OpenPGP ([RFC 4880][]), Security Multiparts for MIME ([RFC 1847][]) and [“Mixed Up” Encryption repairing](https://datatracker.ietf.org/doc/html/draft-dkg-openpgp-pgpmime-message-mangling-00)
 Detect/prevent active attacks    | [securejoin][] protocols
 Compare public keys              | [openpgp4fpr][] URI Scheme
 Metadata minimization            | Header Protection for Cryptographically Protected Email ([RFC 9788][])

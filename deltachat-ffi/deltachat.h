@@ -364,18 +364,14 @@ uint32_t        dc_get_id                    (dc_context_t* context);
  * To get these events, you have to create an event emitter using this function
  * and call dc_get_next_event() on the emitter.
  *
+ * Events are broadcasted to all existing event emitters.
+ * Events emitted before creation of event emitter
+ * are not available to event emitter.
+ *
  * @memberof dc_context_t
  * @param context The context object as created by dc_context_new().
  * @return Returns the event emitter, NULL on errors.
  *     Must be freed using dc_event_emitter_unref() after usage.
- *
- * Note: Use only one event emitter per context.
- * The result of having multiple event emitters is unspecified.
- * Currently events are broadcasted to all existing event emitters,
- * but previous versions delivered events to only one event emitter
- * and this behavior may change again in the future.
- * Events emitted before creation of event emitter
- * may or may not be available to event emitter.
  */
 dc_event_emitter_t* dc_get_event_emitter(dc_context_t* context);
 
@@ -1569,13 +1565,36 @@ dc_array_t*     dc_wait_next_msgs            (dc_context_t* context);
  * (read receipts aren't sent for noticed messages).
  *
  * Calling this function usually results in the event #DC_EVENT_MSGS_NOTICED.
- * See also dc_markseen_msgs().
+ * See also dc_markseen_msgs() and dc_markfresh_chat().
  *
  * @memberof dc_context_t
  * @param context The context object as returned from dc_context_new().
  * @param chat_id The chat ID of which all messages should be marked as being noticed.
  */
 void            dc_marknoticed_chat          (dc_context_t* context, uint32_t chat_id);
+
+
+/**
+ * Mark the last incoming message in chat as _fresh_.
+ *
+ * UI can use this to offer a "mark unread" option,
+ * so that already noticed chats (see dc_marknoticed_chat()) get a badge counter again.
+ *
+ * dc_get_fresh_msg_cnt() and dc_get_fresh_msgs() usually is increased by one afterwards.
+ *
+ * #DC_EVENT_MSGS_CHANGED is fired as usual,
+ * however, #DC_EVENT_INCOMING_MSG is _not_ fired again.
+ * This is to not add complexity to incoming messages code,
+ * e.g. UI usually does not add notifications for manually unread chats.
+ * If the UI wants to update system badge counters,
+ * they should do so directly after calling dc_markfresh_chat().
+ *
+ * @memberof dc_context_t
+ * @param context The context object as returned from dc_context_new().
+ * @param chat_id The chat ID of which the last incoming message should be marked as fresh.
+ *     If the chat does not have incoming messages, nothing happens.
+ */
+void            dc_markfresh_chat            (dc_context_t* context, uint32_t chat_id);
 
 
 /**
@@ -2472,76 +2491,6 @@ char*           dc_imex_has_backup           (dc_context_t* context, const char*
 
 
 /**
- * Initiate Autocrypt Setup Transfer.
- * Before starting the setup transfer with this function, the user should be asked:
- *
- * ~~~
- * "An 'Autocrypt Setup Message' securely shares your end-to-end setup with other Autocrypt-compliant apps.
- * The setup will be encrypted by a setup code which is displayed here and must be typed on the other device.
- * ~~~
- *
- * After that, this function should be called to send the Autocrypt Setup Message.
- * The function creates the setup message and adds it to outgoing message queue.
- * The message is sent asynchronously.
- *
- * The required setup code is returned in the following format:
- *
- * ~~~
- * 1234-1234-1234-1234-1234-1234-1234-1234-1234
- * ~~~
- *
- * The setup code should be shown to the user then:
- *
- * ~~~
- * "Your key has been sent to yourself. Switch to the other device and
- * open the setup message. You should be prompted for a setup code. Type
- * the following digits into the prompt:
- *
- * 1234 - 1234 - 1234 -
- * 1234 - 1234 - 1234 -
- * 1234 - 1234 - 1234
- *
- * Once you're done, your other device will be ready to use Autocrypt."
- * ~~~
- *
- * On the _other device_ you will call dc_continue_key_transfer() then
- * for setup messages identified by dc_msg_is_setupmessage().
- *
- * For more details about the Autocrypt setup process, please refer to
- * https://autocrypt.org/en/latest/level1.html#autocrypt-setup-message
- *
- * @memberof dc_context_t
- * @param context The context object.
- * @return The setup code. Must be released using dc_str_unref() after usage.
- *     On errors, e.g. if the message could not be sent, NULL is returned.
- */
-char*           dc_initiate_key_transfer     (dc_context_t* context);
-
-
-/**
- * Continue the Autocrypt Key Transfer on another device.
- *
- * If you have started the key transfer on another device using dc_initiate_key_transfer()
- * and you've detected a setup message with dc_msg_is_setupmessage(), you should prompt the
- * user for the setup code and call this function then.
- *
- * You can use dc_msg_get_setupcodebegin() to give the user a hint about the code (useful if the user
- * has created several messages and should not enter the wrong code).
- *
- * @memberof dc_context_t
- * @param context The context object.
- * @param msg_id The ID of the setup message to decrypt.
- * @param setup_code The setup code entered by the user. This is the same setup code as returned from
- *     dc_initiate_key_transfer() on the other device.
- *     There is no need to format the string correctly, the function will remove all spaces and other characters and
- *     insert the `-` characters at the correct places.
- * @return 1=key successfully decrypted and imported; both devices will use the same key now;
- *     0=key transfer failed e.g. due to a bad setup code.
- */
-int             dc_continue_key_transfer     (dc_context_t* context, uint32_t msg_id, const char* setup_code);
-
-
-/**
  * Signal an ongoing process to stop.
  *
  * After that, dc_stop_ongoing_process() returns _without_ waiting
@@ -3370,18 +3319,14 @@ void           dc_accounts_set_push_device_token (dc_accounts_t* accounts, const
  * This is similar to dc_get_event_emitter(), which, however,
  * must not be called for accounts handled by the account manager.
  *
+ * Events are broadcasted to all existing event emitters.
+ * Events emitted before creation of event emitter
+ * are not available to event emitter.
+ *
  * @memberof dc_accounts_t
  * @param accounts The account manager as created by dc_accounts_new().
  * @return Returns the event emitter, NULL on errors.
  *     Must be freed using dc_event_emitter_unref() after usage.
- *
- * Note: Use only one event emitter per account manager.
- * The result of having multiple event emitters is unspecified.
- * Currently events are broadcasted to all existing event emitters,
- * but previous versions delivered events to only one event emitter
- * and this behavior may change again in the future.
- * Events emitted before creation of event emitter
- * are not available to event emitter.
  */
 dc_event_emitter_t* dc_accounts_get_event_emitter (dc_accounts_t* accounts);
 
@@ -4612,6 +4557,7 @@ int             dc_msg_is_info                (const dc_msg_t* msg);
  *   and also offer a way to fix the encryption, eg. by a button offering a QR scan
  * - DC_INFO_WEBXDC_INFO_MESSAGE (32) - Info-message created by webxdc app sending `update.info`
  * - DC_INFO_CHAT_E2EE (50) - Info-message for "Chat is end-to-end-encrypted"
+ * - DC_INFO_GROUP_DESCRIPTION_CHANGED (70) - Info-message "Description changed", UI should open the profile with the description
  *
  * For the messages that refer to a CONTACT,
  * dc_msg_get_info_contact_id() returns the contact ID.
@@ -4658,7 +4604,10 @@ uint32_t        dc_msg_get_info_contact_id    (const dc_msg_t* msg);
 #define         DC_INFO_GROUP_IMAGE_CHANGED        3
 #define         DC_INFO_MEMBER_ADDED_TO_GROUP      4
 #define         DC_INFO_MEMBER_REMOVED_FROM_GROUP  5
+
+// Deprecated as of 2026-03-16, not used for new messages.
 #define         DC_INFO_AUTOCRYPT_SETUP_MESSAGE    6
+
 #define         DC_INFO_SECURE_JOIN_MESSAGE        7
 #define         DC_INFO_LOCATIONSTREAMING_ENABLED  8
 #define         DC_INFO_LOCATION_ONLY              9
@@ -4686,40 +4635,6 @@ uint32_t        dc_msg_get_info_contact_id    (const dc_msg_t* msg);
  *     Returns NULL if there is no link attached to the info message and on errors.
  */
 char*           dc_msg_get_webxdc_href        (const dc_msg_t* msg);
-
-
-/**
- * Check if the message is an Autocrypt Setup Message.
- *
- * Setup messages should be shown in an unique way e.g. using a different text color.
- * On a click or another action, the user should be prompted for the setup code
- * which is forwarded to dc_continue_key_transfer() then.
- *
- * Setup message are typically generated by dc_initiate_key_transfer() on another device.
- *
- * @memberof dc_msg_t
- * @param msg The message object.
- * @return 1=message is a setup message, 0=no setup message.
- *     For setup messages, dc_msg_get_viewtype() returns #DC_MSG_FILE.
- */
-int             dc_msg_is_setupmessage        (const dc_msg_t* msg);
-
-
-/**
- * Get the first characters of the setup code.
- *
- * Typically, this is used to pre-fill the first entry field of the setup code.
- * If the user has several setup messages, he can be sure typing in the correct digits.
- *
- * To check, if a message is a setup message, use dc_msg_is_setupmessage().
- * To decrypt a secret key from a setup message, use dc_continue_key_transfer().
- *
- * @memberof dc_msg_t
- * @param msg The message object.
- * @return Typically the first two digits of the setup code or an empty string if unknown.
- *     NULL is never returned. Must be released using dc_str_unref() when done.
- */
-char*           dc_msg_get_setupcodebegin     (const dc_msg_t* msg);
 
 
 /**
@@ -5057,17 +4972,6 @@ uint32_t        dc_msg_get_original_msg_id    (const dc_msg_t* msg);
  *     0 if the given message object is not saved.
  */
 uint32_t        dc_msg_get_saved_msg_id     (const dc_msg_t* msg);
-
-
-/**
- * Force the message to be sent in plain text.
- *
- * This API is for bots, there is no need to expose it in the UI.
- *
- * @memberof dc_msg_t
- * @param msg The message object.
- */
-void            dc_msg_force_plaintext        (dc_msg_t* msg);
 
 /**
  * @class dc_contact_t
@@ -6036,7 +5940,7 @@ char* dc_jsonrpc_blocking_call(dc_jsonrpc_instance_t* jsonrpc_instance, const ch
   * @memberof dc_event_channel_t
   * @return An event channel wrapper object (dc_event_channel_t).
   */
- dc_event_channel_t* dc_event_channel_new();
+ dc_event_channel_t* dc_event_channel_new(void);
  
  /**
   * Release/free the events channel structure.
@@ -6056,21 +5960,14 @@ void dc_event_channel_unref(dc_event_channel_t* event_channel);
  * To get these events, you have to create an event emitter using this function
  * and call dc_get_next_event() on the emitter.
  *
- * This is similar to dc_get_event_emitter(), which, however,
- * must not be called for accounts handled by the account manager.
+ * Events are broadcasted to all existing event emitters.
+ * Events emitted before creation of event emitter
+ * are not available to event emitter.
  * 
  * @memberof dc_event_channel_t
  * @param The event channel.
  * @return Returns the event emitter, NULL on errors.
  *     Must be freed using dc_event_emitter_unref() after usage.
- * 
- * Note: Use only one event emitter per account manager / event channel.
- * The result of having multiple event emitters is unspecified.
- * Currently events are broadcasted to all existing event emitters,
- * but previous versions delivered events to only one event emitter
- * and this behavior may change again in the future.
- * Events emitted before creation of event emitter
- * are not available to event emitter.
  */
 dc_event_emitter_t* dc_event_channel_get_event_emitter(dc_event_channel_t* event_channel);
 
@@ -6315,7 +6212,7 @@ void dc_event_unref(dc_event_t* event);
  * should not be disturbed by a dialog or so. Instead, use a bubble or so.
  *
  * However, for ongoing processes (e.g. dc_configure())
- * or for functions that are expected to fail (e.g. dc_continue_key_transfer())
+ * or for functions that are expected to fail
  * it might be better to delay showing these events until the function has really
  * failed (returned false). It should be sufficient to report only the _last_ error
  * in a message box then.
@@ -6754,6 +6651,7 @@ void dc_event_unref(dc_event_t* event);
  * UI usually only takes action in case call UI was opened before, otherwise the event should be ignored.
  *
  * @param data1 (int) msg_id ID of the message referring to the call
+ * @param data2 (int) 1 if the call was accepted from this device (process).
  */
  #define DC_EVENT_INCOMING_CALL_ACCEPTED                  2560
 
@@ -6782,8 +6680,8 @@ void dc_event_unref(dc_event_t* event);
  * UI should update the list.
  *
  * The event is emitted when the transports are modified on another device
- * using the JSON-RPC calls `add_or_update_transport`, `add_transport_from_qr`, `delete_transport`
- * or `set_config(configured_addr)`.
+ * using the JSON-RPC calls `add_or_update_transport`, `add_transport_from_qr`, `delete_transport`,
+ * `set_transport_unpublished` or `set_config(configured_addr)`.
  */
 #define DC_EVENT_TRANSPORTS_MODIFIED           2600
 
@@ -7495,7 +7393,7 @@ void dc_event_unref(dc_event_t* event);
 
 /// "Messages are end-to-end encrypted."
 ///
-/// Used in info messages.
+/// Used in info-messages, UI may add smth. as "Tap to learn more."
 #define DC_STR_CHAT_PROTECTION_ENABLED 170
 
 /// "Others will only see this group after you sent a first message."
@@ -7578,6 +7476,19 @@ void dc_event_unref(dc_event_t* event);
 /// `%1$s` and `%2$s` will both be replaced by the name of the inviter.
 #define DC_STR_SECURE_JOIN_CHANNEL_STARTED 203
 
+/// "Channel name changed from %1$s to %2$s."
+///
+/// Used in status messages.
+///
+/// `%1$s` will be replaced by the old channel name.
+/// `%2$s` will be replaced by the new channel name.
+#define DC_STR_CHANNEL_NAME_CHANGED 204
+
+/// "Channel image changed."
+///
+/// Used in status messages.
+#define DC_STR_CHANNEL_IMAGE_CHANGED 205
+
 /// "The attachment contains anonymous usage statistics, which help us improve Delta Chat. Thank you!"
 ///
 /// Used as the message body for statistics sent out.
@@ -7615,6 +7526,12 @@ void dc_event_unref(dc_event_t* event);
 
 /// "%1$s changed the group description."
 #define DC_STR_GROUP_DESCRIPTION_CHANGED_BY_OTHER 241
+
+/// "Messages are end-to-end encrypted."
+///
+/// Used when creating text for the "Encryption Info" dialogs.
+#define DC_STR_MESSAGES_ARE_E2EE 242
+
 
 /**
  * @}

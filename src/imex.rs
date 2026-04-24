@@ -19,9 +19,8 @@ use crate::config::Config;
 use crate::context::Context;
 use crate::e2ee;
 use crate::events::EventType;
-use crate::key::{self, DcKey, SignedPublicKey, SignedSecretKey};
+use crate::key::{self, DcKey, SignedSecretKey};
 use crate::log::{LogExt, warn};
-use crate::pgp;
 use crate::qr::DCBACKUP_VERSION;
 use crate::sql;
 use crate::tools::{
@@ -29,11 +28,9 @@ use crate::tools::{
     write_file,
 };
 
-mod key_transfer;
 mod transfer;
 
 use ::pgp::types::KeyDetails;
-pub use key_transfer::{continue_key_transfer, initiate_key_transfer};
 pub use transfer::{BackupProvider, get_backup};
 
 // Name of the database file in the backup.
@@ -103,7 +100,8 @@ pub async fn imex(
 
     if let Err(err) = res.as_ref() {
         // We are using Anyhow's .context() and to show the inner error, too, we need the {:#}:
-        error!(context, "IMEX failed to complete: {:#}", err);
+        error!(context, "{:#}", err);
+        warn!(context, "IMEX failed to complete: {:#}", err);
         context.emit_event(EventType::ImexProgress(0));
     } else {
         info!(context, "IMEX successfully completed");
@@ -141,19 +139,13 @@ pub async fn has_backup(_context: &Context, dir_name: &Path) -> Result<String> {
 }
 
 async fn set_self_key(context: &Context, armored: &str) -> Result<()> {
-    let private_key = SignedSecretKey::from_asc(armored)?;
-    let public_key = private_key.to_public_key();
-
-    let keypair = pgp::KeyPair {
-        public: public_key,
-        secret: private_key,
-    };
-    key::store_self_keypair(context, &keypair).await?;
+    let secret_key = SignedSecretKey::from_asc(armored)?;
+    key::store_self_keypair(context, &secret_key).await?;
 
     info!(
         context,
-        "stored self key: {:?}",
-        keypair.secret.public_key().legacy_key_id()
+        "Stored self key: {:?}.",
+        secret_key.public_key().fingerprint()
     );
     Ok(())
 }
@@ -209,15 +201,6 @@ async fn import_backup(
     backup_to_import: &Path,
     passphrase: String,
 ) -> Result<()> {
-    ensure!(
-        !context.is_configured().await?,
-        "Cannot import backups to accounts in use."
-    );
-    ensure!(
-        !context.scheduler.is_running().await,
-        "cannot import backup, IO is running"
-    );
-
     let backup_file = File::open(backup_to_import).await?;
     let file_size = backup_file.metadata().await?.len();
     info!(
@@ -251,6 +234,15 @@ pub(crate) async fn import_backup_stream<R: tokio::io::AsyncRead + Unpin>(
     file_size: u64,
     passphrase: String,
 ) -> Result<()> {
+    ensure!(
+        !context.is_configured().await?,
+        "Cannot import backups to accounts in use"
+    );
+    ensure!(
+        !context.scheduler.is_running().await,
+        "Cannot import backup, IO is running"
+    );
+
     import_backup_stream_inner(context, backup_file, file_size, passphrase)
         .await
         .0
@@ -293,6 +285,7 @@ impl<R> AsyncRead for ProgressReader<R>
 where
     R: AsyncRead,
 {
+    #[expect(clippy::arithmetic_side_effects)]
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -316,6 +309,9 @@ where
     }
 }
 
+// This function returns a tuple (Result<()>,) rather than Result<()>
+// so that we don't accidentally early-return with `?`
+// and forget to cleanup.
 async fn import_backup_stream_inner<R: tokio::io::AsyncRead + Unpin>(
     context: &Context,
     backup_file: R,
@@ -362,11 +358,6 @@ async fn import_backup_stream_inner<R: tokio::io::AsyncRead + Unpin>(
             }
         }
     };
-    if res.is_err() {
-        for blob in blobs {
-            fs::remove_file(&blob).await.log_err(context).ok();
-        }
-    }
 
     let unpacked_database = context.get_blobdir().join(DBFILE_BACKUP_NAME);
     if res.is_ok() {
@@ -379,17 +370,6 @@ async fn import_backup_stream_inner<R: tokio::io::AsyncRead + Unpin>(
     if res.is_ok() {
         res = check_backup_version(context).await;
     }
-    if res.is_ok() {
-        // All recent backups have `bcc_self` set to "1" before export.
-        //
-        // Setting `bcc_self` to "1" on export was introduced on 2024-12-17
-        // in commit 21664125d798021be75f47d5b0d5006d338b4531
-        //
-        // We additionally try to set `bcc_self` to "1" after import here
-        // for compatibility with older backups,
-        // but eventually this code can be removed.
-        res = context.set_config(Config::BccSelf, Some("1")).await;
-    }
     fs::remove_file(unpacked_database)
         .await
         .context("cannot remove unpacked database")
@@ -399,6 +379,22 @@ async fn import_backup_stream_inner<R: tokio::io::AsyncRead + Unpin>(
         context.emit_event(EventType::ImexProgress(999));
         res = context.sql.run_migrations(context).await;
         context.emit_event(EventType::AccountsItemChanged);
+    }
+    if res.is_err() {
+        context.sql.close().await;
+        fs::remove_file(context.sql.dbfile.as_path())
+            .await
+            .log_err(context)
+            .ok();
+        for blob in blobs {
+            fs::remove_file(&blob).await.log_err(context).ok();
+        }
+        context
+            .sql
+            .open(context, "".to_string())
+            .await
+            .log_err(context)
+            .ok();
     }
     if res.is_ok() {
         delete_and_reset_all_device_msgs(context)
@@ -449,6 +445,7 @@ fn get_next_backup_path(
 /// Exports the database to a separate file with the given passphrase.
 ///
 /// Set passphrase to empty string to export the database unencrypted.
+#[expect(clippy::arithmetic_side_effects)]
 async fn export_backup(context: &Context, dir: &Path, passphrase: String) -> Result<()> {
     // get a fine backup file name (the name includes the date so that multiple backup instances are possible)
     let now = time();
@@ -522,6 +519,7 @@ impl<W> AsyncWrite for ProgressWriter<W>
 where
     W: AsyncWrite,
 {
+    #[expect(clippy::arithmetic_side_effects)]
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -601,6 +599,7 @@ async fn import_secret_key(context: &Context, path: &Path) -> Result<()> {
 /// containing secret keys are imported and the last successfully
 /// imported which does not contain "legacy" in its filename
 /// is set as the default.
+#[expect(clippy::arithmetic_side_effects)]
 async fn import_self_keys(context: &Context, path: &Path) -> Result<()> {
     let attr = tokio::fs::metadata(path).await?;
 
@@ -654,44 +653,43 @@ async fn import_self_keys(context: &Context, path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[expect(clippy::arithmetic_side_effects)]
 async fn export_self_keys(context: &Context, dir: &Path) -> Result<()> {
     let mut export_errors = 0;
 
     let keys = context
         .sql
         .query_map_vec(
-            "SELECT id, public_key, private_key, id=(SELECT value FROM config WHERE keyname='key_id') FROM keypairs;",
+            "SELECT id, private_key, id=(SELECT value FROM config WHERE keyname='key_id') FROM keypairs;",
             (),
             |row| {
                 let id = row.get(0)?;
-                let public_key_blob: Vec<u8> = row.get(1)?;
-                let public_key = SignedPublicKey::from_slice(&public_key_blob);
-                let private_key_blob: Vec<u8> = row.get(2)?;
+                let private_key_blob: Vec<u8> = row.get(1)?;
                 let private_key = SignedSecretKey::from_slice(&private_key_blob);
-                let is_default: i32 = row.get(3)?;
+                let is_default: i32 = row.get(2)?;
 
-                Ok((id, public_key, private_key, is_default))
+                Ok((id, private_key, is_default))
             },
         )
         .await?;
     let self_addr = context.get_primary_self_addr().await?;
-    for (id, public_key, private_key, is_default) in keys {
+    for (id, private_key, is_default) in keys {
         let id = Some(id).filter(|_| is_default == 0);
 
-        if let Ok(key) = public_key {
-            if let Err(err) = export_key_to_asc_file(context, dir, &self_addr, id, &key).await {
-                error!(context, "Failed to export public key: {:#}.", err);
-                export_errors += 1;
-            }
-        } else {
+        let Ok(private_key) = private_key else {
+            export_errors += 1;
+            continue;
+        };
+
+        if let Err(err) = export_key_to_asc_file(context, dir, &self_addr, id, &private_key).await {
+            error!(context, "Failed to export private key: {:#}.", err);
             export_errors += 1;
         }
-        if let Ok(key) = private_key {
-            if let Err(err) = export_key_to_asc_file(context, dir, &self_addr, id, &key).await {
-                error!(context, "Failed to export private key: {:#}.", err);
-                export_errors += 1;
-            }
-        } else {
+
+        let public_key = private_key.to_public_key();
+
+        if let Err(err) = export_key_to_asc_file(context, dir, &self_addr, id, &public_key).await {
+            error!(context, "Failed to export public key: {:#}.", err);
             export_errors += 1;
         }
     }
@@ -721,12 +719,7 @@ where
         format!("{kind}-key-{addr}-{id}-{fp}.asc")
     };
     let path = dir.join(&file_name);
-    info!(
-        context,
-        "Exporting key {:?} to {}.",
-        key.key_id(),
-        path.display()
-    );
+    info!(context, "Exporting key to {}.", path.display());
 
     // Delete the file if it already exists.
     delete_file(context, &path).await.ok();
@@ -800,7 +793,7 @@ async fn check_backup_version(context: &Context) -> Result<()> {
     let version = (context.sql.get_raw_config_int("backup_version").await?).unwrap_or(2);
     ensure!(
         version <= DCBACKUP_VERSION,
-        "Backup too new, please update Delta Chat"
+        "This profile is from a newer version of Delta Chat. Please update Delta Chat and try again (profile version is v{version}, the latest supported is v{DCBACKUP_VERSION})"
     );
     Ok(())
 }
@@ -813,12 +806,12 @@ mod tests {
 
     use super::*;
     use crate::config::Config;
-    use crate::test_utils::{TestContext, alice_keypair};
+    use crate::test_utils::{TestContext, TestContextManager, alice_keypair};
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_export_public_key_to_asc_file() {
         let context = TestContext::new().await;
-        let key = alice_keypair().public;
+        let key = alice_keypair().to_public_key();
         let blobdir = Path::new("$BLOBDIR");
         let filename = export_key_to_asc_file(&context.ctx, blobdir, "a@b", None, &key)
             .await
@@ -835,7 +828,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_import_private_key_exported_to_asc_file() {
         let context = TestContext::new().await;
-        let key = alice_keypair().secret;
+        let key = alice_keypair();
         let blobdir = Path::new("$BLOBDIR");
         let filename = export_key_to_asc_file(&context.ctx, blobdir, "a@b", None, &key)
             .await
@@ -1030,6 +1023,81 @@ mod tests {
         Ok(())
     }
 
+    /// Tests that [`crate::qr::DCBACKUP_VERSION`] is checked correctly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_import_backup_fails_because_of_dcbackup_version() -> Result<()> {
+        let mut tcm = TestContextManager::new();
+        let context1 = tcm.alice().await;
+        let context2 = tcm.unconfigured().await;
+
+        assert!(context1.is_configured().await?);
+        assert!(!context2.is_configured().await?);
+
+        let backup_dir = tempfile::tempdir().unwrap();
+
+        tcm.section("export from context1");
+        assert!(
+            imex(&context1, ImexMode::ExportBackup, backup_dir.path(), None)
+                .await
+                .is_ok()
+        );
+        let _event = context1
+            .evtracker
+            .get_matching(|evt| matches!(evt, EventType::ImexProgress(1000)))
+            .await;
+        let backup = has_backup(&context2, backup_dir.path()).await?;
+        let modified_backup = backup_dir.path().join("modified_backup.tar");
+
+        tcm.section("Change backup_version to be higher than DCBACKUP_VERSION");
+        {
+            let unpack_dir = tempfile::tempdir().unwrap();
+            let mut ar = Archive::new(File::open(&backup).await?);
+            ar.unpack(&unpack_dir).await?;
+
+            let sql = sql::Sql::new(unpack_dir.path().join(DBFILE_BACKUP_NAME));
+            sql.open(&context2, "".to_string()).await?;
+            assert_eq!(
+                sql.get_raw_config_int("backup_version").await?.unwrap(),
+                DCBACKUP_VERSION
+            );
+            sql.set_raw_config_int("backup_version", DCBACKUP_VERSION + 1)
+                .await?;
+            sql.close().await;
+
+            let modified_backup_file = File::create(&modified_backup).await?;
+            let mut builder = tokio_tar::Builder::new(modified_backup_file);
+            builder.append_dir_all("", unpack_dir.path()).await?;
+            builder.finish().await?;
+        }
+
+        tcm.section("import to context2");
+        let err = imex(&context2, ImexMode::ImportBackup, &modified_backup, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().starts_with("This profile is from a newer version of Delta Chat. Please update Delta Chat and try again"));
+
+        // Some UIs show the error from the event to the user.
+        // Therefore, it must also be a user-facing string, rather than some technical info:
+        let err_event = context2
+            .evtracker
+            .get_matching(|evt| matches!(evt, EventType::Error(_)))
+            .await;
+        let EventType::Error(err_msg) = err_event else {
+            unreachable!()
+        };
+        assert!(err_msg.starts_with("This profile is from a newer version of Delta Chat. Please update Delta Chat and try again"));
+
+        context2
+            .evtracker
+            .get_matching(|evt| matches!(evt, EventType::ImexProgress(0)))
+            .await;
+
+        assert!(!context2.is_configured().await?);
+        assert_eq!(context2.get_config(Config::ConfiguredAddr).await?, None);
+
+        Ok(())
+    }
+
     /// This is a regression test for
     /// https://github.com/deltachat/deltachat-android/issues/2263
     /// where the config cache wasn't reset properly after a backup.
@@ -1066,6 +1134,18 @@ mod tests {
 
         // Assert that the config cache has the new value now.
         assert!(context2.is_configured().await?);
+
+        Ok(())
+    }
+
+    /// Tests importing a backup from Delta Chat 1.30.3 for Android (core v1.86.0).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_import_ancient_backup() -> Result<()> {
+        let mut tcm = TestContextManager::new();
+        let context = &tcm.unconfigured().await;
+
+        let backup_path = Path::new("test-data/core-1.86.0-backup.tar");
+        imex(context, ImexMode::ImportBackup, backup_path, None).await?;
 
         Ok(())
     }

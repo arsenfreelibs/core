@@ -465,17 +465,23 @@ pub(crate) async fn send_msg_to_smtp(
     match status {
         SendResult::Retry => Err(format_err!("Retry")),
         SendResult::Success => {
-            if !context
-                .sql
-                .exists("SELECT COUNT(*) FROM smtp WHERE msg_id=?", (msg_id,))
-                .await?
-            {
+            if !msg_has_pending_smtp_job(context, msg_id).await? {
                 msg_id.set_delivered(context).await?;
             }
             Ok(())
         }
         SendResult::Failure(err) => Err(format_err!("{err}")),
     }
+}
+
+pub(crate) async fn msg_has_pending_smtp_job(
+    context: &Context,
+    msg_id: MsgId,
+) -> Result<bool, Error> {
+    context
+        .sql
+        .exists("SELECT COUNT(*) FROM smtp WHERE msg_id=?", (msg_id,))
+        .await
 }
 
 /// Attempts to send queued MDNs.
@@ -706,7 +712,7 @@ pub(crate) async fn add_self_recipients(
         // them. Normally the user should have a non-chatmail primary transport to send unencrypted
         // messages.
         if encrypted {
-            for addr in context.get_secondary_self_addrs().await? {
+            for addr in context.get_published_secondary_self_addrs().await? {
                 recipients.push(addr);
             }
         }

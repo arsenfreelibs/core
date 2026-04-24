@@ -9,6 +9,7 @@ use crate::tools::IsNoneOrEmpty;
 /// This escapes a bit more than actually needed by delta (e.g. also lines as "-- footer"),
 /// but for non-delta-compatibility, that seems to be better.
 /// (to be only compatible with delta, only "[\r\n|\n]-- {0,2}[\r\n|\n]" needs to be replaced)
+#[expect(clippy::arithmetic_side_effects)]
 pub fn escape_message_footer_marks(text: &str) -> String {
     if let Some(text) = text.strip_prefix("--") {
         "-\u{200B}-".to_string() + &text.replace("\n--", "\n-\u{200B}-")
@@ -21,6 +22,7 @@ pub fn escape_message_footer_marks(text: &str) -> String {
 /// Returns `(lines, footer_lines)` tuple;
 /// `footer_lines` is set to `Some` if the footer was actually removed from `lines`
 /// (which is equal to the input array otherwise).
+#[expect(clippy::arithmetic_side_effects)]
 pub(crate) fn remove_message_footer<'a>(
     lines: &'a [&str],
 ) -> (&'a [&'a str], Option<&'a [&'a str]>) {
@@ -32,12 +34,10 @@ pub(crate) fn remove_message_footer<'a>(
             // some providers encode `-- ` to `=2D-` which results in only `--`;
             // use that only when no other footer is found
             // and if the line before is empty and the line after is not empty
-            "--" => {
-                if (ix == 0 || lines.get(ix.saturating_sub(1)).is_none_or_empty())
-                    && !lines.get(ix + 1).is_none_or_empty()
-                {
-                    nearly_standard_footer = Some(ix);
-                }
+            "--" if (ix == 0 || lines.get(ix.saturating_sub(1)).is_none_or_empty())
+                && !lines.get(ix + 1).is_none_or_empty() =>
+            {
+                nearly_standard_footer = Some(ix);
             }
             _ => (),
         }
@@ -175,6 +175,7 @@ fn skip_forward_header<'a>(lines: &'a [&str]) -> (&'a [&'a str], bool) {
     }
 }
 
+#[expect(clippy::arithmetic_side_effects)]
 fn remove_bottom_quote<'a>(lines: &'a [&str]) -> (&'a [&'a str], Option<String>) {
     let mut first_quoted_line = lines.len();
     let mut last_quoted_line = None;
@@ -217,6 +218,7 @@ fn remove_bottom_quote<'a>(lines: &'a [&str]) -> (&'a [&'a str], Option<String>)
     }
 }
 
+#[expect(clippy::arithmetic_side_effects)]
 fn remove_top_quote<'a>(
     lines: &'a [&str],
     is_chat_message: bool,
@@ -262,6 +264,7 @@ fn remove_top_quote<'a>(
     }
 }
 
+#[expect(clippy::arithmetic_side_effects)]
 fn render_message(lines: &[&str], is_cut_at_end: bool) -> String {
     let mut ret = String::new();
     /* we write empty lines only in case and non-empty line follows */

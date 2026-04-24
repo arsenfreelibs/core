@@ -15,6 +15,7 @@ use crate::securejoin;
 use crate::stock_str::{self, backup_transfer_qr};
 
 /// Create a QR code from any input data.
+#[expect(clippy::arithmetic_side_effects)]
 pub fn create_qr_svg(qrcode_content: &str) -> Result<String> {
     let all_size = 512.0;
     let qr_code_size = 416.0;
@@ -110,10 +111,10 @@ async fn generate_join_group_qr_code(context: &Context, chat_id: ChatId) -> Resu
 
     let qrcode_description = match chat.typ {
         crate::constants::Chattype::Group => {
-            stock_str::secure_join_group_qr_description(context, &chat).await
+            stock_str::secure_join_group_qr_description(context, &chat)
         }
         crate::constants::Chattype::OutBroadcast => {
-            stock_str::secure_join_broadcast_qr_description(context, &chat).await
+            stock_str::secure_join_broadcast_qr_description(context, &chat)
         }
         _ => bail!("Unexpected chat type {}", chat.typ),
     };
@@ -131,7 +132,7 @@ async fn generate_verification_qr(context: &Context) -> Result<String> {
     let (avatar, displayname, addr, color) = self_info(context).await?;
 
     inner_generate_secure_join_qr_code(
-        &stock_str::setup_contact_qr_description(context, &displayname, &addr).await,
+        &stock_str::setup_contact_qr_description(context, &displayname, &addr),
         &securejoin::get_securejoin_qr(context, None).await?,
         &color,
         avatar,
@@ -175,6 +176,7 @@ async fn self_info(context: &Context) -> Result<(Option<Vec<u8>>, String, String
     Ok((avatar, displayname, addr, color))
 }
 
+#[expect(clippy::arithmetic_side_effects)]
 fn inner_generate_secure_join_qr_code(
     qrcode_description: &str,
     qrcode_content: &str,

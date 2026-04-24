@@ -21,10 +21,8 @@ const PREFETCH_FLAGS: &str = "(UID INTERNALDATE RFC822.SIZE BODY.PEEK[HEADER.FIE
                               DATE \
                               X-MICROSOFT-ORIGINAL-MESSAGE-ID \
                               FROM \
-                              IN-REPLY-TO REFERENCES \
                               CHAT-VERSION \
                               CHAT-IS-POST-MESSAGE \
-                              AUTO-SUBMITTED \
                               AUTOCRYPT-SETUP-MESSAGE\
                               )])";
 
@@ -127,6 +125,7 @@ impl Session {
 
     /// Prefetch `n_uids` messages starting from `uid_next`. Returns a list of fetch results in the
     /// order of ascending delivery time to the server (INTERNALDATE).
+    #[expect(clippy::arithmetic_side_effects)]
     pub(crate) async fn prefetch(
         &mut self,
         uid_next: u32,

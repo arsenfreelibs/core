@@ -61,6 +61,9 @@ pub enum Qr {
 
         /// Authentication code.
         authcode: String,
+
+        /// Whether the inviter supports the new Securejoin v3 protocol
+        is_v3: bool,
     },
 
     /// Ask the user whether to join the group.
@@ -82,6 +85,9 @@ pub enum Qr {
 
         /// Authentication code.
         authcode: String,
+
+        /// Whether the inviter supports the new Securejoin v3 protocol
+        is_v3: bool,
     },
 
     /// Ask whether to join the broadcast channel.
@@ -106,6 +112,9 @@ pub enum Qr {
         invitenumber: String,
         /// Authentication code.
         authcode: String,
+
+        /// Whether the inviter supports the new Securejoin v3 protocol
+        is_v3: bool,
     },
 
     /// Contact fingerprint is verified.
@@ -483,7 +492,7 @@ async fn decode_openpgp(context: &Context, qr: &str) -> Result<Qr> {
 
     let name = decode_name(&param, "n")?.unwrap_or_default();
 
-    let invitenumber = param
+    let mut invitenumber = param
         .get("i")
         // For historic reansons, broadcasts currently use j instead of i for the invitenumber:
         .or_else(|| param.get("j"))
@@ -500,6 +509,16 @@ async fn decode_openpgp(context: &Context, qr: &str) -> Result<Qr> {
 
     let grpname = decode_name(&param, "g")?;
     let broadcast_name = decode_name(&param, "b")?;
+
+    let mut is_v3 = param.get("v") == Some(&"3");
+
+    if authcode.is_some() && invitenumber.is_none() {
+        // Securejoin v3 doesn't need an invitenumber.
+        // We want to remove the invitenumber and the `v=3` parameter eventually;
+        // therefore, we accept v3 QR codes without an invitenumber.
+        is_v3 = true;
+        invitenumber = Some("".to_string());
+    }
 
     if let (Some(addr), Some(invitenumber), Some(authcode)) = (&addr, invitenumber, authcode) {
         let addr = ContactAddress::new(addr)?;
@@ -519,7 +538,7 @@ async fn decode_openpgp(context: &Context, qr: &str) -> Result<Qr> {
                 .await
                 .with_context(|| format!("can't check if address {addr:?} is our address"))?
             {
-                if token::exists(context, token::Namespace::InviteNumber, &invitenumber).await? {
+                if token::exists(context, token::Namespace::Auth, &authcode).await? {
                     Ok(Qr::WithdrawVerifyGroup {
                         grpname,
                         grpid,
@@ -546,6 +565,7 @@ async fn decode_openpgp(context: &Context, qr: &str) -> Result<Qr> {
                     fingerprint,
                     invitenumber,
                     authcode,
+                    is_v3,
                 })
             }
         } else if let (Some(grpid), Some(name)) = (grpid, broadcast_name) {
@@ -554,7 +574,7 @@ async fn decode_openpgp(context: &Context, qr: &str) -> Result<Qr> {
                 .await
                 .with_context(|| format!("Can't check if {addr:?} is our address"))?
             {
-                if token::exists(context, token::Namespace::InviteNumber, &invitenumber).await? {
+                if token::exists(context, token::Namespace::Auth, &authcode).await? {
                     Ok(Qr::WithdrawJoinBroadcast {
                         name,
                         grpid,
@@ -581,10 +601,11 @@ async fn decode_openpgp(context: &Context, qr: &str) -> Result<Qr> {
                     fingerprint,
                     invitenumber,
                     authcode,
+                    is_v3,
                 })
             }
         } else if context.is_self_addr(&addr).await? {
-            if token::exists(context, token::Namespace::InviteNumber, &invitenumber).await? {
+            if token::exists(context, token::Namespace::Auth, &authcode).await? {
                 Ok(Qr::WithdrawVerifyContact {
                     contact_id,
                     fingerprint,
@@ -605,6 +626,7 @@ async fn decode_openpgp(context: &Context, qr: &str) -> Result<Qr> {
                 fingerprint,
                 invitenumber,
                 authcode,
+                is_v3,
             })
         }
     } else if let Some(addr) = addr {
@@ -660,6 +682,12 @@ fn decode_account(qr: &str) -> Result<Qr> {
     let payload = qr
         .get(DCACCOUNT_SCHEME.len()..)
         .context("Invalid DCACCOUNT payload")?;
+
+    // Handle `dcaccount://...` URLs.
+    let payload = payload.strip_prefix("//").unwrap_or(payload);
+    if payload.is_empty() {
+        bail!("dcaccount payload is empty");
+    }
     if payload.starts_with("https://") {
         let url = url::Url::parse(payload).context("Invalid account URL")?;
         if url.scheme() == "https" {
@@ -673,6 +701,12 @@ fn decode_account(qr: &str) -> Result<Qr> {
             bail!("Bad scheme for account URL: {:?}.", url.scheme());
         }
     } else {
+        if payload.starts_with("/") {
+            // Handle `dcaccount:///` URL reported to have been created
+            // by Telegram link parser at
+            // <https://support.delta.chat/t/could-not-find-dns-resolutions-for-imap-993-when-adding-a-relay/4907>
+            bail!("Hostname in dcaccount URL cannot start with /");
+        }
         Ok(Qr::Account {
             domain: payload.to_string(),
         })
@@ -680,6 +714,7 @@ fn decode_account(qr: &str) -> Result<Qr> {
 }
 
 /// scheme: `https://t.me/socks?server=foo&port=123` or `https://t.me/socks?server=1.2.3.4&port=123`
+#[expect(clippy::arithmetic_side_effects)]
 fn decode_tg_socks_proxy(_context: &Context, qr: &str) -> Result<Qr> {
     let url = url::Url::parse(qr).context("Invalid t.me/socks url")?;
 
@@ -1021,6 +1056,7 @@ async fn decode_smtp(context: &Context, qr: &str) -> Result<Qr> {
 /// Scheme: `MATMSG:TO:addr...;SUB:subject...;BODY:body...;`
 ///
 /// There may or may not be linebreaks after the fields.
+#[expect(clippy::arithmetic_side_effects)]
 async fn decode_matmsg(context: &Context, qr: &str) -> Result<Qr> {
     // Does not work when the text `TO:` is used in subject/body _and_ TO: is not the first field.
     // we ignore this case.

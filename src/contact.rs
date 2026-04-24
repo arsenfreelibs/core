@@ -35,6 +35,7 @@ use crate::log::{LogExt, warn};
 use crate::message::MessageState;
 use crate::mimeparser::AvatarAction;
 use crate::param::{Param, Params};
+use crate::pgp::{addresses_from_public_key, merge_openpgp_certificates};
 use crate::sync::{self, Sync::*};
 use crate::tools::{SystemTime, duration_to_str, get_abs_path, normalize_text, time, to_lowercase};
 use crate::{chat, chatlist_events, ensure_and_debug_assert_ne, stock_str};
@@ -314,6 +315,67 @@ pub async fn make_vcard(context: &Context, contacts: &[ContactId]) -> Result<Str
         .to_string())
 }
 
+/// Imports public key into the public key store.
+///
+/// They key may come from Autocrypt header,
+/// Autocrypt-Gossip header or a vCard.
+///
+/// If the key with the same fingerprint already exists,
+/// it is updated by merging the new key.
+pub(crate) async fn import_public_key(
+    context: &Context,
+    public_key: &SignedPublicKey,
+) -> Result<()> {
+    public_key
+        .verify_bindings()
+        .context("Attempt to import broken public key")?;
+
+    let fingerprint = public_key.dc_fingerprint().hex();
+
+    let merged_public_key;
+    let merged_public_key_ref = if let Some(public_key_bytes) = context
+        .sql
+        .query_row_optional(
+            "SELECT public_key
+             FROM public_keys
+             WHERE fingerprint=?",
+            (&fingerprint,),
+            |row| {
+                let bytes: Vec<u8> = row.get(0)?;
+                Ok(bytes)
+            },
+        )
+        .await?
+    {
+        let old_public_key = SignedPublicKey::from_slice(&public_key_bytes)?;
+        merged_public_key = merge_openpgp_certificates(public_key.clone(), old_public_key)
+            .context("Failed to merge public keys")?;
+        &merged_public_key
+    } else {
+        public_key
+    };
+
+    let inserted = context
+        .sql
+        .execute(
+            "INSERT INTO public_keys (fingerprint, public_key)
+             VALUES (?, ?)
+             ON CONFLICT (fingerprint)
+             DO UPDATE SET public_key=excluded.public_key
+                WHERE public_key!=excluded.public_key",
+            (&fingerprint, merged_public_key_ref.to_bytes()),
+        )
+        .await?;
+    if inserted > 0 {
+        info!(
+            context,
+            "Saved key with fingerprint {fingerprint} from the Autocrypt header"
+        );
+    }
+
+    Ok(())
+}
+
 /// Imports contacts from the given vCard.
 ///
 /// Returns the ids of successfully processed contacts in the order they appear in `vcard`,
@@ -352,23 +414,14 @@ async fn import_vcard_contact(context: &Context, contact: &VcardContact) -> Resu
             .ok()
     });
 
-    let fingerprint;
-    if let Some(public_key) = key {
-        fingerprint = public_key.dc_fingerprint().hex();
-
-        context
-            .sql
-            .execute(
-                "INSERT INTO public_keys (fingerprint, public_key)
-                 VALUES (?, ?)
-                 ON CONFLICT (fingerprint)
-                 DO NOTHING",
-                (&fingerprint, public_key.to_bytes()),
-            )
-            .await?;
+    let fingerprint = if let Some(public_key) = key {
+        import_public_key(context, &public_key)
+            .await
+            .context("Failed to import public key from vCard")?;
+        public_key.dc_fingerprint().hex()
     } else {
-        fingerprint = String::new();
-    }
+        String::new()
+    };
 
     let (id, modified) =
         match Contact::add_or_lookup_ex(context, &contact.authname, &addr, &fingerprint, origin)
@@ -635,7 +688,7 @@ impl Contact {
             .await?
         {
             if contact_id == ContactId::SELF {
-                contact.name = stock_str::self_msg(context).await;
+                contact.name = stock_str::self_msg(context);
                 contact.authname = context
                     .get_config(Config::Displayname)
                     .await?
@@ -652,9 +705,9 @@ impl Contact {
                     .await?
                     .unwrap_or_default();
             } else if contact_id == ContactId::DEVICE {
-                contact.name = stock_str::device_messages(context).await;
+                contact.name = stock_str::device_messages(context);
                 contact.addr = ContactId::DEVICE_ADDR.to_string();
-                contact.status = stock_str::device_messages_hint(context).await;
+                contact.status = stock_str::device_messages_hint(context);
             }
             Ok(Some(contact))
         } else {
@@ -673,6 +726,7 @@ impl Contact {
     }
 
     /// Returns `true` if this contact was seen recently.
+    #[expect(clippy::arithmetic_side_effects)]
     pub fn was_seen_recently(&self) -> bool {
         time() - self.last_seen <= SEEN_RECENTLY_SECONDS
     }
@@ -1071,6 +1125,7 @@ VALUES (?, ?, ?, ?, ?, ?)
     /// The `addr_book` is a multiline string in the format `Name one\nAddress one\nName two\nAddress two`.
     ///
     /// Returns the number of modified contacts.
+    #[expect(clippy::arithmetic_side_effects)]
     pub async fn add_address_book(context: &Context, addr_book: &str) -> Result<usize> {
         let mut modify_cnt = 0;
 
@@ -1127,7 +1182,9 @@ VALUES (?, ?, ?, ?, ?, ?)
         let mut ret = Vec::new();
         let flag_add_self = (listflags & constants::DC_GCL_ADD_SELF) != 0;
         let flag_address = (listflags & constants::DC_GCL_ADDRESS) != 0;
-        let minimal_origin = if context.get_config_bool(Config::Bot).await? {
+        let minimal_origin = if context.get_config_bool(Config::Bot).await?
+            || query.is_some_and(may_be_valid_addr)
+        {
             Origin::Unknown
         } else {
             Origin::IncomingReplyTo
@@ -1185,7 +1242,7 @@ ORDER BY c.origin>=? DESC, c.last_seen DESC, c.id DESC
 
                 if self_addr.contains(query)
                     || self_name.contains(query)
-                    || self_name2.await.contains(query)
+                    || self_name2.contains(query)
                 {
                     add_self = true;
                 }
@@ -1337,17 +1394,17 @@ WHERE addr=?
             .unwrap_or_default();
 
         let Some(fingerprint_other) = contact.fingerprint() else {
-            return Ok(stock_str::encr_none(context).await);
+            return Ok(stock_str::encr_none(context));
         };
         let fingerprint_other = fingerprint_other.to_string();
 
         let stock_message = if contact.public_key(context).await?.is_some() {
-            stock_str::messages_e2e_encrypted(context).await
+            stock_str::messages_are_e2ee(context)
         } else {
-            stock_str::encr_none(context).await
+            stock_str::encr_none(context)
         };
 
-        let finger_prints = stock_str::finger_prints(context).await;
+        let finger_prints = stock_str::finger_prints(context);
         let mut ret = format!("{stock_message}\n{finger_prints}:");
 
         let fingerprint_self = load_self_public_key(context)
@@ -1357,7 +1414,7 @@ WHERE addr=?
         if addr < contact.addr {
             cat_fingerprint(
                 &mut ret,
-                &stock_str::self_msg(context).await,
+                &stock_str::self_msg(context),
                 &addr,
                 &fingerprint_self,
             );
@@ -1376,10 +1433,20 @@ WHERE addr=?
             );
             cat_fingerprint(
                 &mut ret,
-                &stock_str::self_msg(context).await,
+                &stock_str::self_msg(context),
                 &addr,
                 &fingerprint_self,
             );
+        }
+
+        if let Some(public_key) = contact.public_key(context).await?
+            && let Some(relay_addrs) = addresses_from_public_key(&public_key)
+        {
+            ret += "\n\nRelays:";
+            for relay in &relay_addrs {
+                ret += "\n";
+                ret += relay;
+            }
         }
 
         Ok(ret)
@@ -1909,6 +1976,7 @@ pub(crate) async fn set_status(
 }
 
 /// Updates last seen timestamp of the contact if it is earlier than the given `timestamp`.
+#[expect(clippy::arithmetic_side_effects)]
 pub(crate) async fn update_last_seen(
     context: &Context,
     contact_id: ContactId,
@@ -2000,6 +2068,7 @@ pub(crate) async fn mark_contact_id_as_verified(
     Ok(())
 }
 
+#[expect(clippy::arithmetic_side_effects)]
 fn cat_fingerprint(ret: &mut String, name: &str, addr: &str, fingerprint: &str) {
     *ret += &format!("\n\n{name} ({addr}):\n{fingerprint}");
 }
@@ -2041,6 +2110,7 @@ impl RecentlySeenLoop {
         }
     }
 
+    #[expect(clippy::arithmetic_side_effects)]
     async fn run(context: Context, interrupt: Receiver<RecentlySeenInterrupt>) {
         type MyHeapElem = (Reverse<i64>, ContactId);
 

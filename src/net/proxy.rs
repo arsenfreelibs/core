@@ -19,7 +19,6 @@ use tokio_io_timeout::TimeoutStream;
 use url::Url;
 
 use crate::config::Config;
-use crate::constants::NON_ALPHANUMERIC_WITHOUT_DOT;
 use crate::context::Context;
 use crate::net::connect_tcp;
 use crate::net::session::SessionStream;
@@ -93,13 +92,12 @@ impl HttpConfig {
     }
 
     fn to_url(&self, scheme: &str) -> String {
-        let host = utf8_percent_encode(&self.host, NON_ALPHANUMERIC_WITHOUT_DOT);
         if let Some((user, password)) = &self.user_password {
             let user = utf8_percent_encode(user, NON_ALPHANUMERIC);
             let password = utf8_percent_encode(password, NON_ALPHANUMERIC);
-            format!("{scheme}://{user}:{password}@{host}:{}", self.port)
+            format!("{scheme}://{user}:{password}@{}:{}", self.host, self.port)
         } else {
-            format!("{scheme}://{host}:{}", self.port)
+            format!("{scheme}://{}:{}", self.host, self.port)
         }
     }
 }
@@ -143,13 +141,12 @@ impl Socks5Config {
     }
 
     fn to_url(&self) -> String {
-        let host = utf8_percent_encode(&self.host, NON_ALPHANUMERIC_WITHOUT_DOT);
         if let Some((user, password)) = &self.user_password {
             let user = utf8_percent_encode(user, NON_ALPHANUMERIC);
             let password = utf8_percent_encode(password, NON_ALPHANUMERIC);
-            format!("socks5://{user}:{password}@{host}:{}", self.port)
+            format!("socks5://{user}:{password}@{}:{}", self.host, self.port)
         } else {
-            format!("socks5://{host}:{}", self.port)
+            format!("socks5://{}:{}", self.host, self.port)
         }
     }
 }
@@ -174,6 +171,7 @@ pub enum ProxyConfig {
 }
 
 /// Constructs HTTP/1.1 `CONNECT` request for HTTP(S) proxy.
+#[expect(clippy::arithmetic_side_effects)]
 fn http_connect_request(host: &str, port: u16, auth: Option<(&str, &str)>) -> String {
     // According to <https://datatracker.ietf.org/doc/html/rfc7230#section-5.4>
     // clients MUST send `Host:` header in HTTP/1.1 requests,
@@ -322,6 +320,7 @@ impl ProxyConfig {
     /// config into `proxy_url` if `proxy_url` is unset or empty.
     ///
     /// Unsets `socks5_host`, `socks5_port`, `socks5_user` and `socks5_password` in any case.
+    #[expect(clippy::arithmetic_side_effects)]
     async fn migrate_socks_config(sql: &Sql) -> Result<()> {
         if sql.get_raw_config("proxy_url").await?.is_none() {
             // Load legacy SOCKS5 settings.
@@ -563,6 +562,20 @@ mod tests {
                 user_password: None
             })
         );
+
+        let proxy_config = ProxyConfig::from_url("socks5://my-proxy.example.org").unwrap();
+        assert_eq!(
+            proxy_config,
+            ProxyConfig::Socks5(Socks5Config {
+                host: "my-proxy.example.org".to_string(),
+                port: 1080,
+                user_password: None
+            })
+        );
+        assert_eq!(
+            proxy_config.to_url(),
+            "socks5://my-proxy.example.org:1080".to_string()
+        );
     }
 
     #[test]
@@ -596,6 +609,20 @@ mod tests {
                 user_password: None
             })
         );
+
+        let proxy_config = ProxyConfig::from_url("http://my-proxy.example.org").unwrap();
+        assert_eq!(
+            proxy_config,
+            ProxyConfig::Http(HttpConfig {
+                host: "my-proxy.example.org".to_string(),
+                port: 80,
+                user_password: None
+            })
+        );
+        assert_eq!(
+            proxy_config.to_url(),
+            "http://my-proxy.example.org:80".to_string()
+        );
     }
 
     #[test]
@@ -628,6 +655,20 @@ mod tests {
                 port: 443,
                 user_password: None
             })
+        );
+
+        let proxy_config = ProxyConfig::from_url("https://my-proxy.example.org").unwrap();
+        assert_eq!(
+            proxy_config,
+            ProxyConfig::Https(HttpConfig {
+                host: "my-proxy.example.org".to_string(),
+                port: 443,
+                user_password: None
+            })
+        );
+        assert_eq!(
+            proxy_config.to_url(),
+            "https://my-proxy.example.org:443".to_string()
         );
     }
 

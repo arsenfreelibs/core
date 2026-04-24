@@ -13,7 +13,7 @@ import pytest
 from deltachat_rpc_client import EventType, events
 from deltachat_rpc_client.const import DownloadState, MessageState
 from deltachat_rpc_client.pytestplugin import E2EE_INFO_MSGS
-from deltachat_rpc_client.rpc import JsonRpcError
+from deltachat_rpc_client.rpc import JsonRpcError, Rpc
 
 
 def test_system_info(rpc) -> None:
@@ -273,6 +273,9 @@ def test_chat(acfactory) -> None:
     assert group.get_messages()
     group.get_fresh_message_count()
     group.mark_noticed()
+    assert group.get_fresh_message_count() == 0
+    group.mark_fresh()
+    assert group.get_fresh_message_count() > 0
     assert group.get_contacts()
     assert group.get_past_contacts() == []
     group.remove_contact(alice_contact_bob)
@@ -665,6 +668,24 @@ def test_openrpc_command_line() -> None:
     assert "methods" in openrpc
 
 
+def test_early_failure(tmp_path) -> None:
+    """Test that Rpc.start() raises on invalid accounts directories."""
+    # A file instead of a directory.
+    file_path = tmp_path / "not_a_dir"
+    file_path.write_text("I am a file, not a directory")
+    rpc = Rpc(accounts_dir=str(file_path))
+    with pytest.raises(JsonRpcError, match="(?i)directory"):
+        rpc.start()
+
+    # A non-empty directory that is not a deltachat accounts directory.
+    non_dc_dir = tmp_path / "invalid_dir"
+    non_dc_dir.mkdir()
+    (non_dc_dir / "some_file").write_text("content")
+    rpc = Rpc(accounts_dir=str(non_dc_dir))
+    with pytest.raises(JsonRpcError, match="invalid_dir"):
+        rpc.start()
+
+
 def test_provider_info(rpc) -> None:
     account_id = rpc.add_account()
 
@@ -1026,6 +1047,7 @@ def test_no_old_msg_is_fresh(acfactory):
     assert ac1.create_chat(ac2).get_fresh_message_count() == 1
     assert len(list(ac1.get_fresh_messages())) == 1
 
+    ac1_clone.wait_for_incoming_msg_event()
     ac1.wait_for_event(EventType.IMAP_INBOX_IDLE)
 
     logging.info("Send a message from ac1_clone to ac2 and check that ac1 marks the first message as 'noticed'")

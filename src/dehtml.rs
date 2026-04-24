@@ -235,6 +235,7 @@ fn str_cb(event_str: &str, dehtml: &mut Dehtml) {
     }
 }
 
+#[expect(clippy::arithmetic_side_effects)]
 fn dehtml_endtag_cb(event: &BytesEnd, dehtml: &mut Dehtml) {
     let tag = String::from_utf8_lossy(event.name().as_ref())
         .trim()
@@ -265,21 +266,18 @@ fn dehtml_endtag_cb(event: &BytesEnd, dehtml: &mut Dehtml) {
                 }
             }
         }
-        "b" | "strong" => {
-            if dehtml.get_add_text() != AddText::No {
-                *dehtml.get_buf() += "*";
-            }
+        "b" | "strong" if dehtml.get_add_text() != AddText::No => {
+            *dehtml.get_buf() += "*";
         }
-        "i" | "em" => {
-            if dehtml.get_add_text() != AddText::No {
-                *dehtml.get_buf() += "_";
-            }
+        "i" | "em" if dehtml.get_add_text() != AddText::No => {
+            *dehtml.get_buf() += "_";
         }
         "blockquote" => pop_tag(&mut dehtml.blockquotes_since_blockquote),
         _ => {}
     }
 }
 
+#[expect(clippy::arithmetic_side_effects)]
 fn dehtml_starttag_cb<B: std::io::BufRead>(
     event: &BytesStart,
     dehtml: &mut Dehtml,
@@ -339,15 +337,11 @@ fn dehtml_starttag_cb<B: std::io::BufRead>(
                 }
             }
         }
-        "b" | "strong" => {
-            if dehtml.get_add_text() != AddText::No {
-                *dehtml.get_buf() += "*";
-            }
+        "b" | "strong" if dehtml.get_add_text() != AddText::No => {
+            *dehtml.get_buf() += "*";
         }
-        "i" | "em" => {
-            if dehtml.get_add_text() != AddText::No {
-                *dehtml.get_buf() += "_";
-            }
+        "i" | "em" if dehtml.get_add_text() != AddText::No => {
+            *dehtml.get_buf() += "_";
         }
         "blockquote" => dehtml.blockquotes_since_blockquote += 1,
         _ => {}
@@ -356,6 +350,7 @@ fn dehtml_starttag_cb<B: std::io::BufRead>(
 
 /// In order to know when a specific tag is closed, we need to count the opening and closing tags.
 /// The `counts`s are stored in the `Dehtml` struct.
+#[expect(clippy::arithmetic_side_effects)]
 fn pop_tag(count: &mut u32) {
     if *count > 0 {
         *count -= 1;
@@ -364,6 +359,7 @@ fn pop_tag(count: &mut u32) {
 
 /// In order to know when a specific tag is closed, we need to count the opening and closing tags.
 /// The `counts`s are stored in the `Dehtml` struct.
+#[expect(clippy::arithmetic_side_effects)]
 fn maybe_push_tag(
     event: &BytesStart,
     reader: &Reader<impl BufRead>,

@@ -263,6 +263,7 @@ impl Kml {
 }
 
 /// Enables location streaming in chat identified by `chat_id` for `seconds` seconds.
+#[expect(clippy::arithmetic_side_effects)]
 pub async fn send_locations_to_chat(
     context: &Context,
     chat_id: ChatId,
@@ -287,13 +288,13 @@ pub async fn send_locations_to_chat(
         )
         .await?;
     if 0 != seconds && !is_sending_locations_before {
-        let mut msg = Message::new_text(stock_str::msg_location_enabled(context).await);
+        let mut msg = Message::new_text(stock_str::msg_location_enabled(context));
         msg.param.set_cmd(SystemMessage::LocationStreamingEnabled);
         chat::send_msg(context, chat_id, &mut msg)
             .await
             .unwrap_or_default();
     } else if 0 == seconds && is_sending_locations_before {
-        let stock_str = stock_str::msg_location_disabled(context).await;
+        let stock_str = stock_str::msg_location_disabled(context);
         chat::add_info_msg(context, chat_id, &stock_str).await?;
     }
     context.emit_event(EventType::ChatModified(chat_id));
@@ -385,6 +386,7 @@ pub async fn set(context: &Context, latitude: f64, longitude: f64, accuracy: f64
 }
 
 /// Searches for locations in the given time range, optionally filtering by chat and contact IDs.
+#[expect(clippy::arithmetic_side_effects)]
 pub async fn get_range(
     context: &Context,
     chat_id: Option<ChatId>,
@@ -517,6 +519,7 @@ pub(crate) async fn delete_orphaned_poi_locations(context: &Context) -> Result<(
 }
 
 /// Returns `location.kml` contents.
+#[expect(clippy::arithmetic_side_effects)]
 pub async fn get_kml(context: &Context, chat_id: ChatId) -> Result<Option<(String, u32)>> {
     let mut last_added_location_id = 0;
 
@@ -752,6 +755,7 @@ pub(crate) async fn location_loop(context: &Context, interrupt_receiver: Receive
 
 /// Returns number of seconds until the next time location streaming for some chat ends
 /// automatically.
+#[expect(clippy::arithmetic_side_effects)]
 async fn maybe_send_locations(context: &Context) -> Result<Option<u64>> {
     let mut next_event: Option<u64> = None;
 
@@ -848,7 +852,7 @@ async fn maybe_send_locations(context: &Context) -> Result<Option<u64>> {
                 .await
                 .context("failed to disable location streaming")?;
 
-            let stock_str = stock_str::msg_location_disabled(context).await;
+            let stock_str = stock_str::msg_location_disabled(context);
             chat::add_info_msg(context, chat_id, &stock_str).await?;
             context.emit_event(EventType::ChatModified(chat_id));
             chatlist_events::emit_chatlist_item_changed(context, chat_id);
