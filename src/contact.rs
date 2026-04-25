@@ -1209,7 +1209,7 @@ ORDER BY c.origin>=? DESC, c.last_seen DESC, c.id DESC
                         flag_address,
                         minimal_origin,
                         &s3str_like_cmd,
-                        &query_lowercased,
+                        &s3str_like_cmd,
                         Origin::CreateChat,
                     ),
                     |row| {
