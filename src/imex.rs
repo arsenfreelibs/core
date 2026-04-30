@@ -56,7 +56,7 @@ pub enum ImexMode {
     /// Export a backup to the directory given as `path` with the given `passphrase`.
     /// The backup contains all contacts, chats, images and other data and device independent settings.
     /// The backup does not contain device dependent settings as ringtones or LED notification settings.
-    /// The name of the backup is `delta-chat-backup-<day>-<number>-<addr>.tar`.
+    /// The name of the backup is `alt-chat-backup-<day>-<number>-<addr>.tar`.
     ExportBackup = 11,
 
     /// `path` is the file (not: directory) to import. The file is normally
@@ -121,12 +121,12 @@ pub async fn has_backup(_context: &Context, dir_name: &Path) -> Result<String> {
         let path = dirent.path();
         let name = dirent.file_name();
         let name: String = name.to_string_lossy().into();
-        if name.starts_with("delta-chat")
+        if name.starts_with("alt-chat")
             && name.ends_with(".tar")
             && (newest_backup_name.is_empty() || name > newest_backup_name)
         {
             // We just use string comparison to determine which backup is newer.
-            // This works fine because the filenames have the form `delta-chat-backup-2023-10-18-00-foo@example.com.tar`
+            // This works fine because the filenames have the form `alt-chat-backup-2023-10-18-00-foo@example.com.tar`
             newest_backup_path = Some(path);
             newest_backup_name = name;
         }
@@ -421,7 +421,7 @@ fn get_next_backup_path(
     let stem = chrono::DateTime::<chrono::Utc>::from_timestamp(backup_time, 0)
         .context("can't get next backup path")?
         // Don't change this file name format, in `dc_imex_has_backup` we use string comparison to determine which backup is newer:
-        .format("delta-chat-backup-%Y-%m-%d")
+        .format("alt-chat-backup-%Y-%m-%d")
         .to_string();
 
     // 64 backup files per day should be enough for everyone
