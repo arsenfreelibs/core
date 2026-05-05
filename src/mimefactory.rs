@@ -1717,7 +1717,7 @@ impl MimeFactory {
         let fwdhint = if afwd_email {
             Some(
                 "---------- Forwarded message ----------\r\n\
-                 From: Delta Chat\r\n\
+                 From: Alt Chat\r\n\
                  \r\n"
                     .to_string(),
             )

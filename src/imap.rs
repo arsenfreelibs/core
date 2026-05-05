@@ -1425,7 +1425,7 @@ impl Session {
                         warn!(context, "receive_imf error: {err:#}.");
 
                         let text = format!(
-                            "❌ Failed to receive a message: {err:#}. Core version v{DC_VERSION_STR}. Please report this bug to delta@merlinux.eu or https://support.delta.chat/.",
+                            "❌ Failed to receive a message: {err:#}. Core version v{DC_VERSION_STR}. Please report this bug to altchat.me@gmail.com or https://support.alt-chat.me/.",
                         );
                         let mut msg = Message::new_text(text);
                         add_device_msg(context, None, Some(&mut msg)).await?;

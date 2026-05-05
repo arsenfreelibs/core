@@ -247,7 +247,7 @@ Here is what to do:
  • Tap on "QR Invite Code"
  • Have all recipients scan the QR code, or send them the link
 
-If you have any questions, please send an email to delta@merlinux.eu or ask at https://support.delta.chat/."#;
+If you have any questions, please send an email to altchat.me@gmail.com or ask at https://support.alt-chat.me/."#;
 
 #[cfg(test)]
 mod tests {
