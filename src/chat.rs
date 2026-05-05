@@ -3250,6 +3250,34 @@ pub async fn marknoticed_all_chats(context: &Context) -> Result<()> {
 
 /// Marks all messages in the chat as noticed.
 /// If the given chat-id is the archive-link, marks all messages in all archived chats as noticed.
+/// Mark all messages in a chat as fresh (unread).
+/// This is the reverse of marknoticed_chat().
+pub async fn mark_fresh_chat(context: &Context, chat_id: ChatId) -> Result<()> {
+    context
+        .sql
+        .execute(
+            "UPDATE msgs
+            SET state=?
+          WHERE state IN (?,?)
+            AND hidden=0
+            AND chat_id=?;",
+            (
+                MessageState::InFresh,
+                MessageState::InNoticed,
+                MessageState::InSeen,
+                chat_id,
+            ),
+        )
+        .await?;
+
+    context.emit_event(EventType::MsgsChanged {
+        chat_id,
+        msg_id: MsgId::new(0),
+    });
+    chatlist_events::emit_chatlist_item_changed(context, chat_id);
+    Ok(())
+}
+
 pub async fn marknoticed_chat(context: &Context, chat_id: ChatId) -> Result<()> {
     // "WHERE" below uses the index `(state, hidden, chat_id)`, see get_fresh_msg_cnt() for reasoning
     // the additional SELECT statement may speed up things as no write-blocking is needed.
