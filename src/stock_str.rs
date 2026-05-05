@@ -134,7 +134,7 @@ pub enum StockMessage {
     #[strum(props(fallback = "⚠️ Your Alt Chat version might be outdated.\n\n\
                     This may cause problems because your chat partners use newer versions - \
                     and you are missing the latest features 😳\n\
-                    Please check https://get.altchat.me or your app store for updates."))]
+                    Please check https://get.alt-chat.me or your app store for updates."))]
     UpdateReminderMsgBody = 86,
 
     #[strum(props(
@@ -366,7 +366,7 @@ Please consider donating to help that Alt Chat stays free for everyone.
 While Alt Chat is free to use and open source, development costs money.
 Help keeping us to keep Alt Chat independent and make it more awesome in the future.
 
-https://altchat.me/donate"))]
+https://alt-chat.me/donate"))]
     DonationRequest = 193,
 
     #[strum(props(fallback = "Declined call"))]
