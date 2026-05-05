@@ -3248,8 +3248,6 @@ pub async fn marknoticed_all_chats(context: &Context) -> Result<()> {
     Ok(())
 }
 
-/// Marks all messages in the chat as noticed.
-/// If the given chat-id is the archive-link, marks all messages in all archived chats as noticed.
 /// Mark all messages in a chat as fresh (unread).
 /// This is the reverse of marknoticed_chat().
 pub async fn mark_fresh_chat(context: &Context, chat_id: ChatId) -> Result<()> {
