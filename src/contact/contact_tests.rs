@@ -4,6 +4,7 @@ use super::*;
 use crate::chat::{Chat, get_chat_contacts, send_text_msg};
 use crate::chatlist::Chatlist;
 use crate::receive_imf::receive_imf;
+use crate::securejoin::get_securejoin_qr;
 use crate::test_utils::{self, TestContext, TestContextManager, TimeShiftFalsePositiveNote, sync};
 
 #[test]
@@ -155,6 +156,50 @@ async fn test_get_contacts() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_search_contacts_from_group() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+    let fiona = &tcm.fiona().await;
+
+    let alice_chat_id = chat::create_group(alice, "").await?;
+    let qr = get_securejoin_qr(alice, Some(alice_chat_id)).await?;
+    let bob_chat_id = tcm.exec_securejoin_qr(bob, alice, &qr).await;
+    tcm.exec_securejoin_qr(fiona, alice, &qr).await;
+
+    // Workaround for "member added" for fiona not sent to bob.
+    let gossip_period = alice.get_config_int(Config::GossipPeriod).await?;
+    SystemTime::shift(Duration::from_secs(gossip_period.try_into()?));
+    send_text_msg(alice, alice_chat_id, "hello".to_string()).await?;
+    let sent_msg = alice.pop_sent_msg().await;
+    bob.recv_msg(&sent_msg).await;
+    fiona.recv_msg(&sent_msg).await;
+
+    let contacts = Contact::get_all(bob, 0, None).await?;
+    let bob_alice_id = bob.add_or_lookup_contact_id(alice).await;
+    assert_eq!(contacts.len(), 1);
+    assert_eq!(contacts[0], bob_alice_id);
+
+    let contacts = Contact::get_all(fiona, 0, None).await?;
+    let fiona_alice_id = fiona.add_or_lookup_contact_id(alice).await;
+    assert_eq!(contacts.len(), 1);
+    assert_eq!(contacts[0], fiona_alice_id);
+
+    // Sending to the group adds new members to the contact list.
+    send_text_msg(bob, bob_chat_id, "hello".to_string()).await?;
+    fiona.recv_msg(&bob.pop_sent_msg().await).await;
+    let contacts = Contact::get_all(bob, 0, None).await?;
+    let bob_fiona_id = bob.add_or_lookup_contact_id(fiona).await;
+    assert_eq!(contacts.len(), 2);
+    assert_eq!(contacts[0], bob_alice_id);
+    assert_eq!(contacts[1], bob_fiona_id);
+    let contacts = Contact::get_all(fiona, 0, None).await?;
+    assert_eq!(contacts.len(), 1);
+    assert_eq!(contacts[0], fiona_alice_id);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_is_self_addr() -> Result<()> {
     let t = TestContext::new().await;
     assert_eq!(t.is_self_addr("me@me.org").await?, false);
@@ -290,6 +335,7 @@ async fn test_add_or_lookup() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_contact_name_changes() -> Result<()> {
     let t = TestContext::new_alice().await;
+    t.allow_unencrypted().await?;
 
     // first message creates contact and one-to-one-chat without name set
     receive_imf(
@@ -882,9 +928,12 @@ async fn test_synchronize_status() -> Result<()> {
     // Alice has two devices.
     let alice1 = &tcm.alice().await;
     let alice2 = &tcm.alice().await;
+    alice1.allow_unencrypted().await?;
+    alice2.allow_unencrypted().await?;
 
     // Bob has one device.
     let bob = &tcm.bob().await;
+    bob.allow_unencrypted().await?;
 
     let default_status = alice1.get_config(Config::Selfstatus).await?;
 
@@ -953,33 +1002,18 @@ async fn test_selfavatar_changed_event() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_last_seen() -> Result<()> {
-    let alice = TestContext::new_alice().await;
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
 
-    let (contact_id, _) = Contact::add_or_lookup(
-        &alice,
-        "Bob",
-        &ContactAddress::new("bob@example.net")?,
-        Origin::ManuallyCreated,
-    )
-    .await?;
-    let contact = Contact::get_by_id(&alice, contact_id).await?;
+    let contact = alice.add_or_lookup_contact(bob).await;
     assert_eq!(contact.last_seen(), 0);
 
-    let mime = br#"Subject: Hello
-Message-ID: message@example.net
-To: Alice <alice@example.org>
-From: Bob <bob@example.net>
-Content-Type: text/plain; charset=utf-8; format=flowed; delsp=no
-Chat-Version: 1.0
-Date: Sun, 22 Mar 2020 22:37:55 +0000
-
-Hi."#;
-    receive_imf(&alice, mime, false).await?;
-    let msg = alice.get_last_msg().await;
+    let msg = tcm.send_recv(bob, alice, "Hi.").await;
 
     let timestamp = msg.get_timestamp();
     assert!(timestamp > 0);
-    let contact = Contact::get_by_id(&alice, contact_id).await?;
+    let contact = Contact::get_by_id(alice, contact.id).await?;
     assert_eq!(contact.last_seen(), timestamp);
 
     Ok(())
@@ -1053,6 +1087,7 @@ async fn test_was_seen_recently_event() -> Result<()> {
 async fn test_lookup_id_by_addr_recent_ex(accept_unencrypted_chat: bool) -> Result<()> {
     let mut tcm = TestContextManager::new();
     let bob = &tcm.bob().await;
+    bob.allow_unencrypted().await?;
 
     let raw = include_bytes!("../../test-data/message/thunderbird_with_autocrypt.eml");
     assert!(std::str::from_utf8(raw)?.contains("Date: Thu, 24 Nov 2022 20:05:57 +0100"));

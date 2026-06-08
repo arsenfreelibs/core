@@ -194,6 +194,7 @@ fn new_address_with_name(name: &str, address: String) -> Address<'static> {
 }
 
 impl MimeFactory {
+    /// Returns `MimeFactory` for rendering `msg`.
     #[expect(clippy::arithmetic_side_effects)]
     pub async fn from_msg(context: &Context, msg: Message) -> Result<MimeFactory> {
         let now = time();
@@ -463,18 +464,21 @@ impl MimeFactory {
                 .into_iter()
                 .filter(|id| *id != ContactId::SELF)
                 .collect();
-            if recipient_ids.len() == 1
-                && !matches!(
-                    msg.param.get_cmd(),
-                    SystemMessage::MemberRemovedFromGroup | SystemMessage::SecurejoinMessage
-                )
-                && !matches!(chat.typ, Chattype::OutBroadcast | Chattype::InBroadcast)
+            if !matches!(
+                msg.param.get_cmd(),
+                SystemMessage::MemberRemovedFromGroup | SystemMessage::SecurejoinMessage
+            ) && !matches!(chat.typ, Chattype::OutBroadcast | Chattype::InBroadcast)
             {
+                let origin = match recipient_ids.len() {
+                    1 => Origin::OutgoingTo,
+                    // Use the same origin as ChatId::accept_ex() does for groups.
+                    _ => Origin::IncomingTo,
+                };
                 info!(
                     context,
-                    "Scale up origin of {} recipients to OutgoingTo.", chat.id
+                    "Scale up origin of {} recipients to {origin:?}.", chat.id
                 );
-                ContactId::scaleup_origin(context, &recipient_ids, Origin::OutgoingTo).await?;
+                ContactId::scaleup_origin(context, &recipient_ids, origin).await?;
             }
 
             if !msg.is_system_message()
@@ -1164,12 +1168,6 @@ impl MimeFactory {
                 _ => None,
             };
 
-            if context.get_config_bool(Config::TestHooks).await?
-                && let Some(hook) = &*context.pre_encrypt_mime_hook.lock()
-            {
-                message = hook(context, message);
-            }
-
             let encrypted = if let Some(shared_secret) = shared_secret {
                 let sign = true;
                 encrypt_helper
@@ -1223,53 +1221,18 @@ impl MimeFactory {
                     message.header(header, value)
                 });
             let message = MimePart::new("multipart/mixed", vec![message]);
-            let mut message = protected_headers
+            let message = protected_headers
                 .iter()
                 .fold(message, |message, (header, value)| {
                     message.header(*header, value.clone())
                 });
 
-            if skip_autocrypt || !context.get_config_bool(Config::SignUnencrypted).await? {
-                // Deduplicate unprotected headers that also are in the protected headers:
-                let protected: HashSet<&str> =
-                    HashSet::from_iter(protected_headers.iter().map(|(header, _value)| *header));
-                unprotected_headers.retain(|(header, _value)| !protected.contains(header));
+            // Deduplicate unprotected headers that also are in the protected headers:
+            let protected: HashSet<&str> =
+                HashSet::from_iter(protected_headers.iter().map(|(header, _value)| *header));
+            unprotected_headers.retain(|(header, _value)| !protected.contains(header));
 
-                message
-            } else {
-                for (h, v) in &mut message.headers {
-                    if h == "Content-Type"
-                        && let mail_builder::headers::HeaderType::ContentType(ct) = v
-                    {
-                        let mut ct_new = ct.clone();
-                        ct_new = ct_new.attribute("protected-headers", "v1");
-                        if use_std_header_protection {
-                            ct_new = ct_new.attribute("hp", "clear");
-                        }
-                        *ct = ct_new;
-                        break;
-                    }
-                }
-
-                let signature = encrypt_helper.sign(context, &message).await?;
-                MimePart::new(
-                    "multipart/signed; protocol=\"application/pgp-signature\"; protected",
-                    vec![
-                        message,
-                        MimePart::new(
-                            "application/pgp-signature; name=\"signature.asc\"",
-                            signature,
-                        )
-                        .header(
-                            "Content-Description",
-                            mail_builder::headers::raw::Raw::<'static>::new(
-                                "OpenPGP digital signature",
-                            ),
-                        )
-                        .attachment("signature"),
-                    ],
-                )
-            }
+            message
         };
 
         let MimeFactory {
@@ -1391,10 +1354,7 @@ impl MimeFactory {
             }
         }
 
-        if chat.typ == Chattype::Group
-            || chat.typ == Chattype::OutBroadcast
-            || chat.typ == Chattype::InBroadcast
-        {
+        if chat.typ == Chattype::Group || chat.typ == Chattype::OutBroadcast {
             headers.push((
                 "Chat-Group-Name",
                 mail_builder::headers::text::Text::new(chat.name.to_string()).into(),
@@ -1405,7 +1365,11 @@ impl MimeFactory {
                     mail_builder::headers::text::Text::new(ts.to_string()).into(),
                 ));
             }
-
+        }
+        if chat.typ == Chattype::Group
+            || chat.typ == Chattype::OutBroadcast
+            || chat.typ == Chattype::InBroadcast
+        {
             match command {
                 SystemMessage::MemberRemovedFromGroup => {
                     let email_to_remove = msg.param.get(Param::Arg).unwrap_or_default();
@@ -1824,7 +1788,7 @@ impl MimeFactory {
             parts.push(msg_kml_part);
         }
 
-        if location::is_sending_locations_to_chat(context, Some(msg.chat_id)).await?
+        if location::is_sending_to_chat(context, msg.chat_id).await?
             && let Some(part) = self.get_location_kml_part(context).await?
         {
             parts.push(part);
@@ -1884,7 +1848,6 @@ impl MimeFactory {
     }
 
     /// Render an MDN
-    #[expect(clippy::arithmetic_side_effects)]
     fn render_mdn(&mut self) -> Result<MimePart<'static>> {
         // RFC 6522, this also requires the `report-type` parameter which is equal
         // to the MIME subtype of the second body part of the multipart/report
@@ -1970,32 +1933,13 @@ pub(crate) fn render_outer_message(
 /// Takes the encrypted part, wraps it in a MimePart,
 /// and sets the appropriate Content-Type for the outer message
 pub(crate) fn wrap_encrypted_part(encrypted: String) -> MimePart<'static> {
-    // XXX: additional newline is needed
-    // to pass filtermail at
-    // <https://github.com/deltachat/chatmail/blob/4d915f9800435bf13057d41af8d708abd34dbfa8/chatmaild/src/chatmaild/filtermail.py#L84-L86>:
-    let encrypted = encrypted + "\n";
-
     MimePart::new(
         "multipart/encrypted; protocol=\"application/pgp-encrypted\"",
         vec![
             // Autocrypt part 1
-            MimePart::new("application/pgp-encrypted", "Version: 1\r\n").header(
-                "Content-Description",
-                mail_builder::headers::raw::Raw::new("PGP/MIME version identification"),
-            ),
+            MimePart::new("application/pgp-encrypted", "Version: 1\r\n"),
             // Autocrypt part 2
-            MimePart::new(
-                "application/octet-stream; name=\"encrypted.asc\"",
-                encrypted,
-            )
-            .header(
-                "Content-Description",
-                mail_builder::headers::raw::Raw::new("OpenPGP encrypted message"),
-            )
-            .header(
-                "Content-Disposition",
-                mail_builder::headers::raw::Raw::new("inline; filename=\"encrypted.asc\";"),
-            ),
+            MimePart::new("application/octet-stream", encrypted),
         ],
     )
 }
@@ -2188,10 +2132,6 @@ fn group_headers_by_confidentiality(
                 }
             }
         } else {
-            // Copy the header to the protected headers
-            // in case of signed-only message.
-            // If the message is not signed, this value will not be used.
-            protected_headers.push(header.clone());
             unprotected_headers.push(header.clone())
         }
     }
@@ -2223,18 +2163,18 @@ fn should_encrypt_symmetrically(msg: &Message, chat: &Chat) -> bool {
 /// rather than all recipients.
 /// This function returns the fingerprint of the recipient the message should be sent to.
 fn must_have_only_one_recipient<'a>(msg: &'a Message, chat: &Chat) -> Option<Result<&'a str>> {
-    if chat.typ == Chattype::OutBroadcast
-        && matches!(
-            msg.param.get_cmd(),
-            SystemMessage::MemberRemovedFromGroup | SystemMessage::MemberAddedToGroup
-        )
-    {
-        let Some(fp) = msg.param.get(Param::Arg4) else {
-            return Some(Err(format_err!("Missing removed/added member")));
-        };
-        return Some(Ok(fp));
+    if chat.typ != Chattype::OutBroadcast {
+        None
+    } else if let Some(fp) = msg.param.get(Param::Arg4) {
+        Some(Ok(fp))
+    } else if matches!(
+        msg.param.get_cmd(),
+        SystemMessage::MemberRemovedFromGroup | SystemMessage::MemberAddedToGroup
+    ) {
+        Some(Err(format_err!("Missing removed/added member")))
+    } else {
+        None
     }
-    None
 }
 
 async fn build_body_file(context: &Context, msg: &Message) -> Result<MimePart<'static>> {

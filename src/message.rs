@@ -1,7 +1,6 @@
 //! # Messages and their identifiers.
 
 use std::collections::BTreeSet;
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::str;
 
@@ -26,7 +25,7 @@ use crate::download::DownloadState;
 use crate::ephemeral::{Timer as EphemeralTimer, start_ephemeral_timers_msgids};
 use crate::events::EventType;
 use crate::imap::markseen_on_imap_table;
-use crate::location::delete_poi_location;
+use crate::location;
 use crate::log::warn;
 use crate::mimeparser::{SystemMessage, parse_message_id};
 use crate::param::{Param, Params};
@@ -141,8 +140,20 @@ SELECT ?1, rfc724_mid, pre_rfc724_mid, timestamp, ?, ? FROM msgs WHERE id=?1
         Ok(())
     }
 
-    pub(crate) async fn set_delivered(self, context: &Context) -> Result<()> {
-        update_msg_state(context, self, MessageState::OutDelivered).await?;
+    /// Returns whether the message state is updated to `OutDelivered`.
+    pub(crate) async fn set_delivered(self, context: &Context) -> Result<bool> {
+        if context
+            .sql
+            .execute(
+                // Only update `OutPending` i.e. if the message is (re-)sent to all chat members.
+                "UPDATE msgs SET state=?, error='' WHERE id=? AND state=?",
+                (MessageState::OutDelivered, self, MessageState::OutPending),
+            )
+            .await?
+            == 0
+        {
+            return Ok(false);
+        }
         let chat_id: Option<ChatId> = context
             .sql
             .query_get_value("SELECT chat_id FROM msgs WHERE id=?", (self,))
@@ -154,7 +165,7 @@ SELECT ?1, rfc724_mid, pre_rfc724_mid, timestamp, ?, ? FROM msgs WHERE id=?1
         if let Some(chat_id) = chat_id {
             chatlist_events::emit_chatlist_item_changed(context, chat_id);
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Bad evil escape hatch.
@@ -200,7 +211,6 @@ SELECT ?1, rfc724_mid, pre_rfc724_mid, timestamp, ?, ? FROM msgs WHERE id=?1
     }
 
     /// Returns detailed message information in a multi-line text form.
-    #[expect(clippy::arithmetic_side_effects)]
     pub async fn get_info(self, context: &Context) -> Result<String> {
         let msg = Message::load_from_db(context, self).await?;
 
@@ -224,7 +234,7 @@ SELECT ?1, rfc724_mid, pre_rfc724_mid, timestamp, ?, ? FROM msgs WHERE id=?1
             } else {
                 msg.timestamp_sort
             });
-            ret += &format!("Received: {}", &s);
+            ret += &format!("Received: {s}");
             ret += "\n";
         }
 
@@ -303,7 +313,7 @@ SELECT ?1, rfc724_mid, pre_rfc724_mid, timestamp, ?, ? FROM msgs WHERE id=?1
             ret += "Type: ";
             ret += &format!("{}", msg.viewtype);
             ret += "\n";
-            ret += &format!("Mimetype: {}\n", &msg.get_filemime().unwrap_or_default());
+            ret += &format!("Mimetype: {}\n", msg.get_filemime().unwrap_or_default());
         }
         let w = msg.param.get_int(Param::Width).unwrap_or_default();
         let h = msg.param.get_int(Param::Height).unwrap_or_default();
@@ -314,6 +324,7 @@ SELECT ?1, rfc724_mid, pre_rfc724_mid, timestamp, ?, ? FROM msgs WHERE id=?1
         if duration != 0 {
             ret += &format!("Duration: {duration} ms\n",);
         }
+        ret += &format!("\nDatabase ID: {}", msg.id);
         if !msg.rfc724_mid.is_empty() {
             ret += &format!("\nMessage-ID: {}", msg.rfc724_mid);
 
@@ -531,7 +542,7 @@ impl Message {
                  FROM msgs m
                  LEFT JOIN chats c ON c.id=m.chat_id
                  LEFT JOIN msgs_mdns mdns ON mdns.msg_id=m.id
-                 WHERE m.id=? AND chat_id!=3
+                 WHERE m.id=? AND chat_id!=3 -- DC_CHAT_ID_TRASH
                  LIMIT 1",
                 (id,),
                 |row| {
@@ -602,6 +613,31 @@ impl Message {
         }
 
         Ok(msg)
+    }
+
+    /// Loads the message with given Message-ID from the database.
+    ///
+    /// Cannot return a trashed message.
+    pub async fn load_by_rfc724_mid_optional(
+        context: &Context,
+        rfc724_mid: &str,
+    ) -> Result<Option<Message>> {
+        if let Some(msg_id) = context
+            .sql
+            .query_row_optional(
+                "SELECT id FROM msgs WHERE rfc724_mid=? AND chat_id != ?",
+                (rfc724_mid, DC_CHAT_ID_TRASH),
+                |row| {
+                    let msg_id: MsgId = row.get(0)?;
+                    Ok(msg_id)
+                },
+            )
+            .await?
+        {
+            Self::load_from_db_optional(context, msg_id).await
+        } else {
+            Ok(None)
+        }
     }
 
     /// Returns additional text which is appended to the message's text field
@@ -741,7 +777,7 @@ impl Message {
     /// at a position different from the self-location.
     /// You should not call this function
     /// if you want to bind the current self-location to a message;
-    /// this is done by [`location::set()`] and [`send_locations_to_chat()`].
+    /// this is done by [`location::set()`] and [`location::send_to_chat()`].
     ///
     /// Typically results in the event [`LocationChanged`] with
     /// `contact_id` set to [`ContactId::SELF`].
@@ -750,7 +786,7 @@ impl Message {
     /// `longitude` is the East-west position of the location.
     ///
     /// [`location::set()`]: crate::location::set
-    /// [`send_locations_to_chat()`]: crate::location::send_locations_to_chat
+    /// [`location::send_to_chat()`]: crate::location::send_to_chat
     /// [`LocationChanged`]: crate::events::EventType::LocationChanged
     pub fn set_location(&mut self, latitude: f64, longitude: f64) {
         if latitude == 0.0 && longitude == 0.0 {
@@ -797,12 +833,6 @@ impl Message {
         self.viewtype
     }
 
-    /// Forces the message to **keep** [Viewtype::Sticker]
-    /// e.g the message will not be converted to a [Viewtype::Image].
-    pub fn force_sticker(&mut self) {
-        self.param.set_int(Param::ForceSticker, 1);
-    }
-
     /// Returns the state of the message.
     pub fn get_state(&self) -> MessageState {
         self.state
@@ -826,7 +856,6 @@ impl Message {
     ///
     /// Currently this includes `additional_text`, but this may change in future, when the UIs show
     /// the necessary info themselves.
-    #[expect(clippy::arithmetic_side_effects)]
     pub fn get_text(&self) -> String {
         self.text.clone() + &self.additional_text
     }
@@ -1390,17 +1419,17 @@ pub enum MessageState {
     /// IMAP and MDN may be sent.
     InSeen = 16,
 
-    /// For files which need time to be prepared before they can be
-    /// sent, the message enters this state before
-    /// OutPending.
-    OutPreparing = 18,
-
+    // Deprecated 2024-12-07. Removed 2026-04.
+    // OutPreparing = 18,
     /// Message saved as draft.
     OutDraft = 19,
 
     /// The user has pressed the "send" button but the message is not
     /// yet sent and is pending in some way. Maybe we're offline (no
     /// checkmark).
+    ///
+    /// This state means that the message is being (re-)sent to all chat members. It shalln't be
+    /// used e.g. for resending only to a new broadcast member.
     OutPending = 20,
 
     /// *Unrecoverable* error (*recoverable* errors result in pending
@@ -1427,7 +1456,6 @@ impl std::fmt::Display for MessageState {
                 Self::InFresh => "Fresh",
                 Self::InNoticed => "Noticed",
                 Self::InSeen => "Seen",
-                Self::OutPreparing => "Preparing",
                 Self::OutDraft => "Draft",
                 Self::OutPending => "Pending",
                 Self::OutFailed => "Failed",
@@ -1444,7 +1472,7 @@ impl MessageState {
         use MessageState::*;
         matches!(
             self,
-            OutPreparing | OutPending | OutDelivered | OutMdnRcvd // OutMdnRcvd can still fail because it could be a group message and only some recipients failed.
+            OutPending | OutDelivered | OutMdnRcvd // OutMdnRcvd can still fail because it could be a group message and only some recipients failed.
         )
     }
 
@@ -1453,7 +1481,7 @@ impl MessageState {
         use MessageState::*;
         matches!(
             self,
-            OutPreparing | OutDraft | OutPending | OutFailed | OutDelivered | OutMdnRcvd
+            OutDraft | OutPending | OutFailed | OutDelivered | OutMdnRcvd
         )
     }
 
@@ -1656,7 +1684,7 @@ pub(crate) async fn get_mime_headers(context: &Context, msg_id: MsgId) -> Result
 /// This may be called in batches; the final events are emitted in delete_msgs_locally_done() then.
 pub(crate) async fn delete_msg_locally(context: &Context, msg: &Message) -> Result<()> {
     if msg.location_id > 0 {
-        delete_poi_location(context, msg.location_id).await?;
+        location::delete_poi(context, msg.location_id).await?;
     }
     let on_server = true;
     msg.id
@@ -1693,7 +1721,7 @@ pub(crate) async fn delete_msg_locally(context: &Context, msg: &Message) -> Resu
 pub(crate) async fn delete_msgs_locally_done(
     context: &Context,
     msg_ids: &[MsgId],
-    modified_chat_ids: HashSet<ChatId>,
+    modified_chat_ids: BTreeSet<ChatId>,
 ) -> Result<()> {
     for modified_chat_id in modified_chat_ids {
         context.emit_msgs_changed_without_msg_id(modified_chat_id);
@@ -1723,7 +1751,7 @@ pub async fn delete_msgs_ex(
     msg_ids: &[MsgId],
     delete_for_all: bool,
 ) -> Result<()> {
-    let mut modified_chat_ids = HashSet::new();
+    let mut modified_chat_ids = BTreeSet::new();
     let mut deleted_rfc724_mid = Vec::new();
     let mut res = Ok(());
 
@@ -2014,13 +2042,6 @@ pub(crate) async fn update_msg_state(
     Ok(())
 }
 
-// as we do not cut inside words, this results in about 32-42 characters.
-// Do not use too long subjects - we add a tag after the subject which gets truncated by the clients otherwise.
-// It should also be very clear, the subject is _not_ the whole message.
-// The value is also used for CC:-summaries
-
-// Context functions to work with messages
-
 pub(crate) async fn set_msg_failed(
     context: &Context,
     msg: &mut Message,
@@ -2112,64 +2133,52 @@ pub async fn get_request_msg_cnt(context: &Context) -> usize {
 }
 
 /// Estimates the number of messages that will be deleted
-/// by the options `delete_device_after` or `delete_server_after`.
+/// by the `set_config()`-option `delete_device_after`.
 ///
 /// This is typically used to show the estimated impact to the user
 /// before actually enabling deletion of old messages.
 ///
-/// If `from_server` is true,
-/// estimate deletion count for server,
-/// otherwise estimate deletion count for device.
+/// Messages in the "Saved Messages" chat are not counted as they will not be deleted automatically.
 ///
-/// Count messages older than the given number of `seconds`.
+/// Parameters:
+/// - `from_server`: Deprecated, pass `false` here
+/// - `seconds`: Count messages older than the given number of seconds.
 ///
 /// Returns the number of messages that are older than the given number of seconds.
-/// This includes e-mails downloaded due to the `show_emails` option.
-/// Messages in the "saved messages" folder are not counted as they will not be deleted automatically.
 #[expect(clippy::arithmetic_side_effects)]
 pub async fn estimate_deletion_cnt(
     context: &Context,
     from_server: bool,
     seconds: i64,
 ) -> Result<usize> {
+    ensure!(
+        !from_server,
+        "The `delete_server_after` config option was removed. You need to pass `false` for `from_server`"
+    );
+
     let self_chat_id = ChatIdBlocked::lookup_by_contact(context, ContactId::SELF)
         .await?
         .map(|c| c.id)
         .unwrap_or_default();
     let threshold_timestamp = time() - seconds;
 
-    let cnt = if from_server {
-        context
-            .sql
-            .count(
-                "SELECT COUNT(*)
-             FROM msgs m
-             WHERE m.id > ?
-               AND timestamp < ?
-               AND chat_id != ?
-               AND EXISTS (SELECT * FROM imap WHERE rfc724_mid=m.rfc724_mid);",
-                (DC_MSG_ID_LAST_SPECIAL, threshold_timestamp, self_chat_id),
-            )
-            .await?
-    } else {
-        context
-            .sql
-            .count(
-                "SELECT COUNT(*)
+    let cnt = context
+        .sql
+        .count(
+            "SELECT COUNT(*)
              FROM msgs m
              WHERE m.id > ?
                AND timestamp < ?
                AND chat_id != ?
                AND chat_id != ? AND hidden = 0;",
-                (
-                    DC_MSG_ID_LAST_SPECIAL,
-                    threshold_timestamp,
-                    self_chat_id,
-                    DC_CHAT_ID_TRASH,
-                ),
-            )
-            .await?
-    };
+            (
+                DC_MSG_ID_LAST_SPECIAL,
+                threshold_timestamp,
+                self_chat_id,
+                DC_CHAT_ID_TRASH,
+            ),
+        )
+        .await?;
     Ok(cnt)
 }
 
@@ -2323,8 +2332,6 @@ pub enum Viewtype {
     Gif = 21,
 
     /// Message containing a sticker, similar to image.
-    /// NB: When sending, the message viewtype may be changed to `Image` by some heuristics like
-    /// checking for transparent pixels. Use `Message::force_sticker()` to disable them.
     ///
     /// If possible, the ui should display the image without borders in a transparent way.
     /// A click on a sticker will offer to install the sticker set in some future.

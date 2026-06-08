@@ -1396,7 +1396,7 @@ WHERE addr=?
         let Some(fingerprint_other) = contact.fingerprint() else {
             return Ok(stock_str::encr_none(context));
         };
-        let fingerprint_other = fingerprint_other.to_string();
+        let fingerprint_other = fingerprint_other.human_readable();
 
         let stock_message = if contact.public_key(context).await?.is_some() {
             stock_str::messages_are_e2ee(context)
@@ -1410,7 +1410,7 @@ WHERE addr=?
         let fingerprint_self = load_self_public_key(context)
             .await?
             .dc_fingerprint()
-            .to_string();
+            .human_readable();
         if addr < contact.addr {
             cat_fingerprint(
                 &mut ret,
@@ -2068,7 +2068,6 @@ pub(crate) async fn mark_contact_id_as_verified(
     Ok(())
 }
 
-#[expect(clippy::arithmetic_side_effects)]
 fn cat_fingerprint(ret: &mut String, name: &str, addr: &str, fingerprint: &str) {
     *ret += &format!("\n\n{name} ({addr}):\n{fingerprint}");
 }

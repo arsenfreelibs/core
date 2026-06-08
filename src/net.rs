@@ -12,7 +12,7 @@ use tokio_io_timeout::TimeoutStream;
 
 use crate::context::Context;
 use crate::net::session::SessionStream;
-use crate::net::tls::TlsSessionStore;
+use crate::net::tls::{SpkiHashStore, TlsSessionStore};
 use crate::sql::Sql;
 use crate::tools::time;
 
@@ -23,6 +23,7 @@ pub(crate) mod session;
 pub(crate) mod tls;
 
 use dns::lookup_host_with_cache;
+pub(crate) use http::read_url_with_tls;
 pub use http::{Response as HttpResponse, read_url, read_url_blob};
 use tls::wrap_tls;
 
@@ -109,8 +110,8 @@ pub(crate) async fn connect_tcp_inner(
 ) -> Result<Pin<Box<TimeoutStream<TcpStream>>>> {
     let tcp_stream = timeout(TIMEOUT, TcpStream::connect(addr))
         .await
-        .context("Connection timeout")?
-        .context("Connection failure")?;
+        .with_context(|| format!("Connection to {addr} timed out"))?
+        .with_context(|| format!("Connection to {addr} failed"))?;
 
     // Disable Nagle's algorithm.
     tcp_stream.set_nodelay(true)?;
@@ -130,6 +131,8 @@ pub(crate) async fn connect_tls_inner(
     strict_tls: bool,
     alpn: &str,
     tls_session_store: &TlsSessionStore,
+    spki_hash_store: &SpkiHashStore,
+    sql: &Sql,
 ) -> Result<impl SessionStream + 'static> {
     let use_sni = true;
     let tcp_stream = connect_tcp_inner(addr).await?;
@@ -141,6 +144,8 @@ pub(crate) async fn connect_tls_inner(
         alpn,
         tcp_stream,
         tls_session_store,
+        spki_hash_store,
+        sql,
     )
     .await?;
     Ok(tls_stream)
@@ -176,7 +181,7 @@ where
         delay_set.spawn(tokio::time::sleep(delay));
     }
 
-    let mut first_error = None;
+    let mut all_errors = Vec::new();
 
     let res = loop {
         if let Some(fut) = futures.next() {
@@ -196,7 +201,7 @@ where
                             }
                             Ok(Err(err)) => {
                                 // Some connection attempt failed.
-                                first_error.get_or_insert(err);
+                                all_errors.push(err);
                             }
                             Err(err) => {
                                 break Err(err);
@@ -207,9 +212,11 @@ where
                         // Out of connection attempts.
                         //
                         // Break out of the loop and return error.
-                        break Err(
-                            first_error.unwrap_or_else(|| format_err!("No connection attempts were made"))
-                        );
+                        break if all_errors.is_empty() {
+                            Err(format_err!("No connection attempts were made"))
+                        } else {
+                            Err(format_err!("All connection attempts failed: {}", all_errors.into_iter().map(|err| format!("{err:#}")).collect::<Vec<String>>().join("; ")))
+                        };
                     }
                 }
             },

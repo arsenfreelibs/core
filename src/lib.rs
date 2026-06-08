@@ -17,6 +17,7 @@
     clippy::cloned_instead_of_copied,
     clippy::manual_is_variant_and
 )]
+#![cfg_attr(not(test), warn(clippy::large_futures))]
 #![cfg_attr(not(test), warn(clippy::arithmetic_side_effects))]
 #![cfg_attr(not(test), forbid(clippy::indexing_slicing))]
 #![cfg_attr(not(test), forbid(clippy::string_slice))]
@@ -100,7 +101,6 @@ mod update_helper;
 pub mod webxdc;
 #[macro_use]
 mod dehtml;
-mod authres;
 pub mod color;
 pub mod html;
 pub mod net;

@@ -118,7 +118,13 @@ async fn test_receive_pre_message() -> Result<()> {
     let msg = bob.recv_msg(&pre_message).await;
     assert_eq!(msg.download_state, DownloadState::Available);
     assert_summary_texts(&msg, bob, "👤 test").await;
+    let chat_id = msg.chat_id;
 
+    assert!(bob.recv_msg_opt(&pre_message).await.is_none());
+    let msg = Message::load_from_db(bob, msg.id).await?;
+    assert_eq!(msg.download_state, DownloadState::Available);
+    assert_summary_texts(&msg, bob, "👤 test").await;
+    assert_eq!(msg.chat_id, chat_id);
     Ok(())
 }
 
@@ -554,6 +560,45 @@ async fn test_webxdc_updates_in_post_message_after_pre_message() -> Result<()> {
         bob.get_webxdc_status_updates(bob_instance.id, StatusUpdateSerial::new(0))
             .await?,
         r#"[{"payload":42,"info":"i","serial":1,"max_serial":1}]"#
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_webxdc_updates_in_post_message_after_deleted_pre_message() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+
+    let alice_chat_id = alice.create_chat_id(bob).await;
+    let big_webxdc_app = big_webxdc_app().await?;
+
+    let mut alice_instance = Message::new(Viewtype::Webxdc);
+    alice_instance.set_file_from_bytes(alice, "test.xdc", &big_webxdc_app, None)?;
+    alice_instance.set_text("Test".to_string());
+    alice_chat_id
+        .set_draft(alice, Some(&mut alice_instance))
+        .await?;
+    alice
+        .send_webxdc_status_update(alice_instance.id, r#"{"payload":42, "info":"i"}"#)
+        .await?;
+
+    send_msg(alice, alice_chat_id, &mut alice_instance).await?;
+    let post_message = alice.pop_sent_msg().await;
+    let pre_message = alice.pop_sent_msg().await;
+
+    let bob_instance = bob.recv_msg(&pre_message).await;
+    assert_eq!(bob_instance.download_state, DownloadState::Available);
+    delete_msgs(bob, &[bob_instance.id]).await?;
+
+    bob.recv_msg_trash(&post_message).await;
+
+    // Deleted message stays trashed because of a tombstone.
+    assert!(
+        Message::load_from_db_optional(bob, bob_instance.id)
+            .await?
+            .is_none()
     );
 
     Ok(())

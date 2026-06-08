@@ -19,7 +19,7 @@ use crate::token::Namespace;
 use crate::tools::time;
 use crate::transport::{ConfiguredLoginParamJson, sync_transports};
 use crate::{message, stock_str, token};
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 
 /// Whether to send device sync messages. Aimed for usage in the internal API.
 #[derive(Debug, PartialEq)]
@@ -383,7 +383,7 @@ impl Context {
     }
 
     async fn sync_message_deletion(&self, msgs: &Vec<String>) -> Result<()> {
-        let mut modified_chat_ids = HashSet::new();
+        let mut modified_chat_ids = BTreeSet::new();
         let mut msg_ids = Vec::new();
         for rfc724_mid in msgs {
             if let Some(msg_id) = message::rfc724_mid_exists(self, rfc724_mid).await? {
@@ -808,6 +808,25 @@ mod tests {
         tcm.exec_securejoin_qr(fiona, alice2, &qr).await;
         let msg = fiona.get_last_msg().await;
         assert_eq!(msg.text, "Member Me added by alice@example.org.");
+        Ok(())
+    }
+
+    /// Tests that "force encryption" setting is synced.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_sync_force_encryption() -> Result<()> {
+        let mut tcm = TestContextManager::new();
+        let alice = &tcm.alice().await;
+        let alice2 = &tcm.alice().await;
+        alice.set_config_bool(Config::SyncMsgs, true).await?;
+        alice2.set_config_bool(Config::SyncMsgs, true).await?;
+
+        assert_eq!(alice.get_config_bool(Config::ForceEncryption).await?, true);
+        alice2
+            .set_config_bool(Config::ForceEncryption, false)
+            .await?;
+        test_utils::sync(alice2, alice).await;
+        assert_eq!(alice.get_config_bool(Config::ForceEncryption).await?, false);
+
         Ok(())
     }
 }

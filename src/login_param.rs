@@ -56,9 +56,47 @@ pub enum EnteredCertificateChecks {
     AcceptInvalidCertificates2 = 3,
 }
 
-/// Login parameters for a single server, either IMAP or SMTP
+impl EnteredCertificateChecks {
+    pub(crate) fn accept_invalid_certificates(self) -> bool {
+        matches!(
+            self,
+            Self::AcceptInvalidCertificates | Self::AcceptInvalidCertificates2
+        )
+    }
+}
+
+/// Login parameters for a single IMAP server.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EnteredServerLoginParam {
+pub struct EnteredImapLoginParam {
+    /// Server hostname or IP address.
+    pub server: String,
+
+    /// Server port.
+    ///
+    /// 0 if not specified.
+    pub port: u16,
+
+    /// Folder to watch.
+    ///
+    /// If empty, user has not entered anything and it shuold expand to "INBOX" later.
+    #[serde(default)]
+    pub folder: String,
+
+    /// Socket security.
+    pub security: Socket,
+
+    /// Username.
+    ///
+    /// Empty string if not specified.
+    pub user: String,
+
+    /// Password.
+    pub password: String,
+}
+
+/// Login parameters for a single SMTP server.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnteredSmtpLoginParam {
     /// Server hostname or IP address.
     pub server: String,
 
@@ -96,10 +134,10 @@ pub struct EnteredLoginParam {
     pub addr: String,
 
     /// IMAP settings.
-    pub imap: EnteredServerLoginParam,
+    pub imap: EnteredImapLoginParam,
 
     /// SMTP settings.
-    pub smtp: EnteredServerLoginParam,
+    pub smtp: EnteredSmtpLoginParam,
 
     /// TLS options: whether to allow invalid certificates and/or
     /// invalid hostnames
@@ -110,8 +148,11 @@ pub struct EnteredLoginParam {
 }
 
 impl EnteredLoginParam {
-    /// Loads entered account settings.
-    pub(crate) async fn load(context: &Context) -> Result<Self> {
+    /// Loads entered account settings
+    /// that were set by the deprecated `configured_*` configs.
+    ///
+    /// This is only needed by tests and clients using the old CFFI API.
+    pub(crate) async fn load_legacy(context: &Context) -> Result<Self> {
         let addr = context
             .get_config(Config::Addr)
             .await?
@@ -127,6 +168,10 @@ impl EnteredLoginParam {
             .get_config_parsed::<u16>(Config::MailPort)
             .await?
             .unwrap_or_default();
+
+        // There is no way to set custom folder with this legacy API.
+        let mail_folder = String::new();
+
         let mail_security = context
             .get_config_parsed::<i32>(Config::MailSecurity)
             .await?
@@ -144,7 +189,7 @@ impl EnteredLoginParam {
         // The setting is named `imap_certificate_checks`
         // for backwards compatibility,
         // but now it is a global setting applied to all protocols,
-        // while `smtp_certificate_checks` is ignored.
+        // while `smtp_certificate_checks` has been removed.
         let certificate_checks = if let Some(certificate_checks) = context
             .get_config_parsed::<i32>(Config::ImapCertificateChecks)
             .await?
@@ -185,14 +230,15 @@ impl EnteredLoginParam {
 
         Ok(EnteredLoginParam {
             addr,
-            imap: EnteredServerLoginParam {
+            imap: EnteredImapLoginParam {
                 server: mail_server,
                 port: mail_port,
+                folder: mail_folder,
                 security: mail_security,
                 user: mail_user,
                 password: mail_pw,
             },
-            smtp: EnteredServerLoginParam {
+            smtp: EnteredSmtpLoginParam {
                 server: send_server,
                 port: send_port,
                 security: send_security,
@@ -206,7 +252,10 @@ impl EnteredLoginParam {
 
     /// Saves entered account settings,
     /// so that they can be prefilled if the user wants to configure the server again.
-    pub(crate) async fn save(&self, context: &Context) -> Result<()> {
+    ///
+    /// This is needed in case a UI is not yet updated, and still uses `get_config("mail_pw")` etc.
+    /// in order to prefill the entered account settings.
+    pub(crate) async fn save_legacy(&self, context: &Context) -> Result<()> {
         context.set_config(Config::Addr, Some(&self.addr)).await?;
 
         context
@@ -329,7 +378,7 @@ mod tests {
             .await?;
         t.set_config(Config::MailPw, Some("foobarbaz")).await?;
 
-        let param = EnteredLoginParam::load(t).await?;
+        let param = EnteredLoginParam::load_legacy(t).await?;
         assert_eq!(param.addr, "alice@example.org");
         assert_eq!(
             param.certificate_checks,
@@ -338,13 +387,13 @@ mod tests {
 
         t.set_config(Config::ImapCertificateChecks, Some("1"))
             .await?;
-        let param = EnteredLoginParam::load(t).await?;
+        let param = EnteredLoginParam::load_legacy(t).await?;
         assert_eq!(param.certificate_checks, EnteredCertificateChecks::Strict);
 
         // Fail to load invalid settings, but do not panic.
         t.set_config(Config::ImapCertificateChecks, Some("999"))
             .await?;
-        assert!(EnteredLoginParam::load(t).await.is_err());
+        assert!(EnteredLoginParam::load_legacy(t).await.is_err());
 
         Ok(())
     }
@@ -354,14 +403,15 @@ mod tests {
         let t = TestContext::new().await;
         let param = EnteredLoginParam {
             addr: "alice@example.org".to_string(),
-            imap: EnteredServerLoginParam {
+            imap: EnteredImapLoginParam {
                 server: "".to_string(),
                 port: 0,
+                folder: "".to_string(),
                 security: Socket::Starttls,
                 user: "".to_string(),
                 password: "foobar".to_string(),
             },
-            smtp: EnteredServerLoginParam {
+            smtp: EnteredSmtpLoginParam {
                 server: "".to_string(),
                 port: 2947,
                 security: Socket::default(),
@@ -371,7 +421,7 @@ mod tests {
             certificate_checks: Default::default(),
             oauth2: false,
         };
-        param.save(&t).await?;
+        param.save_legacy(&t).await?;
         assert_eq!(
             t.get_config(Config::Addr).await?.unwrap(),
             "alice@example.org"
@@ -380,7 +430,7 @@ mod tests {
         assert_eq!(t.get_config(Config::SendPw).await?, None);
         assert_eq!(t.get_config_int(Config::SendPort).await?, 2947);
 
-        assert_eq!(EnteredLoginParam::load(&t).await?, param);
+        assert_eq!(EnteredLoginParam::load_legacy(&t).await?, param);
 
         Ok(())
     }

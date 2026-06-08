@@ -62,13 +62,13 @@ pub(crate) fn truncate(buf: &str, approx_chars: usize) -> Cow<'_, str> {
     if let Some(index) = buf.get(..end_pos).and_then(|s| s.rfind([' ', '\n'])) {
         Cow::Owned(format!(
             "{}{}",
-            &buf.get(..=index).unwrap_or_default(),
+            buf.get(..=index).unwrap_or_default(),
             DC_ELLIPSIS
         ))
     } else {
         Cow::Owned(format!(
             "{}{}",
-            &buf.get(..end_pos).unwrap_or_default(),
+            buf.get(..end_pos).unwrap_or_default(),
             DC_ELLIPSIS
         ))
     }
@@ -687,7 +687,6 @@ fn extract_address_from_receive_header<'a>(header: &'a str, start: &str) -> Opti
     })
 }
 
-#[expect(clippy::arithmetic_side_effects)]
 pub(crate) fn parse_receive_header(header: &str) -> String {
     let header = header.replace(&['\r', '\n'][..], "");
     let mut hop_info = String::from("Hop: ");

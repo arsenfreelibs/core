@@ -388,7 +388,7 @@ async fn test_decode_openpgp_fingerprint() -> Result<()> {
         bob,
         &format!(
             "OPENPGP4FPR:{}#a=alice@example.org",
-            alice_contact.fingerprint().unwrap()
+            alice_contact.fingerprint().unwrap().hex()
         ),
     )
     .await?;
@@ -709,7 +709,7 @@ async fn test_decode_dclogin_advanced_options() -> Result<()> {
     assert_eq!(param.smtp.security, Socket::Plain);
 
     // `sc` option is actually ignored and `ic` is used instead
-    // because `smtp_certificate_checks` is deprecated.
+    // because `smtp_certificate_checks` has been removed.
     assert_eq!(param.certificate_checks, EnteredCertificateChecks::Strict);
 
     Ok(())

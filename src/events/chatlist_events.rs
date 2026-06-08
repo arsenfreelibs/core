@@ -89,13 +89,9 @@ mod test_chatlist_events {
             .get_matching(|evt| match evt {
                 EventType::ChatlistItemChanged {
                     chat_id: Some(ev_chat_id),
-                } => {
-                    if ev_chat_id == &chat_id {
-                        first_event_is_item.store(true, Ordering::Relaxed);
-                        true
-                    } else {
-                        false
-                    }
+                } if ev_chat_id == &chat_id => {
+                    first_event_is_item.store(true, Ordering::Relaxed);
+                    true
                 }
                 EventType::ChatlistChanged => true,
                 _ => false,
@@ -525,6 +521,7 @@ mod test_chatlist_events {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_adhoc_group() -> Result<()> {
         let alice = TestContext::new_alice().await;
+        alice.allow_unencrypted().await?;
         let mime = br#"Subject: First thread
 Message-ID: first@example.org
 To: Alice <alice@example.org>, Bob <bob@example.net>

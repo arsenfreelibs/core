@@ -41,29 +41,28 @@ async fn test_parse_receive_headers_integration() {
     let raw = include_bytes!("../../test-data/message/mail_with_cc.txt");
     let expected = r"State: Fresh
 
+Database ID: X
 Message-ID: 2dfdbde7@example.org
 
 Hop: From: localhost; By: hq5.merlinux.eu; Date: Sat, 14 Sep 2019 17:00:22 +0000
-Hop: From: hq5.merlinux.eu; By: hq5.merlinux.eu; Date: Sat, 14 Sep 2019 17:00:25 +0000
-
-DKIM Results: Passed=true";
+Hop: From: hq5.merlinux.eu; By: hq5.merlinux.eu; Date: Sat, 14 Sep 2019 17:00:25 +0000";
     check_parse_receive_headers_integration(raw, expected).await;
 
     let raw = include_bytes!("../../test-data/message/encrypted_with_received_headers.eml");
     let expected = "State: Fresh, Encrypted
 
+Database ID: X
 Message-ID: Mr.adQpEwndXLH.LPDdlFVJ7wG@example.net
 
 Hop: From: [127.0.0.1]; By: mail.example.org; Date: Mon, 27 Dec 2021 11:21:21 +0000
 Hop: From: mout.example.org; By: hq5.example.org; Date: Mon, 27 Dec 2021 11:21:22 +0000
-Hop: From: hq5.example.org; By: hq5.example.org; Date: Mon, 27 Dec 2021 11:21:22 +0000
-
-DKIM Results: Passed=true";
+Hop: From: hq5.example.org; By: hq5.example.org; Date: Mon, 27 Dec 2021 11:21:22 +0000";
     check_parse_receive_headers_integration(raw, expected).await;
 }
 
 async fn check_parse_receive_headers_integration(raw: &[u8], expected: &str) {
     let t = TestContext::new_alice().await;
+    t.allow_unencrypted().await.unwrap();
     let received = receive_imf(&t, raw, false).await.unwrap().unwrap();
 
     assert_eq!(received.msg_ids.len(), 1);
@@ -74,7 +73,10 @@ async fn check_parse_receive_headers_integration(raw: &[u8], expected: &str) {
     // received time that depends on the test time which makes it impossible to
     // compare with a static string
     let capped_result = &msg_info[msg_info.find("State").unwrap()..];
-    assert_eq!(expected, capped_result);
+    assert_eq!(
+        expected.replace("\nDatabase ID: X", &format!("\nDatabase ID: {msg_id}")),
+        capped_result
+    );
 }
 
 #[test]
@@ -251,12 +253,12 @@ proptest! {
         assert!(
             l <= approx_chars + el_len,
             "buf: '{}' - res: '{}' - len {}, approx {}",
-            &buf, &res, res.len(), approx_chars
+            buf, res, res.len(), approx_chars
         );
 
         if buf.chars().count() > approx_chars + el_len {
             let l = res.len();
-            assert_eq!(&res[l-5..l], "[...]", "missing ellipsis in {}", &res);
+            assert_eq!(&res[l-5..l], "[...]", "missing ellipsis in {res}");
         }
     }
 }

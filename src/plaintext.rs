@@ -24,7 +24,6 @@ pub struct PlainText {
 impl PlainText {
     /// Convert plain text to HTML.
     /// The function handles quotes, links, fixed and floating text paragraphs.
-    #[expect(clippy::arithmetic_side_effects)]
     pub fn to_html(&self) -> String {
         static LINKIFY_MAIL_RE: LazyLock<regex::Regex> =
             LazyLock::new(|| regex::Regex::new(r"\b([\w.\-+]+@[\w.\-]+)\b").unwrap());
@@ -40,7 +39,7 @@ impl PlainText {
 <html><head>
 <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
 <meta name="color-scheme" content="light dark" />
-</head><body>
+</head><body dir="auto" style="unicode-bidi: plaintext">
 "#
         .to_string();
 
@@ -133,7 +132,7 @@ http://link-at-start-of-line.org
 <html><head>
 <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
 <meta name="color-scheme" content="light dark" />
-</head><body>
+</head><body dir="auto" style="unicode-bidi: plaintext">
 line 1<br/>
 line 2<br/>
 line with <a href="https://link-mid-of-line.org">https://link-mid-of-line.org</a> and <a href="http://link-end-of-line.com/file?foo=bar%20">http://link-end-of-line.com/file?foo=bar%20</a><br/>
@@ -157,7 +156,7 @@ line with <a href="https://link-mid-of-line.org">https://link-mid-of-line.org</a
 <html><head>
 <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
 <meta name="color-scheme" content="light dark" />
-</head><body>
+</head><body dir="auto" style="unicode-bidi: plaintext">
 Foo<br/>
 bar<br/>
 </body></html>
@@ -179,7 +178,7 @@ bar<br/>
 <html><head>
 <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
 <meta name="color-scheme" content="light dark" />
-</head><body>
+</head><body dir="auto" style="unicode-bidi: plaintext">
 line with &lt;<a href="http://encapsulated.link/?foo=_bar">http://encapsulated.link/?foo=_bar</a>&gt; here!<br/>
 </body></html>
 "#
@@ -200,7 +199,7 @@ line with &lt;<a href="http://encapsulated.link/?foo=_bar">http://encapsulated.l
 <html><head>
 <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
 <meta name="color-scheme" content="light dark" />
-</head><body>
+</head><body dir="auto" style="unicode-bidi: plaintext">
 line with nohttp://no.link here<br/>
 </body></html>
 "#
@@ -221,7 +220,7 @@ line with nohttp://no.link here<br/>
 <html><head>
 <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
 <meta name="color-scheme" content="light dark" />
-</head><body>
+</head><body dir="auto" style="unicode-bidi: plaintext">
 just an address: <a href="mailto:foo@bar.org">foo@bar.org</a> <a href="mailto:another@one.de">another@one.de</a><br/>
 </body></html>
 "#
@@ -242,7 +241,7 @@ just an address: <a href="mailto:foo@bar.org">foo@bar.org</a> <a href="mailto:an
 <html><head>
 <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
 <meta name="color-scheme" content="light dark" />
-</head><body>
+</head><body dir="auto" style="unicode-bidi: plaintext">
 line still line<br/>
 <em>&gt;quote </em><br/>
 <em>&gt;still quote</em><br/>
@@ -266,7 +265,7 @@ line still line<br/>
 <html><head>
 <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
 <meta name="color-scheme" content="light dark" />
-</head><body>
+</head><body dir="auto" style="unicode-bidi: plaintext">
 linestill line<br/>
 <em>&gt;quote </em><br/>
 <em>&gt;still quote</em><br/>
@@ -290,7 +289,7 @@ linestill line<br/>
 <html><head>
 <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
 <meta name="color-scheme" content="light dark" />
-</head><body>
+</head><body dir="auto" style="unicode-bidi: plaintext">
 line <br/>
 still line<br/>
 <em>&gt;quote </em><br/>
@@ -315,7 +314,7 @@ still line<br/>
 <html><head>
 <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
 <meta name="color-scheme" content="light dark" />
-</head><body>
+</head><body dir="auto" style="unicode-bidi: plaintext">
 def foo():<br/>
 &nbsp;&nbsp;&nbsp;&nbsp;pass<br/>
 <br/>

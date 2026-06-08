@@ -12,13 +12,12 @@ use rusqlite::OptionalExtension;
 
 use crate::config::Config;
 use crate::configure::EnteredLoginParam;
-use crate::constants::ShowEmails;
 use crate::context::Context;
 use crate::key::DcKey;
 use crate::log::warn;
 use crate::provider::get_provider_info;
 use crate::sql::Sql;
-use crate::tools::{Time, inc_and_check, time_elapsed};
+use crate::tools::{self, Time, inc_and_check, time_elapsed};
 use crate::transport::ConfiguredLoginParam;
 
 const DBVERSION: i32 = 68;
@@ -975,8 +974,7 @@ ALTER TABLE msgs ADD COLUMN mime_references TEXT;"#,
         // keep this default and use DC_SHOW_EMAILS_NO
         // only for new installations
         if exists_before_update {
-            sql.set_raw_config_int("show_emails", ShowEmails::All as i32)
-                .await?;
+            sql.set_raw_config_int("show_emails", 2).await?;
         }
         sql.set_db_version(50).await?;
     }
@@ -1457,8 +1455,7 @@ CREATE INDEX smtp_messageid ON imap(rfc724_mid);
     }
     if dbversion < 98 {
         if exists_before_update && sql.get_raw_config_int("show_emails").await?.is_none() {
-            sql.set_raw_config_int("show_emails", ShowEmails::Off as i32)
-                .await?;
+            sql.set_raw_config_int("show_emails", 0).await?;
         }
         sql.set_db_version(98).await?;
     }
@@ -1919,7 +1916,7 @@ CREATE INDEX gossip_timestamp_index ON gossip_timestamp (chat_id, fingerprint);
 
     inc_and_check(&mut migration_version, 131)?;
     if dbversion < migration_version {
-        let entered_param = EnteredLoginParam::load(context).await?;
+        let entered_param = EnteredLoginParam::load_legacy(context).await?;
         let configured_param = ConfiguredLoginParam::load_legacy(context).await?;
 
         sql.execute_migration_transaction(
@@ -2311,6 +2308,127 @@ ALTER TABLE contacts ADD COLUMN name_normalized TEXT;
             UPDATE transports SET is_published=0 WHERE addr!=(
                 SELECT value FROM config WHERE keyname='configured_addr'
             )",
+            migration_version,
+        )
+        .await?;
+    }
+
+    inc_and_check(&mut migration_version, 150)?;
+    if dbversion < migration_version {
+        sql.execute_migration_transaction(
+            |transaction| {
+                let only_fetch_mvbox = transaction
+                    .query_row(
+                        "SELECT value FROM config WHERE keyname='only_fetch_mvbox'",
+                        (),
+                        |row| {
+                            let value: String = row.get(0)?;
+                            Ok(value)
+                        },
+                    )
+                    .optional()?
+                    .as_deref()
+                    == Some("1");
+
+                if only_fetch_mvbox {
+                    let mvbox_folder = transaction
+                        .query_row(
+                            "SELECT value FROM config WHERE keyname='configured_mvbox_folder'",
+                            (),
+                            |row| {
+                                let value: String = row.get(0)?;
+                                Ok(value)
+                            },
+                        )
+                        .optional()?
+                        .unwrap_or_else(|| "DeltaChat".to_string());
+
+                    transaction.execute(
+                        "UPDATE transports
+                         SET entered_param=json_set(entered_param, '$.imap.folder', ?1),
+                             configured_param=json_set(configured_param, '$.imap_folder', ?1)",
+                        (mvbox_folder,),
+                    )?;
+                }
+                Ok(())
+            },
+            migration_version,
+        )
+        .await?;
+    }
+
+    inc_and_check(&mut migration_version, 151)?;
+    if dbversion < migration_version {
+        sql.execute_migration(
+            "CREATE TABLE tls_spki (
+               host TEXT NOT NULL UNIQUE,
+               spki_hash TEXT NOT NULL, -- base64 of SPKI SHA-256 hash
+               timestamp INTEGER NOT NULL -- timestamp of the last time we have seen this key
+             ) STRICT;
+             -- Index on host column is created implicitly because of UNIQUE constraint.
+             CREATE INDEX tls_spki_index_timestamp ON tls_spki (timestamp);
+            ",
+            migration_version,
+        )
+        .await?;
+    }
+
+    inc_and_check(&mut migration_version, 152)?;
+    if dbversion < migration_version {
+        sql.execute_migration(
+            "
+UPDATE msgs SET state=26 WHERE state=28; -- Change OutMdnRcvd to OutDelivered.
+UPDATE msgs SET state=24 WHERE state=18; -- Change OutPreparing to OutFailed.
+            ",
+            migration_version,
+        )
+        .await?;
+    }
+
+    inc_and_check(&mut migration_version, 153)?;
+    if dbversion < migration_version {
+        sql.execute_migration_transaction(
+            |transaction| {
+                // Newest timestamp of message sent to unencrypted chat with contacts.
+                // This is for 1:1 chats and ad hoc groups.
+                //
+                // Corner case of ad hoc groups with only self as a member is ignored.
+                let max_unencrypted_timestamp: i64 = transaction.query_row(
+                    "SELECT IFNULL(MAX(msgs.timestamp), 0)
+                     FROM msgs
+                     INNER JOIN chats_contacts
+                             ON chats_contacts.chat_id = msgs.chat_id
+                     INNER JOIN contacts
+                             ON chats_contacts.contact_id = contacts.id
+                     WHERE contacts.id > 9
+                       AND contacts.fingerprint = ''
+                    ", (),
+                    |row| row.get(0)
+                 ).context("Failed to select largest unencrypted message timestamp")?;
+
+                // Find the newest unencrypted mailing list message.
+                // Mailing lists have only self-contact as a member,
+                // so we look for them separately.
+                let max_mailing_list_timestamp: i64 =
+                transaction.query_row(
+                    "SELECT IFNULL(MAX(msgs.timestamp), 0)
+                     FROM msgs
+                     INNER JOIN chats ON chats.id = msgs.chat_id
+                     WHERE chats.type = 140",
+                     (), |row| row.get(0)).context("Failed to select largest mailing list timestamp")?;
+
+                let now = tools::time();
+                let max_unencrypted_timestamp = std::cmp::max(max_unencrypted_timestamp, max_mailing_list_timestamp);
+                if max_unencrypted_timestamp.saturating_add(3600 * 24 * 90) > now {
+                    // There are recent active unencrypted chats, don't enforce encryption.
+                    // Otherwise `force_encryption` is enabled by default.
+                    transaction
+                        .execute(
+                            "INSERT OR REPLACE INTO config (keyname, value) VALUES ('force_encryption', '0')", ()
+                        )?;
+                }
+                Ok(())
+            },
             migration_version,
         )
         .await?;

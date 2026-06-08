@@ -1,12 +1,11 @@
 //! # Chat module.
 
 use std::cmp;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::io::Cursor;
 use std::marker::Sync;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
@@ -23,8 +22,9 @@ use crate::chatlist_events;
 use crate::color::str_to_color;
 use crate::config::Config;
 use crate::constants::{
-    Blocked, Chattype, DC_CHAT_ID_ALLDONE_HINT, DC_CHAT_ID_ARCHIVED_LINK, DC_CHAT_ID_LAST_SPECIAL,
-    DC_CHAT_ID_TRASH, DC_RESEND_USER_AVATAR_DAYS, EDITED_PREFIX, TIMESTAMP_SENT_TOLERANCE,
+    self, Blocked, Chattype, DC_CHAT_ID_ALLDONE_HINT, DC_CHAT_ID_ARCHIVED_LINK,
+    DC_CHAT_ID_LAST_SPECIAL, DC_CHAT_ID_TRASH, DC_RESEND_USER_AVATAR_DAYS, EDITED_PREFIX,
+    TIMESTAMP_SENT_TOLERANCE,
 };
 use crate::contact::{self, Contact, ContactId, Origin};
 use crate::context::Context;
@@ -32,9 +32,10 @@ use crate::debug_logging::maybe_set_logging_xdc;
 use crate::download::{
     DownloadState, PRE_MSG_ATTACHMENT_SIZE_THRESHOLD, PRE_MSG_SIZE_WARNING_THRESHOLD,
 };
+use crate::ensure_and_debug_assert_eq;
 use crate::ephemeral::{Timer as EphemeralTimer, start_chat_ephemeral_timers};
 use crate::events::EventType;
-use crate::key::self_fingerprint;
+use crate::key::{Fingerprint, self_fingerprint};
 use crate::location;
 use crate::log::{LogExt, warn};
 use crate::logged_debug_assert;
@@ -1188,7 +1189,6 @@ SELECT id, rfc724_mid, pre_rfc724_mid, timestamp, ?, 1 FROM msgs WHERE chat_id=?
     /// prefer plaintext emails.
     ///
     /// To get more verbose summary for a contact, including its key fingerprint, use [`Contact::get_encrinfo`].
-    #[expect(clippy::arithmetic_side_effects)]
     pub async fn get_encryption_info(self, context: &Context) -> Result<String> {
         let chat = Chat::load_from_db(context, self).await?;
         if !chat.is_encrypted(context).await? {
@@ -1211,7 +1211,8 @@ SELECT id, rfc724_mid, pre_rfc724_mid, timestamp, ?, 1 FROM msgs WHERE chat_id=?
             );
             let fingerprint = contact
                 .fingerprint()
-                .context("Contact does not have a fingerprint in encrypted chat")?;
+                .context("Contact does not have a fingerprint in encrypted chat")?
+                .human_readable();
             if let Some(public_key) = contact.public_key(context).await? {
                 if let Some(relay_addrs) = addresses_from_public_key(&public_key) {
                     let relays = relay_addrs.join(",");
@@ -1752,7 +1753,6 @@ impl Chat {
     ///
     /// If `update_msg_id` is set, that record is reused;
     /// if `update_msg_id` is None, a new record is created.
-    #[expect(clippy::arithmetic_side_effects)]
     async fn prepare_msg_raw(
         &mut self,
         context: &Context,
@@ -1783,9 +1783,8 @@ impl Chat {
                 );
                 bail!("Cannot set message, contact for {} not found.", self.id);
             }
-        } else if matches!(self.typ, Chattype::Group | Chattype::OutBroadcast)
-            && self.param.get_int(Param::Unpromoted).unwrap_or_default() == 1
-        {
+        } else if self.param.get_int(Param::Unpromoted).unwrap_or_default() == 1 {
+            ensure_and_debug_assert_eq!(self.typ, Chattype::Group,);
             msg.param.set_int(Param::AttachChatAvatarAndDescription, 1);
             self.param
                 .remove(Param::Unpromoted)
@@ -2468,10 +2467,7 @@ async fn prepare_msg_blob(context: &Context, msg: &mut Message) -> Result<()> {
             .with_context(|| format!("attachment missing for message of type #{}", msg.viewtype))?;
         let mut maybe_image = false;
 
-        if msg.viewtype == Viewtype::File
-            || msg.viewtype == Viewtype::Image
-            || msg.viewtype == Viewtype::Sticker && !msg.param.exists(Param::ForceSticker)
-        {
+        if msg.viewtype == Viewtype::File || msg.viewtype == Viewtype::Image {
             // Correct the type, take care not to correct already very special
             // formats as GIF or VOICE.
             //
@@ -2479,12 +2475,7 @@ async fn prepare_msg_blob(context: &Context, msg: &mut Message) -> Result<()> {
             // - from FILE to AUDIO/VIDEO/IMAGE
             // - from FILE/IMAGE to GIF */
             if let Some((better_type, _)) = message::guess_msgtype_from_suffix(msg) {
-                if msg.viewtype == Viewtype::Sticker {
-                    if better_type != Viewtype::Image {
-                        // UIs don't want conversions of `Sticker` to anything other than `Image`.
-                        msg.param.set_int(Param::ForceSticker, 1);
-                    }
-                } else if better_type == Viewtype::Image {
+                if better_type == Viewtype::Image {
                     maybe_image = true;
                 } else if better_type != Viewtype::Webxdc
                     || context
@@ -2504,10 +2495,7 @@ async fn prepare_msg_blob(context: &Context, msg: &mut Message) -> Result<()> {
         if msg.viewtype == Viewtype::Vcard {
             msg.try_set_vcard(context, &blob.to_abs_path()).await?;
         }
-        if msg.viewtype == Viewtype::File && maybe_image
-            || msg.viewtype == Viewtype::Image
-            || msg.viewtype == Viewtype::Sticker && !msg.param.exists(Param::ForceSticker)
-        {
+        if msg.viewtype == Viewtype::File && maybe_image || msg.viewtype == Viewtype::Image {
             let new_name = blob
                 .check_or_recode_image(context, msg.get_filename(), &mut msg.viewtype)
                 .await?;
@@ -2541,7 +2529,7 @@ async fn prepare_msg_blob(context: &Context, msg: &mut Message) -> Result<()> {
         // running numbers, etc.
         let filename: String = match viewtype_orig {
             Viewtype::Voice => format!(
-                "voice-messsage_{}.{}",
+                "voice-messsage_{}.{suffix}",
                 chrono::Utc
                     .timestamp_opt(msg.timestamp_sort, 0)
                     .single()
@@ -2549,10 +2537,9 @@ async fn prepare_msg_blob(context: &Context, msg: &mut Message) -> Result<()> {
                         || "YY-mm-dd_hh:mm:ss".to_string(),
                         |ts| ts.format("%Y-%m-%d_%H-%M-%S").to_string()
                     ),
-                &suffix
             ),
             Viewtype::Image | Viewtype::Gif => format!(
-                "image_{}.{}",
+                "image_{}.{suffix}",
                 chrono::Utc
                     .timestamp_opt(msg.timestamp_sort, 0)
                     .single()
@@ -2560,10 +2547,9 @@ async fn prepare_msg_blob(context: &Context, msg: &mut Message) -> Result<()> {
                         || "YY-mm-dd_hh:mm:ss".to_string(),
                         |ts| ts.format("%Y-%m-%d_%H-%M-%S").to_string(),
                     ),
-                &suffix,
             ),
             Viewtype::Video => format!(
-                "video_{}.{}",
+                "video_{}.{suffix}",
                 chrono::Utc
                     .timestamp_opt(msg.timestamp_sort, 0)
                     .single()
@@ -2571,7 +2557,6 @@ async fn prepare_msg_blob(context: &Context, msg: &mut Message) -> Result<()> {
                         || "YY-mm-dd_hh:mm:ss".to_string(),
                         |ts| ts.format("%Y-%m-%d_%H-%M-%S").to_string()
                     ),
-                &suffix
             ),
             _ => filename,
         };
@@ -2625,10 +2610,10 @@ pub async fn send_msg(context: &Context, chat_id: ChatId, msg: &mut Message) -> 
         "chat_id cannot be a special chat: {chat_id}"
     );
 
-    if msg.state != MessageState::Undefined && msg.state != MessageState::OutPreparing {
+    if msg.state != MessageState::Undefined {
         msg.param.remove(Param::GuaranteeE2ee);
         msg.param.remove(Param::ForcePlaintext);
-        msg.update_param(context).await?;
+        // create_send_msg_jobs() will update `param` in the db.
     }
 
     // protect all system messages against RTLO attacks
@@ -2733,7 +2718,16 @@ async fn prepare_send_msg(
         None
     };
 
-    // ... then change the MessageState in the message object
+    if msg.state == MessageState::Undefined
+        // Legacy SecureJoin "v*-request" messages are unencrypted.
+        && msg.param.get_cmd() != SystemMessage::SecurejoinMessage
+        && chat.is_encrypted(context).await?
+    {
+        msg.param.set_int(Param::GuaranteeE2ee, 1);
+        if !msg.id.is_unset() {
+            msg.update_param(context).await?;
+        }
+    }
     msg.state = MessageState::OutPending;
 
     msg.timestamp_sort = create_smeared_timestamp(context);
@@ -2779,15 +2773,13 @@ async fn render_mime_message_and_pre_message(
 
         let mut mimefactory_post_msg = mimefactory.clone();
         mimefactory_post_msg.set_as_post_message();
-        let rendered_msg = mimefactory_post_msg
-            .render(context)
+        let rendered_msg = Box::pin(mimefactory_post_msg.render(context))
             .await
             .context("Failed to render post-message")?;
 
         let mut mimefactory_pre_msg = mimefactory;
         mimefactory_pre_msg.set_as_pre_message_for(&rendered_msg);
-        let rendered_pre_msg = mimefactory_pre_msg
-            .render(context)
+        let rendered_pre_msg = Box::pin(mimefactory_pre_msg.render(context))
             .await
             .context("pre-message failed to render")?;
 
@@ -2802,7 +2794,7 @@ async fn render_mime_message_and_pre_message(
 
         Ok((Some(rendered_pre_msg), rendered_msg))
     } else {
-        Ok((None, mimefactory.render(context).await?))
+        Ok((None, Box::pin(mimefactory.render(context)).await?))
     }
 }
 
@@ -2831,7 +2823,12 @@ pub(crate) async fn create_send_msg_jobs(context: &Context, msg: &mut Message) -
             .await?;
     }
 
-    let needs_encryption = msg.param.get_bool(Param::GuaranteeE2ee).unwrap_or_default();
+    let needs_encryption = msg.param.get_bool(Param::GuaranteeE2ee).unwrap_or_default()
+        || (!msg
+            .param
+            .get_bool(Param::ForcePlaintext)
+            .unwrap_or_default()
+            && context.get_config_bool(Config::ForceEncryption).await?);
     let mimefactory = match MimeFactory::from_msg(context, msg.clone()).await {
         Ok(mf) => mf,
         Err(err) => {
@@ -2898,11 +2895,26 @@ pub(crate) async fn create_send_msg_jobs(context: &Context, msg: &mut Message) -
     }
 
     if needs_encryption && !rendered_msg.is_encrypted {
-        /* unrecoverable */
-        message::set_msg_failed(
+        let addr = context.get_config(Config::ConfiguredAddr).await?;
+        let text = stock_str::unencrypted_email(
             context,
-            msg,
-            "End-to-end-encryption unavailable unexpectedly.",
+            addr.unwrap_or_default()
+                .split('@')
+                .nth(1)
+                .unwrap_or_default(),
+        )
+        .await;
+        message::set_msg_failed(context, msg, &text).await?;
+        add_info_msg_with_cmd(
+            context,
+            msg.chat_id,
+            &text,
+            SystemMessage::InvalidUnencryptedMail,
+            Some(msg.timestamp_sort),
+            msg.timestamp_sort,
+            None,
+            None,
+            None,
         )
         .await?;
         bail!(
@@ -2931,11 +2943,26 @@ pub(crate) async fn create_send_msg_jobs(context: &Context, msg: &mut Message) -
         msg.param.remove(Param::GuaranteeE2ee);
     }
     msg.subject.clone_from(&rendered_msg.subject);
+    // Sort the message to the bottom. Employ `msgs_index7` to compute `timestamp`.
     context
         .sql
         .execute(
-            "UPDATE msgs SET pre_rfc724_mid=?, subject=?, param=? WHERE id=?",
+            "
+UPDATE msgs SET
+    timestamp=(
+        SELECT MAX(timestamp) FROM msgs INDEXED BY msgs_index7 WHERE
+            -- From `InFresh` to `OutDelivered` inclusive, except `OutDraft`.
+            state IN(10,13,16,18,20,24,26) AND
+            hidden IN(0,1) AND
+            chat_id=? AND
+            id<=?
+    ),
+    pre_rfc724_mid=?, subject=?, param=?
+WHERE id=?
+            ",
             (
+                msg.chat_id,
+                msg.id,
                 &msg.pre_rfc724_mid,
                 &msg.subject,
                 msg.param.to_string(),
@@ -3000,7 +3027,6 @@ pub async fn send_text_msg(
 }
 
 /// Sends chat members a request to edit the given message's text.
-#[expect(clippy::arithmetic_side_effects)]
 pub async fn send_edit_request(context: &Context, msg_id: MsgId, new_text: String) -> Result<()> {
     let mut original_msg = Message::load_from_db(context, msg_id).await?;
     ensure!(
@@ -3085,9 +3111,6 @@ async fn donation_request_maybe(context: &Context) -> Result<()> {
 /// Chat message list request options.
 #[derive(Debug)]
 pub struct MessageListOptions {
-    /// Return only info messages.
-    pub info_only: bool,
-
     /// Add day markers before each date regarding the local timezone.
     pub add_daymarker: bool,
 }
@@ -3098,56 +3121,27 @@ pub async fn get_chat_msgs(context: &Context, chat_id: ChatId) -> Result<Vec<Cha
         context,
         chat_id,
         MessageListOptions {
-            info_only: false,
             add_daymarker: false,
         },
     )
     .await
 }
 
-/// Returns messages belonging to the chat according to the given options.
+/// Returns messages belonging to the chat according to the given options,
+/// sorted by oldest message first.
 #[expect(clippy::arithmetic_side_effects)]
 pub async fn get_chat_msgs_ex(
     context: &Context,
     chat_id: ChatId,
     options: MessageListOptions,
 ) -> Result<Vec<ChatItem>> {
-    let MessageListOptions {
-        info_only,
-        add_daymarker,
-    } = options;
-    let process_row = if info_only {
-        |row: &rusqlite::Row| {
-            // is_info logic taken from Message.is_info()
-            let params = row.get::<_, String>("param")?;
-            let (from_id, to_id) = (
-                row.get::<_, ContactId>("from_id")?,
-                row.get::<_, ContactId>("to_id")?,
-            );
-            let is_info_msg: bool = from_id == ContactId::INFO
-                || to_id == ContactId::INFO
-                || match Params::from_str(&params) {
-                    Ok(p) => {
-                        let cmd = p.get_cmd();
-                        cmd != SystemMessage::Unknown && cmd != SystemMessage::AutocryptSetupMessage
-                    }
-                    _ => false,
-                };
-
-            Ok((
-                row.get::<_, i64>("timestamp")?,
-                row.get::<_, MsgId>("id")?,
-                !is_info_msg,
-            ))
-        }
-    } else {
-        |row: &rusqlite::Row| {
-            Ok((
-                row.get::<_, i64>("timestamp")?,
-                row.get::<_, MsgId>("id")?,
-                false,
-            ))
-        }
+    let MessageListOptions { add_daymarker } = options;
+    let process_row = |row: &rusqlite::Row| {
+        Ok((
+            row.get::<_, i64>("timestamp")?,
+            row.get::<_, MsgId>("id")?,
+            false,
+        ))
     };
     let process_rows = |rows: rusqlite::AndThenRows<_>| {
         // It is faster to sort here rather than
@@ -3182,39 +3176,18 @@ pub async fn get_chat_msgs_ex(
         Ok(ret)
     };
 
-    let items = if info_only {
-        context
-            .sql
-            .query_map(
-        // GLOB is used here instead of LIKE because it is case-sensitive
-                "SELECT m.id AS id, m.timestamp AS timestamp, m.param AS param, m.from_id AS from_id, m.to_id AS to_id
-               FROM msgs m
-              WHERE m.chat_id=?
-                AND m.hidden=0
-                AND (
-                    m.param GLOB '*\nS=*' OR param GLOB 'S=*'
-                    OR m.from_id == ?
-                    OR m.to_id == ?
-                );",
-                (chat_id, ContactId::INFO, ContactId::INFO),
-                process_row,
-                process_rows,
-            )
-            .await?
-    } else {
-        context
-            .sql
-            .query_map(
-                "SELECT m.id AS id, m.timestamp AS timestamp
+    let items = context
+        .sql
+        .query_map(
+            "SELECT m.id AS id, m.timestamp AS timestamp
                FROM msgs m
               WHERE m.chat_id=?
                 AND m.hidden=0;",
-                (chat_id,),
-                process_row,
-                process_rows,
-            )
-            .await?
-    };
+            (chat_id,),
+            process_row,
+            process_rows,
+        )
+        .await?;
     Ok(items)
 }
 
@@ -3679,9 +3652,6 @@ pub(crate) async fn create_group_ex(
 /// because the word "channel" already appears a lot in the code,
 /// which would make it hard to grep for it.
 ///
-/// After creation, the chat contains no recipients and is in _unpromoted_ state;
-/// see [`create_group`] for more information on the unpromoted state.
-///
 /// Returns the created chat's id.
 pub async fn create_broadcast(context: &Context, chat_name: String) -> Result<ChatId> {
     let grpid = create_id();
@@ -3713,17 +3683,20 @@ pub(crate) async fn create_out_broadcast_ex(
             |row| row.get(0),
         )?;
         ensure!(cnt == 0, "{cnt} chats exist with grpid {grpid}");
+        let mut params: Params = Params::new();
+        params.update_timestamp(Param::GroupNameTimestamp, time())?;
 
         t.execute(
             "INSERT INTO chats
-            (type, name, name_normalized, grpid, created_timestamp)
-            VALUES(?, ?, ?, ?, ?)",
+            (type, name, name_normalized, grpid, created_timestamp, param)
+            VALUES(?, ?, ?, ?, ?, ?)",
             (
                 Chattype::OutBroadcast,
                 &chat_name,
                 normalize_text(&chat_name),
                 &grpid,
                 timestamp,
+                params.to_string(),
             ),
         )?;
         let chat_id = ChatId::new(t.last_insert_rowid().try_into()?);
@@ -3789,7 +3762,7 @@ pub(crate) async fn update_chat_contacts_table(
     context: &Context,
     timestamp: i64,
     id: ChatId,
-    contacts: &HashSet<ContactId>,
+    contacts: &BTreeSet<ContactId>,
 ) -> Result<()> {
     context
         .sql
@@ -3853,13 +3826,15 @@ pub(crate) async fn add_to_chat_contacts_table(
 
 /// Removes a contact from the chat
 /// by updating the `remove_timestamp`.
+/// Returns whether the contact has been a chat member recently. If so, a removal message should be
+/// sent.
 pub(crate) async fn remove_from_chat_contacts_table(
     context: &Context,
     chat_id: ChatId,
     contact_id: ContactId,
-) -> Result<()> {
+) -> Result<bool> {
     let now = time();
-    context
+    let is_past_member = context
         .sql
         .execute(
             "UPDATE chats_contacts
@@ -3867,12 +3842,15 @@ pub(crate) async fn remove_from_chat_contacts_table(
              WHERE chat_id=? AND contact_id=?",
             (now, chat_id, contact_id),
         )
-        .await?;
-    Ok(())
+        .await?
+        > 0;
+    Ok(is_past_member)
 }
 
 /// Removes a contact from the chat
-/// without leaving a trace.
+/// without leaving a trace in the db.
+/// Returns whether the contact was removed, even if it was a past contact. If so, a removal message
+/// should be sent if the removal is issued by this device.
 ///
 /// Note that if we call this function,
 /// and then receive a message from another device
@@ -3882,17 +3860,17 @@ pub(crate) async fn remove_from_chat_contacts_table_without_trace(
     context: &Context,
     chat_id: ChatId,
     contact_id: ContactId,
-) -> Result<()> {
-    context
+) -> Result<bool> {
+    let removed = context
         .sql
         .execute(
             "DELETE FROM chats_contacts
             WHERE chat_id=? AND contact_id=?",
             (chat_id, contact_id),
         )
-        .await?;
-
-    Ok(())
+        .await?
+        > 0;
+    Ok(removed)
 }
 
 /// Adds a contact to the chat.
@@ -4015,7 +3993,45 @@ pub(crate) async fn add_contact_to_chat_ex(
     if sync.into() {
         chat.sync_contacts(context).await.log_err(context).ok();
     }
+    if chat.typ == Chattype::OutBroadcast {
+        resend_last_msgs(context, chat.id, &contact)
+            .await
+            .log_err(context)
+            .ok();
+    }
     Ok(true)
+}
+
+async fn resend_last_msgs(context: &Context, chat_id: ChatId, to_contact: &Contact) -> Result<()> {
+    let msgs: Vec<MsgId> = context
+        .sql
+        .query_map_vec(
+            "
+SELECT id
+FROM msgs
+WHERE chat_id=?
+    AND hidden=0
+    AND NOT ( -- Exclude info and system messages
+        param GLOB '*\nS=*' OR param GLOB 'S=*'
+        OR from_id=?
+        OR to_id=?
+    )
+    AND type!=?
+ORDER BY timestamp DESC, id DESC LIMIT ?",
+            (
+                chat_id,
+                ContactId::INFO,
+                ContactId::INFO,
+                Viewtype::Webxdc,
+                constants::N_MSGS_TO_NEW_BROADCAST_MEMBER,
+            ),
+            |row: &rusqlite::Row| Ok(row.get::<_, MsgId>(0)?),
+        )
+        .await?
+        .into_iter()
+        .rev()
+        .collect();
+    resend_msgs_ex(context, &msgs, to_contact.fingerprint()).await
 }
 
 /// Returns true if an avatar should be attached in the given chat.
@@ -4174,10 +4190,13 @@ pub async fn remove_contact_from_chat(
 
     let mut sync = Nosync;
 
-    if chat.is_promoted() && chat.typ != Chattype::OutBroadcast {
-        remove_from_chat_contacts_table(context, chat_id, contact_id).await?;
+    let removed = if chat.is_promoted() && chat.typ != Chattype::OutBroadcast {
+        remove_from_chat_contacts_table(context, chat_id, contact_id).await?
     } else {
-        remove_from_chat_contacts_table_without_trace(context, chat_id, contact_id).await?;
+        remove_from_chat_contacts_table_without_trace(context, chat_id, contact_id).await?
+    };
+    if !removed {
+        return Ok(());
     }
 
     // We do not return an error if the contact does not exist in the database.
@@ -4568,6 +4587,7 @@ pub async fn forward_msgs_2ctx(
 
         msg.state = MessageState::OutPending;
         msg.rfc724_mid = create_outgoing_rfc724_mid();
+        msg.pre_rfc724_mid.clear();
         msg.timestamp_sort = curr_timestamp;
         chat.prepare_msg_raw(ctx_dst, &mut msg, None).await?;
 
@@ -4615,7 +4635,6 @@ pub async fn save_msgs(context: &Context, msg_ids: &[MsgId]) -> Result<()> {
 /// the copy contains a reference to the original message
 /// as well as to the original chat in case the original message gets deleted.
 /// Returns data needed to add a `SaveMessage` sync item.
-#[expect(clippy::arithmetic_side_effects)]
 pub(crate) async fn save_copy_in_self_talk(
     context: &Context,
     src_msg_id: MsgId,
@@ -4682,10 +4701,26 @@ pub(crate) async fn save_copy_in_self_talk(
     Ok(msg.rfc724_mid)
 }
 
-/// Resends given messages with the same Message-ID.
+/// Resends given messages to members of the corresponding chats.
 ///
 /// This is primarily intended to make existing webxdcs available to new chat members.
 pub async fn resend_msgs(context: &Context, msg_ids: &[MsgId]) -> Result<()> {
+    resend_msgs_ex(context, msg_ids, None).await
+}
+
+/// Resends given messages to a contact with fingerprint `to_fingerprint` or, if it's `None`, to
+/// members of the corresponding chats.
+///
+/// NB: Actually `to_fingerprint` is only passed for `OutBroadcast` chats when a new member is
+/// added. Regarding webxdcs: It is not trivial to resend only the own status updates,
+/// and it is not trivial to resend them only to the newly-joined member,
+/// so that for now, [`resend_last_msgs`] does not automatically resend webxdcs at all.
+pub(crate) async fn resend_msgs_ex(
+    context: &Context,
+    msg_ids: &[MsgId],
+    to_fingerprint: Option<Fingerprint>,
+) -> Result<()> {
+    let to_fingerprint = to_fingerprint.map(|f| f.hex());
     let mut msgs: Vec<Message> = Vec::new();
     for msg_id in msg_ids {
         let msg = Message::load_from_db(context, *msg_id).await?;
@@ -4704,9 +4739,16 @@ pub async fn resend_msgs(context: &Context, msg_ids: &[MsgId]) -> Result<()> {
             | MessageState::OutFailed
             | MessageState::OutDelivered
             | MessageState::OutMdnRcvd => {
-                message::update_msg_state(context, msg.id, MessageState::OutPending).await?
+                // Broadcast owners shouldn't see spinners on messages being auto-re-sent to new
+                // subscribers (otherwise big channel owners will see spinners most of the time).
+                if to_fingerprint.is_none() {
+                    message::update_msg_state(context, msg.id, MessageState::OutPending).await?;
+                }
             }
             msg_state => bail!("Unexpected message state {msg_state}"),
+        }
+        if let Some(to_fingerprint) = &to_fingerprint {
+            msg.param.set(Param::Arg4, to_fingerprint.clone());
         }
         if create_send_msg_jobs(context, &mut msg).await?.is_empty() {
             continue;
@@ -4719,7 +4761,8 @@ pub async fn resend_msgs(context: &Context, msg_ids: &[MsgId]) -> Result<()> {
             chat_id: msg.chat_id,
             msg_id: msg.id,
         });
-        // note(treefit): only matters if it is the last message in chat (but probably to expensive to check, debounce also solves it)
+        // The event only matters if the message is last in the chat.
+        // But it's probably too expensive check, and UIs anyways need to debounce.
         chatlist_events::emit_chatlist_item_changed(context, msg.chat_id);
 
         if msg.viewtype == Viewtype::Webxdc {
@@ -4912,8 +4955,6 @@ pub async fn was_device_msg_ever_added(context: &Context, label: &str) -> Result
 //   no wrong information are shown in the device chat
 // - deletion in `devmsglabels` makes sure,
 //   deleted messages are reset and useful messages can be added again
-// - we reset the config-option `QuotaExceeding`
-//   that is used as a helper to drive the corresponding device message.
 pub(crate) async fn delete_and_reset_all_device_msgs(context: &Context) -> Result<()> {
     context
         .sql
@@ -4928,9 +4969,6 @@ pub(crate) async fn delete_and_reset_all_device_msgs(context: &Context) -> Resul
             r#"INSERT INTO devmsglabels (label) VALUES ("core-welcome-image"), ("core-welcome")"#,
             (),
         )
-        .await?;
-    context
-        .set_config_internal(Config::QuotaExceeding, None)
         .await?;
     Ok(())
 }
@@ -5048,7 +5086,7 @@ async fn set_contacts_by_addrs(context: &Context, id: ChatId, addrs: &[String]) 
         chat.typ == Chattype::OutBroadcast,
         "{id} is not a broadcast list",
     );
-    let mut contacts = HashSet::new();
+    let mut contacts = BTreeSet::new();
     for addr in addrs {
         let contact_addr = ContactAddress::new(addr)?;
         let contact = Contact::add_or_lookup(context, "", &contact_addr, Origin::Hidden)
@@ -5056,7 +5094,7 @@ async fn set_contacts_by_addrs(context: &Context, id: ChatId, addrs: &[String]) 
             .0;
         contacts.insert(contact);
     }
-    let contacts_old = HashSet::<ContactId>::from_iter(get_chat_contacts(context, id).await?);
+    let contacts_old = BTreeSet::<ContactId>::from_iter(get_chat_contacts(context, id).await?);
     if contacts == contacts_old {
         return Ok(());
     }

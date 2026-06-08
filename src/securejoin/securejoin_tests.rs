@@ -772,6 +772,7 @@ fn manipulate_qr(v3: bool, remove_invite: bool, qr: &mut String) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_adhoc_group_no_qr() -> Result<()> {
     let alice = TestContext::new_alice().await;
+    alice.allow_unencrypted().await?;
 
     let mime = br#"Subject: First thread
 Message-ID: first@example.org
@@ -992,7 +993,7 @@ async fn test_wrong_auth_token() -> Result<()> {
     tcm.send_recv(alice, bob, "hi").await;
 
     let alice_qr = get_securejoin_qr(alice, None).await?;
-    println!("{}", &alice_qr);
+    println!("{alice_qr}");
     let invalid_alice_qr = alice_qr.replace("&s=", "&s=INVALIDAUTHTOKEN&someotherkey=");
 
     join_securejoin(bob, &invalid_alice_qr).await?;
@@ -1415,6 +1416,7 @@ async fn test_vc_request_encrypted_at_rest() -> Result<()> {
     let mut tcm = TestContextManager::new();
     let alice = &tcm.alice().await;
     let bob = &tcm.bob().await;
+    alice.allow_unencrypted().await?;
 
     let qr = get_securejoin_qr(alice, None).await?;
 
@@ -1581,6 +1583,54 @@ async fn test_auth_token_is_synchronized() -> Result<()> {
         .await?
         .unwrap();
     assert_eq!(auth_count, 2);
+
+    Ok(())
+}
+
+/// Tests that Bob deduplicates messages about being added to the group.
+///
+/// If Alice (inviter) has multiple devices,
+/// Bob may receive multiple "member added" messages.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_deduplicate_member_added() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice1 = &tcm.alice().await;
+    let alice2 = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+
+    // Enable sync messages so Alice QR code tokens
+    // are synchronized.
+    alice1.set_config_bool(Config::SyncMsgs, true).await?;
+    alice2.set_config_bool(Config::SyncMsgs, true).await?;
+
+    tcm.section("Alice creates a group");
+    let alice1_chat_id = chat::create_group(alice1, "Group").await?;
+
+    tcm.section("Alice creates group QR code and synchronizes it");
+    let qr = get_securejoin_qr(alice1, Some(alice1_chat_id)).await?;
+    sync(alice1, alice2).await;
+
+    // Import Alice's key to skip key request step.
+    tcm.section("Bob imports Alice's vCard");
+    bob.add_or_lookup_contact_id(alice1).await;
+
+    tcm.section("Bob scans the QR code");
+    let bob_chat_id = join_securejoin(bob, &qr).await?;
+
+    tcm.section("Both Alice's devices add Bob to chat");
+    let sent = bob.pop_sent_msg().await;
+    alice1.recv_msg_trash(&sent).await;
+    alice2.recv_msg_trash(&sent).await;
+
+    let sent1 = alice1.pop_sent_msg().await;
+    let sent2 = alice2.pop_sent_msg().await;
+
+    let bob_rcvd = bob.recv_msg(&sent1).await;
+    assert_eq!(bob_rcvd.chat_id, bob_chat_id);
+    assert_eq!(bob_rcvd.text, "Member Me added by alice@example.org.");
+
+    // Second message is a no-op, so it is trashed.
+    bob.recv_msg_trash(&sent2).await;
 
     Ok(())
 }

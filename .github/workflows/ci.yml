@@ -20,10 +20,10 @@ permissions: {}
 
 env:
   RUSTFLAGS: -Dwarnings
-  RUST_VERSION: 1.94.0
+  RUST_VERSION: 1.95.0
 
   # Minimum Supported Rust Version
-  MSRV: 1.88.0
+  MSRV: 1.89.0
 
 jobs:
   lint_rust:
@@ -40,7 +40,10 @@ jobs:
       - run: rustup override set $RUST_VERSION
         shell: bash
       - name: Cache rust cargo artifacts
-        uses: swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5
+        uses: swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-bin: false
       - name: Run rustfmt
         run: cargo fmt --all -- --check
       - name: Run clippy
@@ -59,7 +62,7 @@ jobs:
         with:
           show-progress: false
           persist-credentials: false
-      - uses: EmbarkStudios/cargo-deny-action@3fd3802e88374d3fe9159b834c7714ec57d6c979
+      - uses: EmbarkStudios/cargo-deny-action@a531616d8ce3b9177443e48a1159bc945a099823
         with:
           arguments: --workspace --all-features --locked
           command: check
@@ -91,7 +94,10 @@ jobs:
           show-progress: false
           persist-credentials: false
       - name: Cache rust cargo artifacts
-        uses: swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5
+        uses: swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-bin: false
       - name: Rustdoc
         run: cargo doc --document-private-items --no-deps
 
@@ -134,10 +140,13 @@ jobs:
         shell: bash
 
       - name: Cache rust cargo artifacts
-        uses: swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5
+        uses: swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-bin: false
 
       - name: Install nextest
-        uses: taiki-e/install-action@69e777b377e4ec209ddad9426ae3e0c1008b0ef3
+        uses: taiki-e/install-action@60ae4ce63c7aeb6e96d7f572c1ec7fafbb17ca80
         with:
           tool: nextest
 
@@ -168,10 +177,13 @@ jobs:
           persist-credentials: false
 
       - name: Cache rust cargo artifacts
-        uses: swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5
+        uses: swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-bin: false
 
       - name: Build C library
-        run: cargo build -p deltachat_ffi
+        run: cargo build -p deltachat_ffi --locked
 
       - name: Upload C library
         uses: actions/upload-artifact@v7
@@ -194,10 +206,13 @@ jobs:
           persist-credentials: false
 
       - name: Cache rust cargo artifacts
-        uses: swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5
+        uses: swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-bin: false
 
       - name: Build deltachat-rpc-server
-        run: cargo build -p deltachat-rpc-server
+        run: cargo build -p deltachat-rpc-server --locked
 
       - name: Upload deltachat-rpc-server
         uses: actions/upload-artifact@v7

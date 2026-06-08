@@ -20,6 +20,7 @@ use pretty_assertions::assert_eq;
 use tempfile::{TempDir, tempdir};
 use tokio::runtime::Handle;
 use tokio::{fs, task};
+use uuid::Uuid;
 
 use crate::chat::{
     self, Chat, ChatId, ChatIdBlocked, MessageListOptions, add_to_chat_contacts_table, create_group,
@@ -32,13 +33,15 @@ use crate::contact::{
     Contact, ContactId, Modifier, Origin, import_vcard, make_vcard, mark_contact_id_as_verified,
 };
 use crate::context::Context;
+use crate::e2ee::EncryptHelper;
 use crate::events::{Event, EventEmitter, EventType, Events};
 use crate::key::{self, DcKey, self_fingerprint};
 use crate::log::warn;
 use crate::login_param::EnteredLoginParam;
-use crate::message::{Message, MessageState, MsgId, update_msg_state};
+use crate::message::{Message, MessageState, MsgId};
 use crate::mimeparser::{MimeMessage, SystemMessage};
-use crate::receive_imf::receive_imf;
+use crate::pgp::SeipdVersion;
+use crate::receive_imf::{ReceivedMsg, receive_imf};
 use crate::securejoin::{get_securejoin_qr, join_securejoin};
 use crate::smtp::msg_has_pending_smtp_job;
 use crate::stock_str::StockStrings;
@@ -132,6 +135,17 @@ impl TestContextManager {
         TestContext::builder()
             .configure_fiona()
             .with_id_offset(6000)
+            .with_log_sink(self.log_sink.clone())
+            .build(Some(&mut self.used_names))
+            .await
+    }
+
+    /// Returns a new "device" with a preconfigured v6 PQC key.
+    pub async fn pqc(&mut self) -> TestContext {
+        TestContext::builder()
+            .with_key_pair(pqc_keypair())
+            .with_address("pqc@example.org".to_string())
+            .with_id_offset(7000)
             .with_log_sink(self.log_sink.clone())
             .build(Some(&mut self.used_names))
             .await
@@ -275,16 +289,17 @@ impl TestContextManager {
 
         let chat_id = join_securejoin(&joiner.ctx, qr).await.unwrap();
 
-        loop {
+        for _ in 0..2 {
             let mut something_sent = false;
-            if let Some(sent) = joiner.pop_sent_msg_opt(Duration::ZERO).await {
+            let rev_order = false;
+            if let Some(sent) = joiner.pop_sent_msg_ex(rev_order, Duration::ZERO).await {
                 for inviter in inviters {
                     inviter.recv_msg_opt(&sent).await;
                 }
                 something_sent = true;
             }
             for inviter in inviters {
-                if let Some(sent) = inviter.pop_sent_msg_opt(Duration::ZERO).await {
+                if let Some(sent) = inviter.pop_sent_msg_ex(rev_order, Duration::ZERO).await {
                     joiner.recv_msg_opt(&sent).await;
                     something_sent = true;
                 }
@@ -302,6 +317,9 @@ impl TestContextManager {
 #[derive(Debug, Clone, Default)]
 pub struct TestContextBuilder {
     key_pair: Option<SignedSecretKey>,
+
+    /// Email address.
+    address: Option<String>,
 
     /// Log sink if set.
     ///
@@ -327,6 +345,7 @@ impl TestContextBuilder {
     /// This is a shortcut for `.with_key_pair(alice_keypair())`.
     pub fn configure_alice(self) -> Self {
         self.with_key_pair(alice_keypair())
+            .with_address("alice@example.org".to_string())
     }
 
     /// Configures as bob@example.net with fixed secret key.
@@ -334,6 +353,7 @@ impl TestContextBuilder {
     /// This is a shortcut for `.with_key_pair(bob_keypair())`.
     pub fn configure_bob(self) -> Self {
         self.with_key_pair(bob_keypair())
+            .with_address("bob@example.net".to_string())
     }
 
     /// Configures as charlie@example.net with fixed secret key.
@@ -341,6 +361,7 @@ impl TestContextBuilder {
     /// This is a shortcut for `.with_key_pair(charlie_keypair())`.
     pub fn configure_charlie(self) -> Self {
         self.with_key_pair(charlie_keypair())
+            .with_address("charlie@example.net".to_string())
     }
 
     /// Configures as dom@example.net with fixed secret key.
@@ -348,6 +369,7 @@ impl TestContextBuilder {
     /// This is a shortcut for `.with_key_pair(dom_keypair())`.
     pub fn configure_dom(self) -> Self {
         self.with_key_pair(dom_keypair())
+            .with_address("dom@example.net".to_string())
     }
 
     /// Configures as elena@example.net with fixed secret key.
@@ -355,6 +377,7 @@ impl TestContextBuilder {
     /// This is a shortcut for `.with_key_pair(elena_keypair())`.
     pub fn configure_elena(self) -> Self {
         self.with_key_pair(elena_keypair())
+            .with_address("elena@example.net".to_string())
     }
 
     /// Configures as fiona@example.net with fixed secret key.
@@ -362,6 +385,7 @@ impl TestContextBuilder {
     /// This is a shortcut for `.with_key_pair(fiona_keypair())`.
     pub fn configure_fiona(self) -> Self {
         self.with_key_pair(fiona_keypair())
+            .with_address("fiona@example.net".to_string())
     }
 
     /// Configures the new [`TestContext`] with the provided [`SignedSecretKey`].
@@ -370,6 +394,12 @@ impl TestContextBuilder {
     /// given identity.
     pub fn with_key_pair(mut self, key_pair: SignedSecretKey) -> Self {
         self.key_pair = Some(key_pair);
+        self
+    }
+
+    /// Sets email address.
+    pub fn with_address(mut self, address: String) -> Self {
+        self.address = Some(address);
         self
     }
 
@@ -395,16 +425,7 @@ impl TestContextBuilder {
     /// Builds the [`TestContext`].
     pub async fn build(self, used_names: Option<&mut BTreeSet<String>>) -> TestContext {
         if let Some(key_pair) = self.key_pair {
-            let userid = {
-                let public_key = key_pair.to_public_key();
-                let id_bstr = public_key.details.users.first().unwrap().id.id();
-                String::from_utf8(id_bstr.to_vec()).unwrap()
-            };
-            let addr = mailparse::addrparse(&userid)
-                .unwrap()
-                .extract_single_info()
-                .unwrap()
-                .addr;
+            let addr = self.address.expect("Address is not set").clone();
             let name = EmailAddress::new(&addr).unwrap().local;
 
             let mut unused_name = name.clone();
@@ -567,7 +588,6 @@ impl TestContext {
             .unwrap();
         ctx.set_config(Config::BccSelf, Some("1")).await.unwrap();
         ctx.set_config(Config::SyncMsgs, Some("0")).await.unwrap();
-        ctx.set_config(Config::MvboxMove, Some("0")).await.unwrap();
 
         Self {
             ctx,
@@ -624,25 +644,35 @@ impl TestContext {
     }
 
     pub async fn pop_sent_msg_opt(&self, timeout: Duration) -> Option<SentMessage<'_>> {
+        let rev_order = true;
+        self.pop_sent_msg_ex(rev_order, timeout).await
+    }
+
+    pub async fn pop_sent_msg_ex(
+        &self,
+        rev_order: bool,
+        timeout: Duration,
+    ) -> Option<SentMessage<'_>> {
         let start = Instant::now();
+        let mut query = "
+SELECT id, msg_id, mime, recipients
+FROM smtp
+ORDER BY id"
+            .to_string();
+        if rev_order {
+            query += " DESC";
+        }
         let (rowid, msg_id, payload, recipients) = loop {
             let row = self
                 .ctx
                 .sql
-                .query_row_optional(
-                    r#"
-                    SELECT id, msg_id, mime, recipients
-                    FROM smtp
-                    ORDER BY id DESC"#,
-                    (),
-                    |row| {
-                        let rowid: i64 = row.get(0)?;
-                        let msg_id: MsgId = row.get(1)?;
-                        let mime: String = row.get(2)?;
-                        let recipients: String = row.get(3)?;
-                        Ok((rowid, msg_id, mime, recipients))
-                    },
-                )
+                .query_row_optional(&query, (), |row| {
+                    let rowid: i64 = row.get(0)?;
+                    let msg_id: MsgId = row.get(1)?;
+                    let mime: String = row.get(2)?;
+                    let recipients: String = row.get(3)?;
+                    Ok((rowid, msg_id, mime, recipients))
+                })
                 .await
                 .expect("query_row_optional failed");
             if let Some(row) = row {
@@ -662,10 +692,11 @@ impl TestContext {
         if !msg_has_pending_smtp_job(self, msg_id)
             .await
             .expect("Failed to check for more jobs")
-        {
-            update_msg_state(&self.ctx, msg_id, MessageState::OutDelivered)
+            && msg_id
+                .set_delivered(self)
                 .await
-                .expect("failed to update message state");
+                .expect("MsgId::set_delivered")
+        {
             self.sql
                 .execute(
                     "UPDATE msgs SET timestamp_sent=? WHERE id=?",
@@ -742,16 +773,19 @@ impl TestContext {
             .execute("DELETE FROM smtp WHERE msg_id=?", (msg_id,))
             .await
             .expect("Delete smtp jobs");
-        update_msg_state(&self.ctx, msg_id, MessageState::OutDelivered)
+        if msg_id
+            .set_delivered(self)
             .await
-            .expect("Update message state");
-        self.sql
-            .execute(
-                "UPDATE msgs SET timestamp_sent=? WHERE id=?",
-                (time(), msg_id),
-            )
-            .await
-            .expect("Update timestamp_sent");
+            .expect("MsgId::set_delivered")
+        {
+            self.sql
+                .execute(
+                    "UPDATE msgs SET timestamp_sent=? WHERE id=?",
+                    (time(), msg_id),
+                )
+                .await
+                .expect("Update timestamp_sent");
+        }
         sent_msgs
     }
 
@@ -783,8 +817,7 @@ impl TestContext {
         let chat_msgs = chat::get_chat_msgs(self, received.chat_id).await.unwrap();
         assert!(
             chat_msgs.contains(&ChatItem::Message { msg_id: msg.id }),
-            "received message is not shown in chat, maybe it's hidden (you may have \
-                to call set_config(Config::ShowEmails, Some(\"2\")).await)"
+            "received message is not shown in chat, maybe it's hidden"
         );
 
         msg
@@ -805,10 +838,7 @@ impl TestContext {
 
     /// Receive a message using the `receive_imf()` pipeline. This is similar
     /// to `recv_msg()`, but doesn't assume that the message is shown in the chat.
-    pub async fn recv_msg_opt(
-        &self,
-        msg: &SentMessage<'_>,
-    ) -> Option<crate::receive_imf::ReceivedMsg> {
+    pub async fn recv_msg_opt(&self, msg: &SentMessage<'_>) -> Option<ReceivedMsg> {
         receive_imf(self, msg.payload().as_bytes(), false)
             .await
             .unwrap()
@@ -824,17 +854,24 @@ impl TestContext {
         assert_eq!(received.chat_id, DC_CHAT_ID_TRASH);
     }
 
+    /// Gets the most recent message ID of a chat.
+    ///
+    /// Panics on errors or if the most recent message is a marker.
+    pub async fn get_last_msg_id_in(&self, chat_id: ChatId) -> MsgId {
+        let msgs = chat::get_chat_msgs(&self.ctx, chat_id).await.unwrap();
+        if let ChatItem::Message { msg_id } = msgs.last().unwrap() {
+            *msg_id
+        } else {
+            panic!("Wrong item type");
+        }
+    }
+
     /// Gets the most recent message of a chat.
     ///
     /// Panics on errors or if the most recent message is a marker.
     pub async fn get_last_msg_in(&self, chat_id: ChatId) -> Message {
-        let msgs = chat::get_chat_msgs(&self.ctx, chat_id).await.unwrap();
-        let msg_id = if let ChatItem::Message { msg_id } = msgs.last().unwrap() {
-            msg_id
-        } else {
-            panic!("Wrong item type");
-        };
-        Message::load_from_db(&self.ctx, *msg_id).await.unwrap()
+        let msg_id = self.get_last_msg_id_in(chat_id).await;
+        Message::load_from_db(&self.ctx, msg_id).await.unwrap()
     }
 
     /// Gets the most recent message over all chats.
@@ -1088,7 +1125,6 @@ impl TestContext {
             self,
             chat_id,
             MessageListOptions {
-                info_only: false,
                 add_daymarker: false,
             },
         )
@@ -1197,6 +1233,74 @@ impl TestContext {
             .await
             .unwrap();
     }
+
+    /// Allow reception of unencrypted messages.
+    pub async fn allow_unencrypted(&self) -> Result<()> {
+        self.set_config_bool(Config::ForceEncryption, false).await?;
+        Ok(())
+    }
+}
+
+pub async fn encrypt_raw_message(
+    context: &Context,
+    receivers: &[&TestContext],
+    payload: &[u8],
+) -> Result<String> {
+    let encryption_helper = EncryptHelper::new(context).await?;
+    let mut encryption_keyring = vec![encryption_helper.public_key.clone()];
+
+    for receiver in receivers {
+        encryption_keyring.push(key::load_self_public_key(receiver).await?);
+    }
+
+    let from = context.get_primary_self_addr().await?;
+    let compress = false;
+
+    let mut cleartext = format!("Autocrypt: {}", encryption_helper.get_aheader()).into_bytes();
+    cleartext.extend_from_slice(b"\r\n");
+    cleartext.extend_from_slice(payload);
+    let encrypted_payload = encryption_helper
+        .encrypt_raw(
+            context,
+            encryption_keyring,
+            cleartext,
+            compress,
+            SeipdVersion::V2,
+        )
+        .await?;
+    let boundary = Uuid::new_v4();
+
+    let res = format!(
+"Content-Type: multipart/encrypted; protocol=\"application/pgp-encrypted\"; boundary=\"{boundary}\"\r
+MIME-Version: 1.0\r
+From: {from}\r
+Subject: [...]\r
+\r
+\r
+--{boundary}\r
+Content-Type: application/pgp-encrypted\r
+\r
+Version: 1\r
+\r
+--{boundary}\r
+Content-Type: application/octet-stream\r
+\r
+{encrypted_payload}\r
+--{boundary}--\r
+");
+    Ok(res)
+}
+
+pub async fn receive_encrypted_imf(
+    context: &TestContext,
+    from: &TestContext,
+    imf_raw: &[u8],
+) -> Result<ReceivedMsg> {
+    let encrypted_message = encrypt_raw_message(from, &[context], imf_raw).await?;
+    let received_msg = receive_imf(context, encrypted_message.as_bytes(), false)
+        .await?
+        .unwrap();
+    Ok(received_msg)
 }
 
 impl Deref for TestContext {
@@ -1405,6 +1509,13 @@ pub fn fiona_keypair() -> SignedSecretKey {
     key::SignedSecretKey::from_asc(include_str!("../test-data/key/fiona-secret.asc")).unwrap()
 }
 
+/// Loads a pre-generated v6 PQC keypair from disk.
+///
+/// Like [alice_keypair] but a different key and identity.
+pub fn pqc_keypair() -> SignedSecretKey {
+    key::SignedSecretKey::from_asc(include_str!("../test-data/key/pqc-secret.asc")).unwrap()
+}
+
 /// Utility to help wait for and retrieve events.
 ///
 /// This buffers the events in order they are emitted.  This allows consuming events in
@@ -1415,6 +1526,12 @@ pub fn fiona_keypair() -> SignedSecretKey {
 /// you will be accessing it as [`TestContext::evtracker`].
 #[derive(Debug)]
 pub struct EventTracker(EventEmitter);
+
+/// See [`super::EventTracker::get_matching_ex`].
+pub struct ExpectedEvents<E: Fn(&EventType) -> bool, U: Fn(&EventType) -> bool> {
+    pub expected: E,
+    pub unexpected: U,
+}
 
 impl Deref for EventTracker {
     type Target = EventEmitter;
@@ -1452,21 +1569,39 @@ impl EventTracker {
         .expect("timeout waiting for event match")
     }
 
-    /// Consumes emitted events returning the first matching one if any.
+    /// Consumes all emitted events returning the first matching one if any.
     pub async fn get_matching_opt<F: Fn(&EventType) -> bool>(
         &self,
         ctx: &Context,
         event_matcher: F,
     ) -> Option<EventType> {
+        self.get_matching_ex(
+            ctx,
+            ExpectedEvents {
+                expected: event_matcher,
+                unexpected: |_| false,
+            },
+        )
+        .await
+    }
+
+    /// Consumes all emitted events returning the first matching one if any. Panics on unexpected
+    /// events.
+    pub async fn get_matching_ex<E: Fn(&EventType) -> bool, U: Fn(&EventType) -> bool>(
+        &self,
+        ctx: &Context,
+        args: ExpectedEvents<E, U>,
+    ) -> Option<EventType> {
         ctx.emit_event(EventType::Test);
         let mut found_event = None;
         loop {
             let event = self.recv().await.unwrap();
+            assert!(!(args.unexpected)(&event.typ));
             if let EventType::Test = event.typ {
                 return found_event;
             }
-            if event_matcher(&event.typ) {
-                found_event = Some(event.typ);
+            if (args.expected)(&event.typ) {
+                found_event.get_or_insert(event.typ);
             }
         }
     }
@@ -1518,9 +1653,7 @@ pub(crate) async fn get_chat_msg(
         asserted_msgs_count,
         msgs.len()
     );
-    let msg_id = if let ChatItem::Message { msg_id } = msgs[index] {
-        msg_id
-    } else {
+    let ChatItem::Message { msg_id } = msgs[index] else {
         panic!("Wrong item type");
     };
     Message::load_from_db(&t.ctx, msg_id).await.unwrap()
@@ -1646,7 +1779,7 @@ async fn write_msg(context: &Context, prefix: &str, msg: &Message, buf: &mut Str
         msg.get_id(),
         if msg.get_showpadlock() { "🔒" } else { "" },
         if msg.has_location() { "📍" } else { "" },
-        &contact_name,
+        contact_name,
         contact_id,
         msgtext,
         if msg.get_from_id() == ContactId::SELF {
