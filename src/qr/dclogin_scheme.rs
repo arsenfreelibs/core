@@ -201,7 +201,7 @@ pub(crate) fn login_param_from_login_qr(
             Ok(param)
         }
         _ => bail!(
-            "DeltaChat does not understand this QR Code yet, please update the app and try again."
+            "Alt Chat does not understand this QR Code yet, please update the app and try again."
         ),
     }
 }

@@ -659,7 +659,7 @@ impl Config {
         });
         if locked_rx.await.is_err() {
             bail!(
-                "Delta Chat is already running. To use Delta Chat, you must first close the existing Delta Chat process, or restart your device. (accounts.lock file is already locked)"
+                "Alt Chat is already running. To use Alt Chat, you must first close the existing Alt Chat process, or restart your device. (accounts.lock file is already locked)"
             );
         };
         Ok(Some(lock_task))

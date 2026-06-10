@@ -1186,7 +1186,7 @@ async fn decide_chat_assignment(
         let now = tools::time();
         let update_config = if last_time.saturating_add(24 * 60 * 60) <= now {
             let txt = format!(
-                "⚠️ It seems you are using Delta Chat on multiple devices that cannot decrypt each other's outgoing messages. To fix this, on the older device use \"Settings / Add Second Device\" and follow the instructions. (Error: {decryption_error}, {rfc724_mid})."
+                "⚠️ It seems you are using Alt Chat on multiple devices that cannot decrypt each other's outgoing messages. To fix this, on the older device use \"Settings / Add Second Device\" and follow the instructions. (Error: {decryption_error}, {rfc724_mid})."
             );
             let mut msg = Message::new_text(txt.to_string());
             chat::add_device_msg(context, None, Some(&mut msg))

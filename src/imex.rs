@@ -793,7 +793,7 @@ async fn check_backup_version(context: &Context) -> Result<()> {
     let version = (context.sql.get_raw_config_int("backup_version").await?).unwrap_or(2);
     ensure!(
         version <= DCBACKUP_VERSION,
-        "This profile is from a newer version of Delta Chat. Please update Delta Chat and try again (profile version is v{version}, the latest supported is v{DCBACKUP_VERSION})"
+        "This profile is from a newer version of Alt Chat. Please update Alt Chat and try again (profile version is v{version}, the latest supported is v{DCBACKUP_VERSION})"
     );
     Ok(())
 }
@@ -1063,7 +1063,7 @@ mod tests {
         let err = imex(&context2, ImexMode::ImportBackup, &modified_backup, None)
             .await
             .unwrap_err();
-        assert!(err.to_string().starts_with("This profile is from a newer version of Delta Chat. Please update Delta Chat and try again"));
+        assert!(err.to_string().starts_with("This profile is from a newer version of Alt Chat. Please update Alt Chat and try again"));
 
         // Some UIs show the error from the event to the user.
         // Therefore, it must also be a user-facing string, rather than some technical info:
@@ -1074,7 +1074,7 @@ mod tests {
         let EventType::Error(err_msg) = err_event else {
             unreachable!()
         };
-        assert!(err_msg.starts_with("This profile is from a newer version of Delta Chat. Please update Delta Chat and try again"));
+        assert!(err_msg.starts_with("This profile is from a newer version of Alt Chat. Please update Alt Chat and try again"));
 
         context2
             .evtracker

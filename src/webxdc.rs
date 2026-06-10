@@ -899,7 +899,7 @@ impl Message {
             && min_api > WEBXDC_API_VERSION
         {
             return Ok(Vec::from(
-                "<!DOCTYPE html>This Webxdc requires a newer Delta Chat version.",
+                "<!DOCTYPE html>This Webxdc requires a newer Alt Chat version.",
             ));
         }
 
