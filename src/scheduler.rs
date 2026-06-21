@@ -454,10 +454,12 @@ async fn inbox_fetch_idle(ctx: &Context, imap: &mut Imap, mut session: Session) 
         .update_metadata(ctx)
         .await
         .context("update_metadata")?;
-    session
-        .register_token(ctx)
-        .await
-        .context("Failed to register push token")?;
+    if let Err(err) = session.register_token(ctx).await {
+        warn!(
+            ctx,
+            "Transport {transport_id}: Failed to register push token: {err:#}."
+        );
+    }
 
     let session = fetch_idle(ctx, imap, session).await?;
     Ok(session)
@@ -488,14 +490,6 @@ async fn fetch_idle(ctx: &Context, connection: &mut Imap, mut session: Session) 
     download_msgs(ctx, &mut session)
         .await
         .context("download_msgs")?;
-
-    // Synchronize Seen flags.
-    session
-        .sync_seen_flags(ctx, &watch_folder)
-        .await
-        .context("sync_seen_flags")
-        .log_err(ctx)
-        .ok();
 
     connection.connectivity.set_idle(ctx);
 

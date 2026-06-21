@@ -1,5 +1,80 @@
 # Changelog
 
+## [2.53.0] - 2026-06-15
+
+### Features / Changes
+
+- Make quality of images sent in chats more consistent between images with different aspect ratio.
+- `MsgId::get_html`: Make only one db query.
+- Do not log the recipient list for sent messages.
+
+### Fixes
+
+- Do not trash pre-messages without text but with a webxdc update.
+- Don't send or process webxdc status updates in pre-messages.
+- Ignore SecureJoin messages from blocked contacts ([#8295](https://github.com/chatmail/core/pull/8295)).
+- Do not abort IMAP connection if setting the push token fails.
+
+### Documentation
+
+- STYLE.md: Require to list columns explicitly in `INSERT` statements.
+
+### Build system
+
+- nix: switch to the "master" branch for naersk.
+- flake.nix: Use hostPlatform.rust.rustcTarget instead of hardcoding it.
+
+### Miscellaneous Tasks
+
+- Bump version to 2.52.0-dev.
+- deps: bump taiki-e/install-action from 2.79.10 to 2.81.1.
+- deps: bump EmbarkStudios/cargo-deny-action from 2.0.19 to 2.0.20.
+- Bump version to 2.53.0-dev.
+
+### Refactor
+
+- Move the definition of the `target_wh`-variable.
+- Remove timesmearing.
+
+### Tests
+
+- Print multiline chat descriptions with debug formatter.
+- `exec_securejoin_qr_multi_device()`: Make inviter devices receive each other messages.
+- Fixup the tests after removing timesmearing.
+- Remove timeout from `pop_sent_msg_ex()`.
+
+## [2.52.0] - 2026-06-09
+
+### Fixes
+
+- Update the channel title after joining if the QR code included a wrong title ([#8260](https://github.com/chatmail/core/pull/8260)).
+- Don't send removal message to contact that hasn't been a chat member ([#8298](https://github.com/chatmail/core/pull/8298)).
+
+### Features / Changes
+
+- Add cryptography-related statistics (`number_of_transports`, `key_version`, `key_algorithm`, `pubkey_size`, `number_of_keys`) ([#8293](https://github.com/chatmail/core/pull/8293), [#8297](https://github.com/chatmail/core/pull/8297)).
+- Add IMAP folder to `Context::get_info()` ([#8285](https://github.com/chatmail/core/pull/8285)).
+
+### Miscellaneous Tasks
+
+- Update preloaded DNS cache.
+- Use default aws-lc-rs cryptography provider for rustls.
+- Add exception for unmaintained proc-macro-error2 to deny.toml.
+- cargo: bump `pin-project` from 1.1.11 to 1.1.13.
+- cargo: bump `tokio` from 1.52.1 to 1.52.3.
+- cargo: bump `log` from 0.4.29 to 0.4.30.
+- cargo: bump `serde_json` from 1.0.149 to 1.0.150.
+- deps: bump EmbarkStudios/cargo-deny-action from 2.0.18 to 2.0.19.
+- deps: bump taiki-e/install-action from 2.79.2 to 2.79.10.
+
+### Build system
+
+- nix: fix windows cross-compilation by adding pthreads includes.
+
+### Refactor
+
+- Remove support for building "source" packages for deltachat-rpc-server.
+
 ## [2.51.0] - 2026-05-29
 
 ### Features / Changes
@@ -8297,3 +8372,5 @@ https://github.com/chatmail/core/pulls?q=is%3Apr+is%3Aclosed
 [2.49.0]: https://github.com/chatmail/core/compare/v2.48.0..v2.49.0
 [2.50.0]: https://github.com/chatmail/core/compare/v2.49.0..v2.50.0
 [2.51.0]: https://github.com/chatmail/core/compare/v2.50.0..v2.51.0
+[2.52.0]: https://github.com/chatmail/core/compare/v2.51.0..v2.52.0
+[2.53.0]: https://github.com/chatmail/core/compare/v2.52.0..v2.53.0

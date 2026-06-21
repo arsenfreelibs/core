@@ -1,6 +1,5 @@
 use mailparse::ParsedMail;
 use std::mem;
-use std::time::Duration;
 
 use super::*;
 use crate::{
@@ -1405,23 +1404,17 @@ async fn test_extra_imf_headers() -> Result<()> {
     let t = &tcm.alice().await;
     let chat_id = t.get_self_chat().await.id;
 
-    for std_hp_composing in [false, true] {
-        t.set_config_bool(Config::StdHeaderProtectionComposing, std_hp_composing)
-            .await?;
-        chat::send_text_msg(t, chat_id, "hi!".to_string()).await?;
-        let sent_msg = t.pop_sent_msg().await;
-        // Check removal of some nonexistent "Chat-*" header to protect the code from future
-        // breakages. But headers not prefixed with "Chat-" remain unless a message has standard
-        // Header Protection.
-        let payload = sent_msg.payload.replace(
-            "Message-ID:",
-            "Chat-Forty-Two: 42\r\nForty-Two: 42\r\nMessage-ID:",
-        );
-        let msg = MimeMessage::from_bytes(t, payload.as_bytes()).await?;
-        assert!(msg.headers.contains_key("chat-version"));
-        assert!(!msg.headers.contains_key("chat-forty-two"));
-        assert_ne!(msg.headers.contains_key("forty-two"), std_hp_composing);
-    }
+    chat::send_text_msg(t, chat_id, "hi!".to_string()).await?;
+    let sent_msg = t.pop_sent_msg().await;
+    // Check that extra headers are ignored with RFC 9788 Header Protection.
+    let payload = sent_msg.payload.replace(
+        "Message-ID:",
+        "Chat-Forty-Two: 42\r\nForty-Two: 42\r\nMessage-ID:",
+    );
+    let msg = MimeMessage::from_bytes(t, payload.as_bytes()).await?;
+    assert!(msg.headers.contains_key("chat-version"));
+    assert!(!msg.headers.contains_key("chat-forty-two"));
+    assert!(!msg.headers.contains_key("forty-two"));
     Ok(())
 }
 
@@ -1435,7 +1428,7 @@ async fn test_intended_recipient_fingerprint() -> Result<()> {
     let chat_id = chat::create_group(t, "").await?;
 
     chat::send_text_msg(t, chat_id, "hi!".to_string()).await?;
-    assert!(t.pop_sent_msg_opt(Duration::ZERO).await.is_none());
+    assert!(t.pop_sent_msg_opt().await.is_none());
 
     for (i, member) in members.iter().enumerate() {
         let contact = t.add_or_lookup_contact(member).await;

@@ -826,7 +826,9 @@ UPDATE config SET value=? WHERE keyname='configured_addr' AND value!=?1
         }
     }
 
-    if let Some(ref status_update) = mime_parser.webxdc_status_update {
+    if let Some(ref status_update) = mime_parser.webxdc_status_update
+        && !matches!(mime_parser.pre_message, PreMessageMode::Pre { .. })
+    {
         let can_info_msg;
         let instance = if mime_parser
             .parts
@@ -1215,6 +1217,8 @@ async fn decide_chat_assignment(
         // Most mailboxes have a "Drafts" folder where constantly new emails appear but we don't actually want to show them
         info!(context, "Email is probably just a draft (TRASH).");
         true
+    } else if matches!(mime_parser.pre_message, PreMessageMode::Pre { .. }) {
+        false
     } else if mime_parser.webxdc_status_update.is_some() && mime_parser.parts.len() == 1 {
         if let Some(part) = mime_parser.parts.first() {
             if part.typ == Viewtype::Text && part.msg.is_empty() {
@@ -1848,14 +1852,11 @@ async fn add_parts(
 
     let state = if !mime_parser.incoming {
         MessageState::OutDelivered
-    } else if seen
-        || !mime_parser.mdn_reports.is_empty()
-        || chat_id_blocked == Blocked::Yes
-        || group_changes.silent
+    } else if seen || !mime_parser.mdn_reports.is_empty() || chat_id_blocked == Blocked::Yes
     // No check for `hidden` because only reactions are such and they should be `InFresh`.
     {
         MessageState::InSeen
-    } else if mime_parser.from.addr == STATISTICS_BOT_EMAIL {
+    } else if mime_parser.from.addr == STATISTICS_BOT_EMAIL || group_changes.silent {
         MessageState::InNoticed
     } else {
         MessageState::InFresh
@@ -2079,7 +2080,7 @@ async fn add_parts(
         }
     }
 
-    handle_edit_delete(context, mime_parser, from_id).await?;
+    handle_edit_delete(context, mime_parser, from_id, &mime_headers).await?;
     handle_post_message(context, mime_parser, from_id, state).await?;
 
     if mime_parser.is_system_message == SystemMessage::CallAccepted
@@ -2349,6 +2350,7 @@ async fn handle_edit_delete(
     context: &Context,
     mime_parser: &MimeMessage,
     from_id: ContactId,
+    mime_headers: &[u8],
 ) -> Result<()> {
     if let Some(rfc724_mid) = mime_parser.get_header(HeaderDef::ChatEdit) {
         let Some(original_msg_id) = rfc724_mid_exists(context, rfc724_mid).await? else {
@@ -2382,7 +2384,7 @@ async fn handle_edit_delete(
         }
 
         let new_text = part.msg.strip_prefix(EDITED_PREFIX).unwrap_or(&part.msg);
-        chat::save_text_edit_to_db(context, &mut original_msg, new_text).await?;
+        chat::save_text_edit_to_db(context, &mut original_msg, new_text, mime_headers).await?;
     } else if let Some(rfc724_mid_list) = mime_parser.get_header(HeaderDef::ChatDelete)
         && let Some(part) = mime_parser.parts.first()
     {

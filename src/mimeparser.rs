@@ -31,9 +31,7 @@ use crate::message::{self, Message, MsgId, Viewtype, get_vcard_summary, set_msg_
 use crate::param::{Param, Params};
 use crate::simplify::{SimplifiedText, simplify};
 use crate::sync::SyncItems;
-use crate::tools::{
-    get_filemeta, parse_receive_headers, smeared_time, time, truncate_msg_text, validate_id,
-};
+use crate::tools::{get_filemeta, parse_receive_headers, time, truncate_msg_text, validate_id};
 use crate::{chatlist_events, location, tools};
 
 /// Public key extracted from `Autocrypt-Gossip`
@@ -271,7 +269,7 @@ impl MimeMessage {
     pub(crate) async fn from_bytes(context: &Context, body: &[u8]) -> Result<Self> {
         let mail = mailparse::parse_mail(body)?;
 
-        let timestamp_rcvd = smeared_time(context);
+        let timestamp_rcvd = time();
         let mut timestamp_sent =
             Self::get_timestamp_sent(&mail.headers, timestamp_rcvd, timestamp_rcvd);
         let hop_info = parse_receive_headers(&mail.get_headers());
@@ -924,14 +922,16 @@ impl MimeMessage {
         self.parse_attachments();
 
         // See if an MDN is requested from the other side
+        let mut wants_mdn = false;
         if self.decryption_error.is_none()
-            && !self.parts.is_empty()
+            && (!self.parts.is_empty() || matches!(&self.pre_message, PreMessageMode::Pre { .. }))
             && let Some(ref dn_to) = self.chat_disposition_notification_to
         {
             // Check that the message is not outgoing.
             let from = &self.from.addr;
             if !context.is_self_addr(from).await? {
                 if from.to_lowercase() == dn_to.addr.to_lowercase() {
+                    wants_mdn = true;
                     if let Some(part) = self.parts.last_mut() {
                         part.param.set_int(Param::WantsMdn, 1);
                     }
@@ -953,7 +953,9 @@ impl MimeMessage {
                 typ: Viewtype::Text,
                 ..Default::default()
             };
-
+            if wants_mdn {
+                part.param.set_int(Param::WantsMdn, 1);
+            }
             if let Some(ref subject) = self.get_subject()
                 && !self.has_chat_version()
                 && self.webxdc_status_update.is_none()
@@ -2462,6 +2464,9 @@ async fn handle_mdn(
     let Some((msg_id, chat_id, has_mdns, is_dup)) = context
         .sql
         .query_row_optional(
+            // MDN on a pre-message (message preview) references the post-message. So we can't tell
+            // if the pre-message or fully downloaded message was seen, but this is on purpose. For
+            // images this problem is going to be solved by showing thumbnails.
             "SELECT
                 m.id AS msg_id,
                 c.id AS chat_id,
@@ -2509,6 +2514,7 @@ async fn handle_mdn(
         // note(treefit): only matters if it is the last message in chat (but probably too expensive to check, debounce also solves it)
         chatlist_events::emit_chatlist_item_changed(context, chat_id);
     }
+    context.emit_event(EventType::MsgReadCountChanged { chat_id, msg_id });
     Ok(())
 }
 
