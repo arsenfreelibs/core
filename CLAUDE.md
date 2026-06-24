@@ -25,10 +25,16 @@ This is the rust core for **Alt Chat**, a fork of [deltachat/deltachat-core-rust
 | `delta@merlinux.eu` | `child.aplic@gmail.com` |
 | `support.delta.chat` | `child.aplic@gmail.com` |
 
+**Do NOT change:**
+- `github.com/deltachat/` links (source code references)
+- Rust crate names (`deltachat`, `deltachat-rpc-server`)
+- `i.delta.chat` protocol invitation links (used in QR/invite flow)
+- HTML anchor IDs like `#what-is-delta-chat`
+
 Scan after every merge:
 ```bash
 grep -rn "Delta Chat\|DeltaChat\|delta\.chat\|deltachat\.org\|delta@merlinux\|support\.delta\.chat" \
-  src/ --include="*.rs"
+  src/ --include="*.rs" --exclude-dir="target"
 ```
 
 ---
@@ -63,8 +69,8 @@ git merge upstream/main
 
 # 4. Scan for branding leaks
 
-# 5. Fix any leaked strings, then:
-git add -p  # or git add <files>
+# 5. Fix any leaked strings, then commit
+git add <files>
 git merge --continue  # or git commit
 
 # 6. Push
