@@ -155,7 +155,12 @@ pub(crate) async fn prioritize_server_login_params(
         .await?;
         res.push((timestamp, param.clone()));
     }
-    res.sort_by_key(|(ts, _param)| std::cmp::Reverse(*ts));
+    // alt.chat fork: always try port 443 first. It is indistinguishable from plain
+    // HTTPS and stays reachable under Russia's ТСПУ whitelist/DPI, which drops most
+    // other ports. Our chatmail server offers IMAP+SMTP on 443/SSL alongside the
+    // standard ports; within the same port class we keep upstream's ordering
+    // (most-recently-working candidate first).
+    res.sort_by_key(|(ts, param)| (param.connection.port != 443, std::cmp::Reverse(*ts)));
     Ok(res.into_iter().map(|(_ts, param)| param).collect())
 }
 
