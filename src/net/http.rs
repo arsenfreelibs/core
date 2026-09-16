@@ -5,7 +5,6 @@ use bytes::Bytes;
 use http_body_util::BodyExt;
 use hyper_util::rt::TokioIo;
 use mime::Mime;
-use serde::Serialize;
 use tokio::fs;
 
 use crate::blob::BlobObject;
@@ -259,6 +258,15 @@ pub(crate) async fn http_cache_cleanup(context: &Context) -> Result<()> {
     Ok(())
 }
 
+/// Returns the request target in origin form, i.e. the path and query of `url`.
+///
+/// The absolute form is only for proxy requests and
+/// nginx rejects it if the host starts contains an underscore.
+fn origin_form(url: &hyper::Uri) -> &str {
+    url.path_and_query()
+        .map_or("/", |path_and_query| path_and_query.as_str())
+}
+
 /// Fetches URL and updates the cache.
 ///
 /// URL is fetched regardless of whether there is an existing result in the cache.
@@ -277,7 +285,7 @@ async fn fetch_url(context: &Context, original_url: &str, strict_tls: bool) -> R
             .context("URL has no authority")?
             .clone();
 
-        let req = hyper::Request::builder().uri(parsed_url);
+        let req = hyper::Request::builder().uri(origin_form(&parsed_url));
 
         // OSM usage policy requires
         // that User-Agent is set for HTTP GET requests
@@ -410,7 +418,7 @@ pub(crate) async fn post_empty(context: &Context, url: &str) -> Result<(String, 
         .authority()
         .context("URL has no authority")?
         .clone();
-    let req = hyper::Request::post(parsed_url)
+    let req = hyper::Request::post(origin_form(&parsed_url))
         .header(hyper::header::HOST, authority.as_str())
         .body(http_body_util::Empty::<Bytes>::new())?;
 
@@ -424,66 +432,6 @@ pub(crate) async fn post_empty(context: &Context, url: &str) -> Result<(String, 
     Ok((response_text, response_status.is_success()))
 }
 
-/// Posts string to the given URL.
-///
-/// Returns true if successful HTTP response code was returned.
-///
-/// Does not follow redirects.
-#[allow(dead_code)]
-pub(crate) async fn post_string(context: &Context, url: &str, body: String) -> Result<bool> {
-    let parsed_url = url
-        .parse::<hyper::Uri>()
-        .with_context(|| format!("Failed to parse URL {url:?}"))?;
-    let scheme = parsed_url.scheme_str().context("URL has no scheme")?;
-    if scheme != "https" {
-        bail!("POST requests to non-HTTPS URLs are not allowed");
-    }
-
-    let mut sender = get_http_sender(context, parsed_url.clone(), true).await?;
-    let authority = parsed_url
-        .authority()
-        .context("URL has no authority")?
-        .clone();
-
-    let request = hyper::Request::post(parsed_url)
-        .header(hyper::header::HOST, authority.as_str())
-        .body(body)?;
-    let response = sender.send_request(request).await?;
-
-    Ok(response.status().is_success())
-}
-
-/// Sends a POST request with x-www-form-urlencoded data.
-///
-/// Does not follow redirects.
-pub(crate) async fn post_form<T: Serialize + ?Sized>(
-    context: &Context,
-    url: &str,
-    form: &T,
-) -> Result<Bytes> {
-    let parsed_url = url
-        .parse::<hyper::Uri>()
-        .with_context(|| format!("Failed to parse URL {url:?}"))?;
-    let scheme = parsed_url.scheme_str().context("URL has no scheme")?;
-    if scheme != "https" {
-        bail!("POST requests to non-HTTPS URLs are not allowed");
-    }
-
-    let encoded_body = serde_urlencoded::to_string(form).context("Failed to encode data")?;
-    let mut sender = get_http_sender(context, parsed_url.clone(), true).await?;
-    let authority = parsed_url
-        .authority()
-        .context("URL has no authority")?
-        .clone();
-    let request = hyper::Request::post(parsed_url)
-        .header(hyper::header::HOST, authority.as_str())
-        .header("content-type", "application/x-www-form-urlencoded")
-        .body(encoded_body)?;
-    let response = sender.send_request(request).await?;
-    let bytes = response.collect().await?.to_bytes();
-    Ok(bytes)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -492,6 +440,20 @@ mod tests {
     use crate::sql::housekeeping;
     use crate::test_utils::TestContext;
     use crate::tools::SystemTime;
+
+    #[test]
+    fn test_origin_form() {
+        let url = "https://_cm0.localchat/autoconfig?emailaddress=x%40_cm0.localchat"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            origin_form(&url),
+            "/autoconfig?emailaddress=x%40_cm0.localchat"
+        );
+
+        let url = "https://example.org".parse().unwrap();
+        assert_eq!(origin_form(&url), "/");
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_http_cache() -> Result<()> {
@@ -602,6 +564,7 @@ mod tests {
             None
         );
 
+        t.assert_warn("os error 2").await;
         Ok(())
     }
 }

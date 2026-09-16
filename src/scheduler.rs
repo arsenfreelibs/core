@@ -1,12 +1,15 @@
 use std::cmp;
+use std::future::Future;
 use std::num::NonZeroUsize;
+use std::pin::Pin;
+use std::sync::atomic::Ordering;
 
 use anyhow::{Context as _, Error, Result, bail};
 use async_channel::{self as channel, Receiver, Sender};
 use futures::future::try_join_all;
 use futures_lite::FutureExt;
 use tokio::sync::{RwLock, oneshot};
-use tokio::task;
+use tokio::task::{self, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
@@ -18,8 +21,10 @@ use crate::download::{download_known_post_messages_without_pre_message, download
 use crate::ephemeral;
 use crate::events::EventType;
 use crate::imap::{Imap, session::Session};
+use crate::keyupdate::{maybe_send_keyupdate_message, schedule_keyupdate_check};
 use crate::location;
 use crate::log::{LogExt, warn};
+use crate::reaction::broadcast_reactions::maybe_broadcast_reactions;
 use crate::smtp::{Smtp, send_smtp_messages};
 use crate::sql;
 use crate::stats::maybe_send_stats;
@@ -277,6 +282,60 @@ impl SchedulerState {
             scheduler.interrupt_recently_seen(contact_id, timestamp);
         }
     }
+
+    /// Fetches from all transports at once, each on a dedicated connection,
+    /// with I/O paused so that the scheduler does not connect as well.
+    ///
+    /// Returns as soon as one transport fetched messages:
+    /// the others then fetch nothing more and are dropped,
+    /// so that a caller woken up by a push notification
+    /// does not wait for a transport that may never answer.
+    pub(crate) async fn background_fetch_any(&self, context: &Context) -> Result<()> {
+        let _pause_guard = self.pause(context).await?;
+
+        let stop_token = CancellationToken::new();
+        let mut set = JoinSet::new();
+        for (transport_id, param) in ConfiguredLoginParam::load_all(context).await? {
+            let context = context.clone();
+            let stop_token = stop_token.clone();
+            set.spawn(async move {
+                match background_fetch_from_transport(&context, transport_id, param, stop_token)
+                    .await
+                {
+                    Ok(fetched) => fetched,
+                    Err(err) => {
+                        warn!(context, "Transport {transport_id}: fetch failed: {err:#}.");
+                        false
+                    }
+                }
+            });
+        }
+
+        while let Some(fetched) = set.join_next().await {
+            if let Ok(true) = fetched {
+                break;
+            }
+        }
+        Ok(())
+    }
+}
+
+async fn background_fetch_from_transport(
+    context: &Context,
+    transport_id: u32,
+    param: ConfiguredLoginParam,
+    stop_token: CancellationToken,
+) -> Result<bool> {
+    // A single fetch has nothing to interrupt.
+    let (_, idle_interrupt_receiver) = channel::bounded(1);
+    let mut connection = Imap::new(context, transport_id, param, idle_interrupt_receiver).await?;
+    connection.background_fetch_stop_token = Some(stop_token);
+    let mut session = connection.prepare(context).await?;
+
+    let folder = connection.folder.clone();
+    connection
+        .fetch_move_delete(context, &mut session, &folder)
+        .await
 }
 
 #[derive(Debug, Default)]
@@ -407,6 +466,12 @@ async fn inbox_loop(
         .await;
 }
 
+/// Same as `context.restart_io_if_running()`, but `Box::pin`ed and with a `+ Send` bound
+/// to break the async type cycle with the IMAP loop it restarts.
+fn restart_io_if_running_boxed(context: Context) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    Box::pin(async move { context.restart_io_if_running().await })
+}
+
 async fn inbox_fetch_idle(ctx: &Context, imap: &mut Imap, mut session: Session) -> Result<Session> {
     let transport_id = session.transport_id();
 
@@ -421,11 +486,11 @@ async fn inbox_fetch_idle(ctx: &Context, imap: &mut Imap, mut session: Session) 
     }
 
     if let Ok(()) = imap.resync_request_receiver.try_recv()
-        && let Err(err) = session.resync_folders(ctx).await
+        && let Err(err) = session.resync_uids_with_server(ctx, &imap.folder).await
     {
         warn!(
             ctx,
-            "Transport {transport_id}: Failed to resync folders: {err:#}."
+            "Transport {transport_id}: Failed to resync UIDs: {err:#}."
         );
         imap.resync_request_sender.try_send(()).ok();
     }
@@ -448,6 +513,7 @@ async fn inbox_fetch_idle(ctx: &Context, imap: &mut Imap, mut session: Session) 
         }
     };
 
+    maybe_broadcast_reactions(ctx).await.log_err(ctx).ok();
     maybe_send_stats(ctx).await.log_err(ctx).ok();
 
     session
@@ -490,6 +556,12 @@ async fn fetch_idle(ctx: &Context, connection: &mut Imap, mut session: Session) 
     download_msgs(ctx, &mut session)
         .await
         .context("download_msgs")?;
+
+    if ctx.restart_io_after_fetch.swap(false, Ordering::Relaxed) {
+        // Restarting IO cancels the IMAP loop.
+        // Therefore, we only restart when we're anyways about to go IDLE.
+        task::spawn(restart_io_if_running_boxed(ctx.clone()));
+    }
 
     connection.connectivity.set_idle(ctx);
 
@@ -553,6 +625,9 @@ async fn smtp_loop(
             return;
         }
 
+        // Reschedule the check to catch changes lost to a restart.
+        schedule_keyupdate_check(&ctx).await.log_err(&ctx).ok();
+
         let mut timeout = None;
         loop {
             if let Err(err) = send_smtp_messages(&ctx, &mut connection).await {
@@ -606,8 +681,29 @@ async fn smtp_loop(
                     slept.saturating_add(rand::random_range((slept / 2)..=slept)),
                 ));
             } else {
+                // Queue is drained: send a due keyupdate without delaying real messages.
+                let next_check = ctx.next_keyupdate_check.load(Ordering::Relaxed);
+                let wait = u64::try_from(next_check.saturating_sub(time())).unwrap_or_default();
+                if next_check != 0 && wait == 0 {
+                    // Clear first so that an intervening transport change schedules a new check.
+                    ctx.next_keyupdate_check.store(0, Ordering::Relaxed);
+                    maybe_send_keyupdate_message(&ctx)
+                        .await
+                        .context("Failed to send keyupdate message")
+                        .log_err(&ctx)
+                        .ok();
+                    continue;
+                }
+
                 info!(ctx, "SMTP has no messages to retry, waiting for interrupt.");
-                idle_interrupt_receiver.recv().await.unwrap_or_default();
+                let interrupt = idle_interrupt_receiver.recv();
+                if next_check != 0 {
+                    tokio::time::timeout(std::time::Duration::from_secs(wait), interrupt)
+                        .await
+                        .ok();
+                } else {
+                    interrupt.await.ok();
+                }
             };
 
             info!(ctx, "SMTP fake idle interrupted.")

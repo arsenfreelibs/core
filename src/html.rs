@@ -21,6 +21,7 @@ use crate::message::{Message, MsgId};
 use crate::mimeparser::parse_message_id;
 use crate::param::{Param::SendHtml, Params};
 use crate::plaintext::PlainText;
+use crate::simplify::unescape_message_footer_marks;
 use crate::sql;
 use crate::tools::{buf_compress, buf_decompress};
 
@@ -174,14 +175,14 @@ impl HtmlMsgParser {
                     if self.html.is_empty()
                         && let Ok(decoded_data) = mail.get_body()
                     {
-                        self.html = decoded_data;
+                        self.html = unescape_message_footer_marks(&decoded_data);
                     }
                 } else if mimetype == mime::TEXT_PLAIN
                     && self.plain.is_none()
                     && let Ok(decoded_data) = mail.get_body()
                 {
                     self.plain = Some(PlainText {
-                        text: decoded_data,
+                        text: unescape_message_footer_marks(&decoded_data),
                         flowed: if let Some(format) = mail.ctype.params.get("format") {
                             format.as_str().eq_ignore_ascii_case("flowed")
                         } else {
@@ -335,7 +336,7 @@ mod tests {
 
     use crate::constants;
     use crate::contact::ContactId;
-    use crate::message::{MessengerMessage, Viewtype};
+    use crate::message::Viewtype;
     use crate::receive_imf::receive_imf;
     use crate::test_utils::{TestContext, TestContextManager};
 
@@ -412,6 +413,25 @@ and will be wrapped as usual.<br/>
 mime-modified should not be set set as there is no html and no special stuff;<br/>
 although not being a delta-message.<br/>
 test some special html-characters as &lt; &gt; and &amp; but also &quot; and &#x27; :)<br/>
+</body></html>
+"#
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_htmlparse_plain_escaped_footer() {
+        let t = TestContext::new().await;
+        let raw = include_bytes!("../test-data/message/text_plain_escaped_footer.eml");
+        let (parser, _) = HtmlMsgParser::from_bytes(&t.ctx, raw).unwrap();
+        assert_eq!(
+            parser.html,
+            r#"<!DOCTYPE html>
+<html><head>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
+<meta name="color-scheme" content="light dark" />
+</head><body dir="auto" style="unicode-bidi: plaintext">
+-- escaped footer 1<br/>
+-- escaped footer 2<br/>
 </body></html>
 "#
         );
@@ -504,7 +524,6 @@ test some special html-characters as &lt; &gt; and &amp; but also &quot; and &#x
         receive_imf(alice, raw, false).await.unwrap();
         let msg = alice.get_last_msg_in(chat.get_id()).await;
         assert_ne!(msg.get_from_id(), ContactId::SELF);
-        assert_eq!(msg.is_dc_message, MessengerMessage::No);
         assert!(!msg.is_forwarded());
         assert!(msg.get_text().contains("this is plain"));
         assert!(msg.has_html());
@@ -519,7 +538,6 @@ test some special html-characters as &lt; &gt; and &amp; but also &quot; and &#x
         async fn check_sender(ctx: &TestContext, chat: &Chat) {
             let msg = ctx.get_last_msg_in(chat.get_id()).await;
             assert_eq!(msg.get_from_id(), ContactId::SELF);
-            assert_eq!(msg.is_dc_message, MessengerMessage::Yes);
             assert!(msg.is_forwarded());
             assert!(msg.get_text().contains("this is plain"));
             assert!(msg.has_html());
@@ -536,7 +554,6 @@ test some special html-characters as &lt; &gt; and &amp; but also &quot; and &#x
             let msg = ctx.recv_msg(&sender.pop_sent_msg().await).await;
             assert_eq!(chat.id, msg.chat_id);
             assert_ne!(msg.get_from_id(), ContactId::SELF);
-            assert_eq!(msg.is_dc_message, MessengerMessage::Yes);
             assert!(msg.is_forwarded());
             assert!(msg.get_text().contains("this is plain"));
             assert!(msg.has_html());
@@ -588,7 +605,6 @@ test some special html-characters as &lt; &gt; and &amp; but also &quot; and &#x
         assert!(!saved_msg.is_forwarded()); // UI should not flag "saved messages" as "forwarded"
         assert_ne!(saved_msg.get_from_id(), ContactId::SELF);
         assert_eq!(saved_msg.get_from_id(), msg.get_from_id());
-        assert_eq!(saved_msg.is_dc_message, MessengerMessage::No);
         assert!(saved_msg.get_text().contains("this is plain"));
         assert!(saved_msg.has_html());
         let html = saved_msg.get_id().get_html(alice).await?.unwrap();
@@ -623,7 +639,6 @@ test some special html-characters as &lt; &gt; and &amp; but also &quot; and &#x
         let msg = alice.recv_msg(&msg).await;
         assert_eq!(msg.chat_id, alice.get_self_chat().await.id);
         assert_eq!(msg.get_from_id(), ContactId::SELF);
-        assert_eq!(msg.is_dc_message, MessengerMessage::Yes);
         assert!(msg.get_showpadlock());
         assert!(msg.is_forwarded());
         assert!(msg.get_text().contains("this is plain"));

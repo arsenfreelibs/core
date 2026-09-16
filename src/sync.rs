@@ -66,8 +66,8 @@ pub(crate) struct TransportData {
     /// Timestamp of when the transport was last time (re)configured.
     pub(crate) timestamp: i64,
 
-    /// Whether the transport is published.
-    /// See [`Context::set_transport_unpublished`] for details.
+    /// Whether the transport is advertised to contacts.
+    /// Always `true` from this core; an older core's `false` is applied as a removal.
     pub(crate) is_published: bool,
 }
 
@@ -341,7 +341,7 @@ impl Context {
         // Since there was a sync message, we know that there is a second device.
         // Set BccSelf to true if it isn't already.
         if !items.items.is_empty() && !self.get_config_bool(Config::BccSelf).await.unwrap_or(true) {
-            self.set_config_ex(Sync::Nosync, Config::BccSelf, Some("1"))
+            self.set_config_ext(Sync::Nosync, Config::BccSelf, Some("1"))
                 .await
                 .log_err(self)
                 .ok();
@@ -382,7 +382,7 @@ impl Context {
         Ok(())
     }
 
-    async fn sync_message_deletion(&self, msgs: &Vec<String>) -> Result<()> {
+    async fn sync_message_deletion(&self, msgs: &[String]) -> Result<()> {
         let mut modified_chat_ids = BTreeSet::new();
         let mut msg_ids = Vec::new();
         for rfc724_mid in msgs {
@@ -695,6 +695,9 @@ mod tests {
         bob.recv_msg_trash(&sent_msg).await;
         assert!(!token::exists(&bob, token::Namespace::Auth, "testtoken").await?);
 
+        bob.assert_warn("missing key").await;
+        bob.assert_warn("unencrypted message").await;
+
         Ok(())
     }
 
@@ -807,7 +810,7 @@ mod tests {
         let fiona = &tcm.fiona().await;
         tcm.exec_securejoin_qr(fiona, alice2, &qr).await;
         let msg = fiona.get_last_msg().await;
-        assert_eq!(msg.text, "Member Me added by alice@example.org.");
+        assert_eq!(msg.text, "You were added by alice@example.org.");
         Ok(())
     }
 

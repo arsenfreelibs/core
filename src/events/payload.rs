@@ -92,7 +92,7 @@ pub enum EventType {
         /// ID of the message for which reactions were changed.
         msg_id: MsgId,
 
-        /// ID of the contact whose reaction set is changed.
+        /// ID of the contact whose reaction set is changed. May be 0 eg. in case of broadcasted reactions.
         contact_id: ContactId,
     },
 
@@ -214,7 +214,6 @@ pub enum EventType {
     },
 
     /// Chat changed.  The name or the image of a chat group was changed or members were added or removed.
-    /// Or the verify state of a chat has changed.
     /// See dc_set_chat_name(), dc_set_chat_profile_image(), dc_add_contact_to_chat()
     /// and dc_remove_contact_from_chat().
     ///
@@ -302,8 +301,7 @@ pub enum EventType {
         contact_id: ContactId,
 
         /// Progress as:
-        /// 400=vg-/vc-request-with-auth sent, typically shown as "alice@addr verified, introducing myself."
-        /// (Bob has verified alice and waits until Alice does the same for him)
+        /// 400=vg-/vc-request-with-auth sent, typically shown as "introducing myself."
         /// 1000=vg-member-added/vc-contact-confirm received
         progress: u16,
     },
@@ -357,11 +355,15 @@ pub enum EventType {
         msg_id: MsgId,
     },
 
-    /// Tells that the Background fetch was completed (or timed out).
-    /// This event acts as a marker, when you reach this event you can be sure
-    /// that all events emitted during the background fetch were processed.
+    /// Tells that a background fetch call is done:
+    /// the fetch completed, timed out, was stopped or was not started.
     ///
-    /// This event is only emitted by the account manager
+    /// For the call that started the fetch, this event acts as a marker:
+    /// all events emitted during the fetch were processed once it is reached.
+    /// A call made while another background fetch is running gets the event immediately,
+    /// and the running fetch keeps emitting events until its own marker.
+    ///
+    /// This event is only emitted by the account manager.
     AccountsBackgroundFetchDone,
     /// Inform that set of chats or the order of the chats in the chatlist has changed.
     ///
@@ -429,13 +431,13 @@ pub enum EventType {
         chat_id: ChatId,
     },
 
-    /// One or more transports has changed or another transport is primary now.
+    /// One or more transports has changed or another transport is used for sending now.
     ///
     /// UI should update the list.
     ///
-    /// This event is emitted when a transport
-    /// synchronization message modifies transports,
-    /// but not when the UI modifies the transport list by itself.
+    /// The event is emitted on the device modifying
+    /// the transports as well as on other devices
+    /// applying the synced change.
     TransportsModified,
 
     /// Event for using in tests, e.g. as a fence between normally generated events.
@@ -447,4 +449,22 @@ pub enum EventType {
         /// Number of events skipped.
         n: u64,
     },
+}
+
+impl EventType {
+    /// Returns the warning [`String`], if the event is a warning.
+    pub fn get_warn(&self) -> Option<&String> {
+        match self {
+            Self::Warning(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Returns the error [`String`], if the event is an error.
+    pub fn get_error(&self) -> Option<&String> {
+        match self {
+            Self::Error(s) | Self::ErrorSelfNotInGroup(s) => Some(s),
+            _ => None,
+        }
+    }
 }

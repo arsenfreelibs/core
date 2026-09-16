@@ -69,16 +69,8 @@ pub enum StockMessage {
     #[strum(props(fallback = "Fingerprints"))]
     FingerPrints = 30,
 
-    #[strum(props(fallback = "%1$s verified."))]
-    ContactVerified = 35,
-
     #[strum(props(fallback = "Archived chats"))]
     ArchivedChats = 40,
-
-    #[strum(props(
-        fallback = "Cannot login as \"%1$s\". Please check if the email address and the password are correct."
-    ))]
-    CannotLogin = 60,
 
     #[strum(props(fallback = "Location streaming enabled."))]
     MsgLocationEnabled = 64,
@@ -344,6 +336,18 @@ pub enum StockMessage {
     #[strum(props(fallback = "Member %1$s removed."))]
     MsgDelMember = 178,
 
+    #[strum(props(fallback = "You were removed by %1$s."))]
+    MsgRemovedBy = 179,
+
+    #[strum(props(fallback = "You were added by %1$s."))]
+    MsgAddedBy = 180,
+
+    #[strum(props(fallback = "You were removed."))]
+    MsgRemoved = 181,
+
+    #[strum(props(fallback = "You were added."))]
+    MsgAdded = 182,
+
     #[strum(props(fallback = "Establishing connection, please wait…"))]
     SecurejoinWait = 190,
 
@@ -421,6 +425,12 @@ https://alt-chat.me/donate"))]
 
     #[strum(props(fallback = "Messages are end-to-end encrypted."))]
     MessagesAreE2ee = 242,
+
+    #[strum(props(fallback = "You pinned a message."))]
+    MsgYouPinnedAMessage = 243,
+
+    #[strum(props(fallback = "Message pinned by %1$s."))]
+    MsgMessagePinnedBy = 244,
 }
 
 impl StockMessage {
@@ -606,7 +616,23 @@ pub(crate) async fn msg_chat_description_changed(
     }
 }
 
-/// Stock string: `Member %1$s added.`, `You added member %1$s.` or `Member %1$s added by %2$s.`.
+/// Stock strings for pinning a message; used in info messages, once tapped, UI scrolled to the pinned message.
+/// For unpinning a message, we do not add a visible info message as this is of fewer interest.
+pub(crate) async fn msg_pinned(context: &Context, by_contact: ContactId) -> String {
+    if by_contact == ContactId::SELF {
+        translated(context, StockMessage::MsgYouPinnedAMessage)
+    } else {
+        translated(context, StockMessage::MsgMessagePinnedBy)
+            .replace1(&by_contact.get_stock_name(context).await)
+    }
+}
+
+/// Stock string, one of:
+/// - `Member %1$s added.`,
+/// - `You added member %1$s.`,
+/// - `Member %1$s added by %2$s.`,
+/// - `You were added by %1$s.`,
+/// - `You were added.`.
 ///
 /// The `added_member` and `by_contact` contacts
 /// are looked up in the database to get the display names.
@@ -616,18 +642,28 @@ pub(crate) async fn msg_add_member_local(
     by_contact: ContactId,
 ) -> String {
     let whom = added_member.get_stock_name(context).await;
-    if by_contact == ContactId::UNDEFINED {
-        translated(context, StockMessage::MsgAddMember).replace1(&whom)
-    } else if by_contact == ContactId::SELF {
-        translated(context, StockMessage::MsgYouAddMember).replace1(&whom)
-    } else {
-        translated(context, StockMessage::MsgAddMemberBy)
+    match (added_member, by_contact) {
+        (ContactId::SELF, ContactId::UNDEFINED) => translated(context, StockMessage::MsgAdded),
+        (ContactId::SELF, _) => translated(context, StockMessage::MsgAddedBy)
+            .replace1(&by_contact.get_stock_name(context).await),
+        (_, ContactId::UNDEFINED) => {
+            translated(context, StockMessage::MsgAddMember).replace1(&whom)
+        }
+        (_, ContactId::SELF) => translated(context, StockMessage::MsgYouAddMember).replace1(&whom),
+        _ => translated(context, StockMessage::MsgAddMemberBy)
             .replace1(&whom)
-            .replace2(&by_contact.get_stock_name(context).await)
+            .replace2(&by_contact.get_stock_name(context).await),
     }
 }
 
-/// Stock string: `Member %1$s removed.` or `You removed member %1$s.` or `Member %1$s removed by %2$s.`
+/// Stock string, one of:
+/// - `Member %1$s removed.`,
+/// - `You removed member %1$s.`,
+/// - `Member %1$s removed by %2$s.`,
+/// - `You were removed by %1$s.`,
+/// - `You were removed.`,
+/// - `You left the group.`,
+/// - `Group left by %1$s.`.
 ///
 /// The `removed_member` and `by_contact` contacts
 /// are looked up in the database to get the display names.
@@ -637,24 +673,27 @@ pub(crate) async fn msg_del_member_local(
     by_contact: ContactId,
 ) -> String {
     let whom = removed_member.get_stock_name(context).await;
-    if by_contact == ContactId::UNDEFINED {
-        translated(context, StockMessage::MsgDelMember).replace1(&whom)
-    } else if by_contact == ContactId::SELF {
-        translated(context, StockMessage::MsgYouDelMember).replace1(&whom)
-    } else {
-        translated(context, StockMessage::MsgDelMemberBy)
+    match (removed_member, by_contact) {
+        // You left the group.
+        (ContactId::SELF, ContactId::SELF) => translated(context, StockMessage::MsgYouLeftGroup),
+        // You were removed.
+        (ContactId::SELF, ContactId::UNDEFINED) => translated(context, StockMessage::MsgRemoved),
+        // You were removed by ...
+        (ContactId::SELF, _) => translated(context, StockMessage::MsgRemovedBy)
+            .replace1(&by_contact.get_stock_name(context).await),
+        // Member ... removed.
+        (_, ContactId::UNDEFINED) => {
+            translated(context, StockMessage::MsgDelMember).replace1(&whom)
+        }
+        // You removed member ...
+        (_, ContactId::SELF) => translated(context, StockMessage::MsgYouDelMember).replace1(&whom),
+        // Group left by ...
+        (a, b) if a == b => translated(context, StockMessage::MsgGroupLeftBy)
+            .replace1(&by_contact.get_stock_name(context).await),
+        // Member ... removed by ...
+        _ => translated(context, StockMessage::MsgDelMemberBy)
             .replace1(&whom)
-            .replace2(&by_contact.get_stock_name(context).await)
-    }
-}
-
-/// Stock string: `You left the group.` or `Group left by %1$s.`.
-pub(crate) async fn msg_group_left_local(context: &Context, by_contact: ContactId) -> String {
-    if by_contact == ContactId::SELF {
-        translated(context, StockMessage::MsgYouLeftGroup)
-    } else {
-        translated(context, StockMessage::MsgGroupLeftBy)
-            .replace1(&by_contact.get_stock_name(context).await)
+            .replace2(&by_contact.get_stock_name(context).await),
     }
 }
 
@@ -831,13 +870,6 @@ pub(crate) fn secure_join_broadcast_qr_description(context: &Context, chat: &Cha
     translated(context, StockMessage::SecureJoinBrodcastQRDescription).replace1(chat.get_name())
 }
 
-/// Stock string: `%1$s verified.`.
-#[allow(dead_code)]
-pub(crate) fn contact_verified(context: &Context, contact: &Contact) -> String {
-    let addr = contact.get_display_name();
-    translated(context, StockMessage::ContactVerified).replace1(addr)
-}
-
 /// Stock string: `Archived chats`.
 pub(crate) fn archived_chats(context: &Context) -> String {
     translated(context, StockMessage::ArchivedChats)
@@ -851,11 +883,6 @@ pub(crate) fn sync_msg_subject(context: &Context) -> String {
 /// Stock string: `This message is used to synchronize data between your devices.`.
 pub(crate) fn sync_msg_body(context: &Context) -> String {
     translated(context, StockMessage::SyncMsgBody)
-}
-
-/// Stock string: `Cannot login as \"%1$s\". Please check...`.
-pub(crate) fn cannot_login(context: &Context, user: &str) -> String {
-    translated(context, StockMessage::CannotLogin).replace1(user)
 }
 
 /// Stock string: `Location streaming enabled.`.

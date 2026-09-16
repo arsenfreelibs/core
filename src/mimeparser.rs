@@ -10,7 +10,7 @@ use anyhow::{Context as _, Result, bail, ensure};
 use deltachat_contact_tools::{addr_cmp, addr_normalize, sanitize_bidi_characters};
 use deltachat_derive::{FromSql, ToSql};
 use format_flowed::unformat_flowed;
-use mailparse::{DispositionType, MailHeader, MailHeaderMap, SingleInfo, addrparse_header};
+use mailparse::{DispositionType, MailHeader, MailHeaderMap, SingleInfo};
 use mime::Mime;
 
 use crate::aheader::Aheader;
@@ -33,17 +33,6 @@ use crate::simplify::{SimplifiedText, simplify};
 use crate::sync::SyncItems;
 use crate::tools::{get_filemeta, parse_receive_headers, time, truncate_msg_text, validate_id};
 use crate::{chatlist_events, location, tools};
-
-/// Public key extracted from `Autocrypt-Gossip`
-/// header with associated information.
-#[derive(Debug)]
-pub struct GossipedKey {
-    /// Public key extracted from `keydata` attribute.
-    pub public_key: SignedPublicKey,
-
-    /// True if `Autocrypt-Gossip` has a `_verified` attribute.
-    pub verified: bool,
-}
 
 /// A parsed MIME message.
 ///
@@ -82,7 +71,9 @@ pub(crate) struct MimeMessage {
     /// The List-Post address is only set for mailing lists. Users can send
     /// messages to this address to post them to the list.
     pub list_post: Option<String>,
-    pub chat_disposition_notification_to: Option<SingleInfo>,
+
+    /// True if the message requests a read receipt (MDN).
+    pub wants_mdn: bool,
 
     /// Decryption error if decryption of the message has failed.
     pub decryption_error: Option<String>,
@@ -97,7 +88,7 @@ pub(crate) struct MimeMessage {
 
     /// The addresses for which there was a gossip header
     /// and their respective gossiped keys.
-    pub gossiped_keys: BTreeMap<String, GossipedKey>,
+    pub gossiped_keys: BTreeMap<String, SignedPublicKey>,
 
     /// Fingerprint of the key in the Autocrypt header.
     ///
@@ -115,6 +106,10 @@ pub(crate) struct MimeMessage {
     pub(crate) group_avatar: Option<AvatarAction>,
     pub(crate) mdn_reports: Vec<Report>,
     pub(crate) delivery_report: Option<DeliveryReport>,
+
+    /// Parsed `Chat-Broadcast-States` header, if any:
+    /// accumulated reaction updates sent by a broadcast channel owner.
+    pub(crate) broadcast_reactions: Option<String>,
 
     /// Standard USENET signature, if any.
     ///
@@ -225,11 +220,11 @@ pub enum SystemMessage {
     /// which is sent by chatmail servers.
     InvalidUnencryptedMail = 13,
 
-    /// 1:1 chats info message telling that SecureJoin has started and the user should wait for it
+    /// Single chats info message telling that SecureJoin has started and the user should wait for it
     /// to complete.
     SecurejoinWait = 14,
 
-    /// 1:1 chats info message telling that SecureJoin is still running, but the user may already
+    /// Single chats info message telling that SecureJoin is still running, but the user may already
     /// send messages.
     SecurejoinWaitTimeout = 15,
 
@@ -259,6 +254,12 @@ pub enum SystemMessage {
 
     /// Group or broadcast channel description changed.
     GroupDescriptionChanged = 70,
+
+    /// Message pinned. The pinned message is referred in `In-Reply-To:` header.
+    MessagePinned = 71,
+
+    /// Message unpinned. The unpinned message is referred in `In-Reply-To:` header.
+    MessageUnpinned = 72,
 }
 
 impl MimeMessage {
@@ -280,18 +281,17 @@ impl MimeMessage {
         let mut past_members = Default::default();
         let mut from = Default::default();
         let mut list_post = Default::default();
-        let mut chat_disposition_notification_to = None;
+        let mut wants_mdn = false;
 
         // Parse IMF headers.
         MimeMessage::merge_headers(
-            context,
             &mut headers,
             &mut headers_removed,
             &mut recipients,
             &mut past_members,
             &mut from,
             &mut list_post,
-            &mut chat_disposition_notification_to,
+            &mut wants_mdn,
             &mail,
         );
         headers_removed.extend(
@@ -525,19 +525,16 @@ impl MimeMessage {
             // let known protected headers from the decrypted
             // part override the unencrypted top-level
 
-            // Signature was checked for original From, so we
-            // do not allow overriding it.
             let mut inner_from = None;
 
             MimeMessage::merge_headers(
-                context,
                 &mut headers,
                 &mut headers_removed,
                 &mut recipients,
                 &mut past_members,
                 &mut inner_from,
                 &mut list_post,
-                &mut chat_disposition_notification_to,
+                &mut wants_mdn,
                 mail,
             );
 
@@ -547,8 +544,7 @@ impl MimeMessage {
                 // but only if the mail was correctly signed. Probably it's ok to not require
                 // encryption here, but let's follow the standard.
                 let gossip_headers = mail.headers.get_all_values("Autocrypt-Gossip");
-                gossiped_keys =
-                    parse_gossip_headers(context, &from.addr, &recipients, gossip_headers).await?;
+                gossiped_keys = parse_gossip_headers(context, gossip_headers).await?;
             }
 
             if let Some(inner_from) = inner_from {
@@ -558,19 +554,22 @@ impl MimeMessage {
                     // This _might_ be because the sender's mail server
                     // replaced the sending address, e.g. in a mailing list.
                     // Or it's because someone is doing some replay attack.
-                    // Resending encrypted messages via mailing lists
-                    // without reencrypting is not useful anyway,
-                    // so we return an error below.
                     warn!(
                         context,
                         "From header in encrypted part doesn't match the outer one",
                     );
 
-                    // Return an error from the parser.
-                    // This will result in creating a tombstone
-                    // and no further message processing
-                    // as if the MIME structure is broken.
-                    bail!("From header is forged");
+                    // If there are no valid signatures,
+                    // possibly because we don't have the public key,
+                    // the message will be associated with the address-contact.
+                    // If the address is possibly forged, we trash the message.
+                    if signatures.is_empty() {
+                        // Return an error from the parser.
+                        // This will result in creating a tombstone
+                        // and no further message processing
+                        // as if the MIME structure is broken.
+                        bail!("From header is forged");
+                    }
                 }
                 from = inner_from;
             }
@@ -639,7 +638,7 @@ impl MimeMessage {
             list_post,
             from,
             incoming,
-            chat_disposition_notification_to,
+            wants_mdn,
             decryption_error: mail.err().map(|err| format!("{err:#}")),
 
             // only non-empty if it was a valid autocrypt message
@@ -656,6 +655,7 @@ impl MimeMessage {
             user_avatar: None,
             group_avatar: None,
             delivery_report: None,
+            broadcast_reactions: None,
             footer: None,
             is_mime_modified: false,
             decoded_data: Vec::new(),
@@ -671,7 +671,7 @@ impl MimeMessage {
                 parser.parse_mime_recursive(context, mail, false).await?;
             }
             Err(err) => {
-                let txt = "[This message cannot be decrypted.\n\n• It might already help to simply reply to this message and ask the sender to send the message again.\n\n• If you just re-installed Delta Chat then it is best if you re-setup Delta Chat now and choose \"Add as second device\" or import a backup.]";
+                let txt = "[This message cannot be decrypted.\n\n• It might already help to simply reply to this message and ask the sender to send the message again.\n\n• If you just re-installed Alt Chat then it is best if you re-setup Alt Chat now and choose \"Add as second device\" or import a backup.]";
 
                 let part = Part {
                     typ: Viewtype::Text,
@@ -735,6 +735,10 @@ impl MimeMessage {
                 self.is_system_message = SystemMessage::CallAccepted;
             } else if value == "call-ended" {
                 self.is_system_message = SystemMessage::CallEnded;
+            } else if value == "message-pinned" {
+                self.is_system_message = SystemMessage::MessagePinned;
+            } else if value == "message-unpinned" {
+                self.is_system_message = SystemMessage::MessageUnpinned;
             }
         } else if self.get_header(HeaderDef::ChatGroupMemberRemoved).is_some() {
             self.is_system_message = SystemMessage::MemberRemovedFromGroup;
@@ -790,6 +794,12 @@ impl MimeMessage {
                 part.param.set(Param::WebrtcHasVideoInitially, has_video);
             }
         }
+    }
+
+    fn parse_broadcast_reactions_header(&mut self) {
+        self.broadcast_reactions = self
+            .get_header(HeaderDef::ChatBroadcastStates)
+            .map(|s| s.to_string());
     }
 
     /// Squashes mutitpart chat messages with attachment into single-part messages.
@@ -873,6 +883,7 @@ impl MimeMessage {
         self.parse_system_message_headers();
         self.parse_avatar_headers(context)?;
         self.parse_videochat_headers();
+        self.parse_broadcast_reactions_header();
         if self.delivery_report.is_none() {
             self.squash_attachment_parts();
         }
@@ -922,26 +933,13 @@ impl MimeMessage {
         self.parse_attachments();
 
         // See if an MDN is requested from the other side
-        let mut wants_mdn = false;
         if self.decryption_error.is_none()
             && (!self.parts.is_empty() || matches!(&self.pre_message, PreMessageMode::Pre { .. }))
-            && let Some(ref dn_to) = self.chat_disposition_notification_to
+            && self.wants_mdn
+            && self.incoming
+            && let Some(part) = self.parts.last_mut()
         {
-            // Check that the message is not outgoing.
-            let from = &self.from.addr;
-            if !context.is_self_addr(from).await? {
-                if from.to_lowercase() == dn_to.addr.to_lowercase() {
-                    wants_mdn = true;
-                    if let Some(part) = self.parts.last_mut() {
-                        part.param.set_int(Param::WantsMdn, 1);
-                    }
-                } else {
-                    warn!(
-                        context,
-                        "{} requested a read receipt to {}, ignoring", from, dn_to.addr
-                    );
-                }
-            }
+            part.param.set_int(Param::WantsMdn, 1);
         }
 
         // If there were no parts, especially a non-DC mail user may
@@ -953,7 +951,7 @@ impl MimeMessage {
                 typ: Viewtype::Text,
                 ..Default::default()
             };
-            if wants_mdn {
+            if self.wants_mdn && self.incoming {
                 part.param.set_int(Param::WantsMdn, 1);
             }
             if let Some(ref subject) = self.get_subject()
@@ -1024,6 +1022,24 @@ impl MimeMessage {
     /// valid signature.
     pub fn was_encrypted(&self) -> bool {
         self.signature.is_some()
+    }
+
+    /// Returns the fingerprints of all keys distributed by this message:
+    /// - keys from Autocrypt-Gossip headers
+    /// - the key from the sender's Autocrypt header ("self-gossip")
+    ///
+    /// Nothing is returned unless the message was correctly encrypted.
+    pub(crate) fn distributed_key_fingerprints(&self) -> Vec<String> {
+        let sender_fingerprint = if self.was_encrypted() {
+            self.autocrypt_fingerprint.clone()
+        } else {
+            None
+        };
+        self.gossiped_keys
+            .values()
+            .map(|gossiped_key| gossiped_key.dc_fingerprint().hex())
+            .chain(sender_fingerprint)
+            .collect()
     }
 
     /// Returns whether the email contains a `chat-version` header.
@@ -1719,14 +1735,13 @@ impl MimeMessage {
     /// outer parts.
     #[allow(clippy::too_many_arguments)]
     fn merge_headers(
-        context: &Context,
         headers: &mut HashMap<String, String>,
         headers_removed: &mut HashSet<String>,
         recipients: &mut Vec<SingleInfo>,
         past_members: &mut Vec<SingleInfo>,
         from: &mut Option<SingleInfo>,
         list_post: &mut Option<String>,
-        chat_disposition_notification_to: &mut Option<SingleInfo>,
+        wants_mdn: &mut bool,
         part: &mailparse::ParsedMail,
     ) {
         let fields = &part.headers;
@@ -1738,36 +1753,35 @@ impl MimeMessage {
                 .extract_if(|k, _v| has_header_protection || is_protected(k))
                 .map(|(k, _v)| k.to_string()),
         );
+
+        if has_header_protection {
+            *wants_mdn = false;
+        }
         for field in fields {
             // lowercasing all headers is technically not correct, but makes things work better
             let key = field.get_key().to_lowercase();
             if key == HeaderDef::ChatDispositionNotificationTo.get_headername() {
-                match addrparse_header(field) {
-                    Ok(addrlist) => {
-                        *chat_disposition_notification_to = addrlist.extract_single_info();
-                    }
-                    Err(e) => warn!(context, "Could not read {} address: {}", key, e),
-                }
+                *wants_mdn = true;
             } else {
                 let value = field.get_value();
                 headers.insert(key.to_string(), value);
             }
         }
         let recipients_new = get_recipients(fields);
-        if !recipients_new.is_empty() {
+        if has_header_protection || !recipients_new.is_empty() {
             *recipients = recipients_new;
         }
         let past_members_addresses =
             get_all_addresses_from_header(fields, "chat-group-past-members");
-        if !past_members_addresses.is_empty() {
+        if has_header_protection || !past_members_addresses.is_empty() {
             *past_members = past_members_addresses;
         }
         let from_new = get_from(fields);
-        if from_new.is_some() {
+        if has_header_protection || from_new.is_some() {
             *from = from_new;
         }
         let list_post_new = get_list_post(fields);
-        if list_post_new.is_some() {
+        if has_header_protection || list_post_new.is_some() {
             *list_post = list_post_new;
         }
     }
@@ -2090,16 +2104,12 @@ fn remove_header(
 /// Parses `Autocrypt-Gossip` headers from the email,
 /// saves the keys into the `public_keys` table,
 /// and returns them in a HashMap<address, public key>.
-///
-/// * `from`: The address which sent the message currently being parsed
 async fn parse_gossip_headers(
     context: &Context,
-    from: &str,
-    recipients: &[SingleInfo],
     gossip_headers: Vec<String>,
-) -> Result<BTreeMap<String, GossipedKey>> {
+) -> Result<BTreeMap<String, SignedPublicKey>> {
     // XXX split the parsing from the modification part
-    let mut gossiped_keys: BTreeMap<String, GossipedKey> = Default::default();
+    let mut gossiped_keys: BTreeMap<String, SignedPublicKey> = Default::default();
 
     for value in &gossip_headers {
         let header = match Aheader::from_str(value) {
@@ -2110,35 +2120,11 @@ async fn parse_gossip_headers(
             }
         };
 
-        if !recipients
-            .iter()
-            .any(|info| addr_cmp(&info.addr, &header.addr))
-        {
-            warn!(
-                context,
-                "Ignoring gossiped \"{}\" as the address is not in To/Cc list.", &header.addr,
-            );
-            continue;
-        }
-        if addr_cmp(from, &header.addr) {
-            // Non-standard, might not be necessary to have this check here
-            warn!(
-                context,
-                "Ignoring gossiped \"{}\" as it equals the From address", &header.addr,
-            );
-            continue;
-        }
-
         import_public_key(context, &header.public_key)
             .await
             .context("Failed to import Autocrypt-Gossip key")?;
 
-        let gossiped_key = GossipedKey {
-            public_key: header.public_key,
-
-            verified: header.verified,
-        };
-        gossiped_keys.insert(header.addr.to_lowercase(), gossiped_key);
+        gossiped_keys.insert(header.addr.to_lowercase(), header.public_key);
     }
 
     Ok(gossiped_keys)

@@ -6,8 +6,6 @@ use deltachat_derive::{FromSql, ToSql};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC};
 use serde::{Deserialize, Serialize};
 
-use crate::chat::ChatId;
-
 pub static DC_VERSION_STR: &str = env!("CARGO_PKG_VERSION");
 
 /// Set of characters to percent-encode in email addresses and names.
@@ -70,15 +68,6 @@ pub(crate) const DC_RESEND_USER_AVATAR_DAYS: i64 = 14;
 // "90 days" has proven to be too short at some point (user were informed but there was no update)
 pub(crate) const DC_OUTDATED_WARNING_DAYS: i64 = 183;
 
-/// messages that should be deleted get this chat_id; the messages are deleted from the working thread later then. This is also needed as rfc724_mid should be preset as long as the message is not deleted on the server (otherwise it is downloaded again)
-pub const DC_CHAT_ID_TRASH: ChatId = ChatId::new(3);
-/// only an indicator in a chatlist
-pub const DC_CHAT_ID_ARCHIVED_LINK: ChatId = ChatId::new(6);
-/// only an indicator in a chatlist
-pub const DC_CHAT_ID_ALLDONE_HINT: ChatId = ChatId::new(7);
-/// larger chat IDs are "real" chats, their messages are "real" messages.
-pub const DC_CHAT_ID_LAST_SPECIAL: ChatId = ChatId::new(9);
-
 /// Chat type.
 #[derive(
     Debug,
@@ -99,9 +88,9 @@ pub const DC_CHAT_ID_LAST_SPECIAL: ChatId = ChatId::new(9);
 )]
 #[repr(u32)]
 pub enum Chattype {
-    /// A 1:1 chat, i.e. a normal chat with a single contact.
+    /// A single chat (a chat with a single contact).
     ///
-    /// Created by [`ChatId::create_for_contact`].
+    /// Created by [`crate::chat::ChatId::create_for_contact`].
     Single = 100,
 
     /// Group chat.
@@ -141,9 +130,6 @@ pub enum Chattype {
     InBroadcast = 165,
 }
 
-pub const DC_MSG_ID_DAYMARKER: u32 = 9;
-pub const DC_MSG_ID_LAST_SPECIAL: u32 = 9;
-
 /// String that indicates that something is left out or truncated.
 pub(crate) const DC_ELLIPSIS: &str = "[...]";
 // how many lines desktop can display when fullscreen (fullscreen at zoomlevel 1x)
@@ -162,27 +148,9 @@ pub const DC_DESIRED_TEXT_LINE_LEN: usize = 100;
 /// `char`s), not Unicode Grapheme Clusters.
 pub const DC_DESIRED_TEXT_LEN: usize = DC_DESIRED_TEXT_LINE_LEN * DC_DESIRED_TEXT_LINES;
 
-// Flags for configuring IMAP and SMTP servers.
-// These flags are optional
-// and may be set together with the username, password etc.
-// via dc_set_config() using the key "server_flags".
-
-/// Force OAuth2 authorization.
-///
-/// This flag does not skip automatic configuration.
-/// Before calling configure() with DC_LP_AUTH_OAUTH2 set,
-/// the user has to confirm access at the URL returned by dc_get_oauth2_url().
-pub const DC_LP_AUTH_OAUTH2: i32 = 0x2;
-
-/// Force NORMAL authorization, this is the default.
-/// If this flag is set, automatic configuration is skipped.
-pub const DC_LP_AUTH_NORMAL: i32 = 0x4;
-
-/// if none of these flags are set, the default is chosen
-pub const DC_LP_AUTH_FLAGS: i32 = DC_LP_AUTH_OAUTH2 | DC_LP_AUTH_NORMAL;
-
-// max. weight of images to send w/o recoding
-pub const BALANCED_IMAGE_BYTES: usize = 500_000;
+/// max. weight of images to send w/o recoding.
+// this is an estimation to the size we get when recoding high detail images.
+pub const BALANCED_IMAGE_BYTES: usize = 940_000;
 pub const WORSE_IMAGE_BYTES: usize = 130_000;
 
 // max. width/height and bytes of an avatar
@@ -192,23 +160,17 @@ pub(crate) const WORSE_AVATAR_SIZE: u32 = 256;
 pub(crate) const WORSE_AVATAR_BYTES: usize = 20_000; // this also fits to Outlook servers don't allowing headers larger than 32k.
 
 // max. width/height of images scaled down because of being too huge
-pub const BALANCED_IMAGE_SIZE: u32 = 1280;
+pub const BALANCED_IMAGE_SIZE: u32 = 1760;
 pub const WORSE_IMAGE_SIZE: u32 = 640;
 
 /// Limit for received images size. Bigger images become `Viewtype::File` to avoid excessive memory
 /// usage by UIs.
 pub const MAX_RCVD_IMAGE_PIXELS: u32 = 50_000_000;
 
-// If more recipients are needed in SMTP's `RCPT TO:` header, the recipient list is split into
-// chunks. This does not affect MIME's `To:` header. Can be overwritten by setting
-// `max_smtp_rcpt_to` in the provider db.
-pub(crate) const DEFAULT_MAX_SMTP_RCPT_TO: usize = 50;
-
-/// Same as `DEFAULT_MAX_SMTP_RCPT_TO`, but for chatmail relays.
-pub(crate) const DEFAULT_CHATMAIL_MAX_SMTP_RCPT_TO: usize = 999;
-
-/// How far the last quota check needs to be in the past to be checked by the background function (in seconds).
-pub(crate) const DC_BACKGROUND_FETCH_QUOTA_CHECK_RATELIMIT: u64 = 12 * 60 * 60; // 12 hours
+// Fallback for the maximum number of recipients in SMTP's `RCPT TO:`;
+// recipient lists exceeding the limit are sent in chunks.
+// Relays typically advertise their limit via IMAP METADATA.
+pub(crate) const DEFAULT_MAX_SMTP_RCPT_TO: u32 = 50;
 
 /// How far in the future the sender timestamp of a message is allowed to be, in seconds. Also used
 /// in the group membership consistency algo to reject outdated membership changes.
@@ -221,19 +183,8 @@ pub(crate) const EDITED_PREFIX: &str = "✏️";
 /// Period between `sql::housekeeping()` runs.
 pub(crate) const HOUSEKEEPING_PERIOD: i64 = 24 * 60 * 60;
 
-pub(crate) const BROADCAST_INCOMPATIBILITY_MSG: &str = r#"The up to now "experimental channels feature" is about to become an officially supported one. By that, privacy will be improved, it will become faster, and less traffic will be consumed.
-
-As we do not guarantee feature-stability for such experiments, this means, that you will need to create the channel again. 
-
-Here is what to do:
- • Create a new channel
- • Tap on the channel name
- • Tap on "QR Invite Code"
- • Have all recipients scan the QR code, or send them the link
-
-If you have any questions, please send an email to altchat.me@gmail.com or ask at https://support.alt-chat.me/."#;
-
-/// How many recent messages should be re-sent to a new broadcast member.
+/// Number of recent messages that should be resent to a new broadcast member.
+/// Additionally, up to this amount of pinned messages will be resent.
 pub(crate) const N_MSGS_TO_NEW_BROADCAST_MEMBER: usize = 10;
 
 #[cfg(test)]

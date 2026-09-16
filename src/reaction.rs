@@ -14,20 +14,27 @@
 //! possible to remove the reaction by sending an empty string as a reaction,
 //! even though RFC 9078 requires at least one emoji to be sent.
 
+pub(crate) mod broadcast_reactions;
+
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::chat::{Chat, ChatId, send_msg};
 use crate::chatlist_events;
+use crate::constants::Chattype;
 use crate::contact::ContactId;
 use crate::context::Context;
 use crate::events::EventType;
 use crate::message::{Message, MsgId, rfc724_mid_exists};
 use crate::param::Param;
+use crate::reaction::broadcast_reactions::{
+    is_allowed_reaction, load_broadcast_reactions, modify_frequencies, refine_frequencies,
+    save_broadcast_reactions,
+};
 
 /// A single reaction.
 #[derive(Debug, Default, Clone, Deserialize, Eq, PartialEq, Serialize)]
@@ -70,78 +77,46 @@ impl Reaction {
     }
 }
 
+/// A single reaction with frequency and sender flag.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReactionFrequency {
+    /// The reaction emoji.
+    pub reaction: Reaction,
+
+    /// Number of contacts that reacted with this emoji.
+    pub count: usize,
+
+    /// True if `ContactId::SELF` is among the contacts that reacted with this emoji.
+    pub is_from_self: bool,
+}
+
 /// Structure representing all reactions to a particular message.
 #[derive(Debug)]
 pub struct Reactions {
+    /// Unique reactions and their frequencies.
+    pub frequencies: Vec<ReactionFrequency>,
+
     /// Map from a contact to its reaction to message.
-    reactions: BTreeMap<ContactId, Reaction>,
+    /// For channels subscribers, this map is empty or contains `ContactId::SELF` only.
+    pub by_contact: BTreeMap<ContactId, Reaction>,
 }
 
 impl Reactions {
-    /// Returns vector of contacts that reacted to the message.
-    pub fn contacts(&self) -> Vec<ContactId> {
-        self.reactions.keys().copied().collect()
-    }
-
-    /// Returns reaction of a given contact to message.
-    ///
-    /// If contact did not react to message or removed the reaction,
-    /// this method returns an empty reaction.
-    pub fn get(&self, contact_id: ContactId) -> Reaction {
-        self.reactions.get(&contact_id).cloned().unwrap_or_default()
-    }
-
     /// Returns true if the message has no reactions.
     pub fn is_empty(&self) -> bool {
-        self.reactions.is_empty()
-    }
-
-    /// Returns a map from emojis to their frequencies.
-    #[expect(clippy::arithmetic_side_effects)]
-    pub fn emoji_frequencies(&self) -> BTreeMap<String, usize> {
-        let mut emoji_frequencies: BTreeMap<String, usize> = BTreeMap::new();
-        for reaction in self.reactions.values() {
-            emoji_frequencies
-                .entry(reaction.as_str().to_string())
-                .and_modify(|x| *x += 1)
-                .or_insert(1);
-        }
-        emoji_frequencies
-    }
-
-    /// Returns a vector of emojis
-    /// sorted in descending order of frequencies.
-    ///
-    /// This function can be used to display the reactions in
-    /// the message bubble in the UIs.
-    pub fn emoji_sorted_by_frequency(&self) -> Vec<(String, usize)> {
-        let mut emoji_frequencies: Vec<(String, usize)> =
-            self.emoji_frequencies().into_iter().collect();
-        emoji_frequencies.sort_by(|(a, a_count), (b, b_count)| {
-            match a_count.cmp(b_count).reverse() {
-                Ordering::Equal => a.cmp(b),
-                other => other,
-            }
-        });
-        emoji_frequencies
-    }
-
-    /// Returns an iterator of the contacts that reacted and their corresponding reactions.
-    pub fn iter(&self) -> impl Iterator<Item = (&ContactId, &Reaction)> {
-        self.reactions.iter()
+        self.frequencies.is_empty()
     }
 }
 
 impl fmt::Display for Reactions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let emoji_frequencies = self.emoji_sorted_by_frequency();
         let mut first = true;
-        for (emoji, frequency) in emoji_frequencies {
+        for entry in &self.frequencies {
             if !first {
                 write!(f, " ")?;
             }
             first = false;
-            write!(f, "{emoji}{frequency}")?;
+            write!(f, "{}{}", entry.reaction.as_str(), entry.count)?;
         }
         Ok(())
     }
@@ -155,6 +130,17 @@ async fn set_msg_id_reaction(
     timestamp: i64,
     reaction: &Reaction,
 ) -> Result<()> {
+    let mut chat = Chat::load_from_db(context, chat_id).await?;
+    let old_reactions = get_msg_reactions(context, msg_id).await?;
+    let old_self_reaction = old_reactions.by_contact.get(&ContactId::SELF);
+
+    if matches!(chat.typ, Chattype::OutBroadcast | Chattype::InBroadcast)
+        && !is_allowed_reaction(reaction)
+    {
+        info!(context, "Reaction {} filtered.", reaction.as_str());
+        return Ok(());
+    }
+
     if reaction.is_empty() {
         // Simply remove the record instead of setting it to empty string.
         context
@@ -177,7 +163,6 @@ async fn set_msg_id_reaction(
                 (msg_id, contact_id, reaction.as_str()),
             )
             .await?;
-        let mut chat = Chat::load_from_db(context, chat_id).await?;
         if chat
             .param
             .update_timestamp(Param::LastReactionTimestamp, timestamp)?
@@ -190,6 +175,25 @@ async fn set_msg_id_reaction(
         }
     }
 
+    if chat.typ == Chattype::OutBroadcast {
+        context
+            .sql
+            .execute(
+                "INSERT INTO reactions_need_broadcast (chat_id, msg_id)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(chat_id, msg_id) DO NOTHING;",
+                (chat_id, msg_id),
+            )
+            .await?;
+    } else if chat.typ == Chattype::InBroadcast && contact_id == ContactId::SELF {
+        // for immediate feedback, alter `broadcasted_reactions` directly.
+        // this "dirty state" will overwritten on next broadcast,
+        // however, means that `broadcasted_reactions` counts can be assumemd to include SELF-reaction eventually.
+        let mut frequencies = load_broadcast_reactions(context, msg_id).await?;
+        modify_frequencies(&mut frequencies, old_self_reaction, reaction);
+        save_broadcast_reactions(context, msg_id, &frequencies).await?;
+    }
+
     context.emit_event(EventType::ReactionsChanged {
         chat_id,
         msg_id,
@@ -199,15 +203,55 @@ async fn set_msg_id_reaction(
     Ok(())
 }
 
+/// Adds or updates a pending reaction to `pending_reactions` table.
+async fn set_pending_reaction(
+    context: &Context,
+    rfc724_mid: &str,
+    contact_id: ContactId,
+    timestamp: i64,
+    reaction: &Reaction,
+) -> Result<()> {
+    if reaction.is_empty() {
+        context
+            .sql
+            .execute(
+                "DELETE FROM pending_reactions
+                 WHERE rfc724_mid = ?1
+                 AND contact_id = ?2",
+                (rfc724_mid, contact_id),
+            )
+            .await?;
+    } else {
+        context
+            .sql
+            .execute(
+                "INSERT INTO pending_reactions (rfc724_mid, contact_id, reaction, timestamp)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(rfc724_mid, contact_id)
+                 DO UPDATE SET reaction=excluded.reaction, timestamp=excluded.timestamp",
+                (rfc724_mid, contact_id, reaction.as_str(), timestamp),
+            )
+            .await?;
+    }
+    Ok(())
+}
+
 /// Sends a reaction to message `msg_id`, overriding previously sent reactions.
 ///
 /// `reaction` is a string consisting of a single emoji. Use
 /// empty string to retract a reaction.
 pub async fn send_reaction(context: &Context, msg_id: MsgId, reaction: &str) -> Result<MsgId> {
+    let reaction = Reaction::new(reaction);
     let msg = Message::load_from_db(context, msg_id).await?;
     let chat_id = msg.chat_id;
+    let chat = Chat::load_from_db(context, chat_id).await?;
 
-    let reaction = Reaction::new(reaction);
+    if matches!(chat.typ, Chattype::OutBroadcast | Chattype::InBroadcast)
+        && !is_allowed_reaction(&reaction)
+    {
+        bail!("Reaction not allowed: {}", reaction.as_str());
+    }
+
     let mut reaction_msg = Message::new_text(reaction.as_str().to_string());
     reaction_msg.set_reaction();
     reaction_msg.in_reply_to = Some(msg.rfc724_mid);
@@ -235,6 +279,9 @@ pub async fn send_reaction(context: &Context, msg_id: MsgId, reaction: &str) -> 
 ///
 /// `reaction` is string representing the emoji. It can be empty
 /// if contact wants to remove the reaction.
+///
+/// Delegates to [`set_msg_reaction_if_present`],
+/// and if message is not present, fallbacks to [`set_pending_reaction`].
 pub(crate) async fn set_msg_reaction(
     context: &Context,
     in_reply_to: &str,
@@ -244,8 +291,43 @@ pub(crate) async fn set_msg_reaction(
     reaction: Reaction,
     is_incoming_fresh: bool,
 ) -> Result<()> {
+    if !set_msg_reaction_if_present(
+        context,
+        in_reply_to,
+        chat_id,
+        contact_id,
+        timestamp,
+        &reaction,
+        is_incoming_fresh,
+    )
+    .await?
+    {
+        info!(
+            context,
+            "Can't assign reaction to unknown message with Message-ID {}; inserting into pending table.",
+            in_reply_to
+        );
+        let rfc724_mid = in_reply_to.trim_start_matches('<').trim_end_matches('>');
+        set_pending_reaction(context, rfc724_mid, contact_id, timestamp, &reaction).await?
+    }
+    Ok(())
+}
+
+/// Similar to [`set_msg_reaction`],
+/// but does not create a row in `pending_messages` if message is not present.
+///
+/// Returns `Ok(true)` if message was present and `Ok(false)` if not.
+pub(crate) async fn set_msg_reaction_if_present(
+    context: &Context,
+    in_reply_to: &str,
+    chat_id: ChatId,
+    contact_id: ContactId,
+    timestamp: i64,
+    reaction: &Reaction,
+    is_incoming_fresh: bool,
+) -> Result<bool> {
     if let Some(msg_id) = rfc724_mid_exists(context, in_reply_to).await? {
-        set_msg_id_reaction(context, msg_id, chat_id, contact_id, timestamp, &reaction).await?;
+        set_msg_id_reaction(context, msg_id, chat_id, contact_id, timestamp, reaction).await?;
 
         if is_incoming_fresh
             && !reaction.is_empty()
@@ -255,21 +337,128 @@ pub(crate) async fn set_msg_reaction(
                 chat_id,
                 contact_id,
                 msg_id,
-                reaction,
+                reaction: reaction.clone(),
             });
         }
-    } else {
-        info!(
-            context,
-            "Can't assign reaction to unknown message with Message-ID {}", in_reply_to
-        );
+        return Ok(true);
     }
+    Ok(false)
+}
+
+/// Applies pending reactions to message `rfc724_mid`, assuming `chat_id`.
+///
+/// Does not check if the `chat_id` is correct for this message.
+pub(crate) async fn apply_pending_reactions(
+    context: &Context,
+    rfc724_mid: &str,
+    chat_id: ChatId,
+) -> Result<()> {
+    let pending_reactions: BTreeMap<ContactId, (Reaction, i64)> = context
+        .sql
+        .query_map_collect(
+            "SELECT contact_id, reaction, timestamp
+            FROM pending_reactions
+            WHERE rfc724_mid=?",
+            (rfc724_mid,),
+            |row| {
+                let contact_id: ContactId = row.get(0)?;
+                let reaction: Reaction = Reaction::new(row.get::<_, String>(1)?.as_str());
+                let timestamp: i64 = row.get(2)?;
+                Ok((contact_id, (reaction, timestamp)))
+            },
+        )
+        .await?;
+
+    if pending_reactions.is_empty() {
+        return Ok(());
+    }
+
+    info!(
+        context,
+        "Applying {} pending reactions to {}.",
+        pending_reactions.len(),
+        rfc724_mid
+    );
+
+    for (contact_id, (reaction, timestamp)) in pending_reactions {
+        // We know whether the reaction message is incoming,
+        // but it is unclear whether it's still fresh (i.e. unnoticed by the user).
+        // To be safe, always count it as fresh, to notify the user rather once too often than once too few.
+        // This is only relevant in edge cases, anyway.
+        let is_incoming_fresh = contact_id != ContactId::SELF;
+        if !set_msg_reaction_if_present(
+            context,
+            rfc724_mid,
+            chat_id,
+            contact_id,
+            timestamp,
+            &reaction,
+            is_incoming_fresh,
+        )
+        .await?
+        {
+            bail!("Message {rfc724_mid} is not present, can't apply pending reactions");
+        }
+    }
+
+    // Note: race condition can't happen here,
+    // as at this point the message is already added to the DB,
+    // so no new pending reactions with this rfc724_mid will be added in meantime.
+    // (Assuming this function is used after receiving the message.)
+    context
+        .sql
+        .execute(
+            "DELETE FROM pending_reactions WHERE rfc724_mid=?",
+            (rfc724_mid,),
+        )
+        .await?;
+
     Ok(())
 }
 
+/// Returns unique reactions with their frequency and whether self reacted,
+/// sorted in descending order of frequency.
+fn calc_frequencies(by_contact: &BTreeMap<ContactId, Reaction>) -> Vec<ReactionFrequency> {
+    let mut self_reaction = Reaction::new("");
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for (contact_id, reaction) in by_contact {
+        let count = counts.entry(reaction.as_str()).or_insert(0);
+        *count = count.saturating_add(1);
+        if *contact_id == ContactId::SELF {
+            self_reaction = reaction.clone();
+        }
+    }
+
+    let mut frequencies: Vec<ReactionFrequency> = counts
+        .into_iter()
+        .map(|(emoji, count)| ReactionFrequency {
+            reaction: Reaction::new(emoji),
+            count,
+            is_from_self: !self_reaction.is_empty() && self_reaction.as_str() == emoji,
+        })
+        .collect();
+
+    sort_frequencies(&mut frequencies);
+    frequencies
+}
+
+/// Sorts reaction frequencies by descending count. when equal, order by emoji string.
+///
+/// This is the order UIs shall use to display reactions in the message bubble.
+pub(crate) fn sort_frequencies(frequencies: &mut [ReactionFrequency]) {
+    frequencies.sort_by(|a, b| match b.count.cmp(&a.count) {
+        Ordering::Equal => a.reaction.as_str().cmp(b.reaction.as_str()),
+        other => other,
+    });
+}
+
 /// Returns a structure containing all reactions to the message.
+///
+/// For displaying, UI shall use the `frequencies` field, which is already sorted accordingly.
+/// `frequencies` should also be used to check for SELF-reaction.
+/// For detailed reaction information outside broadcast channel subscribers, UI can use the `by_contact` table.
 pub async fn get_msg_reactions(context: &Context, msg_id: MsgId) -> Result<Reactions> {
-    let mut reactions: BTreeMap<ContactId, Reaction> = context
+    let mut by_contact: BTreeMap<ContactId, Reaction> = context
         .sql
         .query_map_collect(
             "SELECT contact_id, reaction FROM reactions WHERE msg_id=?",
@@ -281,8 +470,19 @@ pub async fn get_msg_reactions(context: &Context, msg_id: MsgId) -> Result<React
             },
         )
         .await?;
-    reactions.retain(|_contact, reaction| !reaction.is_empty());
-    Ok(Reactions { reactions })
+    by_contact.retain(|_contact, reaction| !reaction.is_empty());
+
+    let broadcasted_reactions = load_broadcast_reactions(context, msg_id).await?;
+    let frequencies = if !broadcasted_reactions.is_empty() {
+        refine_frequencies(broadcasted_reactions, &by_contact)
+    } else {
+        calc_frequencies(&by_contact)
+    };
+
+    Ok(Reactions {
+        frequencies,
+        by_contact,
+    })
 }
 
 impl Chat {
@@ -351,6 +551,20 @@ mod tests {
     use crate::test_utils::TestContextManager;
     use crate::tools::SystemTime;
     use std::time::Duration;
+
+    impl Reactions {
+        fn contacts(&self) -> Vec<ContactId> {
+            self.by_contact.keys().copied().collect()
+        }
+
+        // Returns reaction of a given contact to message or an empty reaction.
+        fn get(&self, contact_id: ContactId) -> Reaction {
+            self.by_contact
+                .get(&contact_id)
+                .cloned()
+                .unwrap_or_default()
+        }
+    }
 
     #[test]
     fn test_parse_reaction() {
@@ -704,12 +918,75 @@ Content-Disposition: reaction\n\
             .unwrap();
         let reactions = get_msg_reactions(&alice, alice_msg.sender_msg_id).await?;
         assert_eq!(reactions.to_string(), "👍2");
+        assert_eq!(reactions.frequencies.len(), 1);
+        assert_eq!(reactions.frequencies[0].reaction.as_str(), "👍");
+        assert_eq!(reactions.frequencies[0].count, 2);
 
-        assert_eq!(
-            reactions.emoji_sorted_by_frequency(),
-            vec![("👍".to_string(), 2)]
-        );
+        Ok(())
+    }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_send_out_of_order_reaction() -> Result<()> {
+        let mut tcm = TestContextManager::new();
+        let alice = tcm.alice().await;
+        let bob = tcm.bob().await;
+        let charlie = tcm.charlie().await;
+
+        tcm.send_recv_accept(&alice, &bob, "hi").await;
+        tcm.send_recv_accept(&alice, &charlie, "hi").await;
+
+        let chat_alice = alice.create_chat(&bob).await;
+        let groupchat_alice = alice
+            .create_group_with_members("test", &[&bob, &charlie])
+            .await;
+
+        // one to one
+
+        {
+            let alice_msg = alice.send_text(chat_alice.id, "test").await;
+
+            send_reaction(&alice, alice_msg.sender_msg_id, "👍").await?;
+            let reaction_msg = alice.pop_sent_msg().await;
+
+            bob.recv_msg_hidden(&reaction_msg).await;
+            let msg = bob.recv_msg(&alice_msg).await;
+            assert_eq!(get_msg_reactions(&bob, msg.id).await?.by_contact.len(), 1);
+        }
+
+        // group
+
+        {
+            let alice_msg = alice.send_text(groupchat_alice, "test").await;
+
+            send_reaction(&alice, alice_msg.sender_msg_id, "👍").await?;
+            let reaction_msg_alice = alice.pop_sent_msg().await;
+
+            let charlie_msg = charlie.recv_msg(&alice_msg).await;
+            send_reaction(&charlie, charlie_msg.id, "👍").await?;
+            let reaction_msg_charlie = charlie.pop_sent_msg().await;
+
+            bob.recv_msg_hidden(&reaction_msg_alice).await;
+            bob.recv_msg_hidden(&reaction_msg_charlie).await;
+            let msg = bob.recv_msg(&alice_msg).await;
+            assert_eq!(get_msg_reactions(&bob, msg.id).await?.by_contact.len(), 2);
+        }
+
+        // react and remove reaction
+
+        {
+            let alice_msg = alice.send_text(chat_alice.id, "test").await;
+
+            send_reaction(&alice, alice_msg.sender_msg_id, "👍").await?;
+            let reaction_msg = alice.pop_sent_msg().await;
+
+            send_reaction(&alice, alice_msg.sender_msg_id, "").await?;
+            let remove_reaction_msg = alice.pop_sent_msg().await;
+
+            bob.recv_msg_hidden(&reaction_msg).await;
+            bob.recv_msg_hidden(&remove_reaction_msg).await;
+            let msg = bob.recv_msg(&alice_msg).await;
+            assert!(get_msg_reactions(&bob, msg.id).await?.is_empty());
+        }
         Ok(())
     }
 
@@ -823,7 +1100,7 @@ Content-Disposition: reaction\n\
         send_reaction(&alice, msg_id, "🐫").await?;
         assert_summary(&alice, "You reacted 🐫 to \"foo\"").await;
         let reactions = get_msg_reactions(&alice, msg_id).await?;
-        assert_eq!(reactions.reactions.len(), 1);
+        assert_eq!(reactions.by_contact.len(), 1);
 
         // Alice forwards that message to Bob: Reactions are not forwarded, the message is prefixed by "Forwarded".
         let bob_id = Contact::create(&alice, "", "bob@example.net").await?;
@@ -833,7 +1110,7 @@ Content-Disposition: reaction\n\
         let chatlist = Chatlist::try_load(&alice, 0, None, None).await.unwrap();
         let forwarded_msg_id = chatlist.get_msg_id(0)?.unwrap();
         let reactions = get_msg_reactions(&alice, forwarded_msg_id).await?;
-        assert!(reactions.reactions.is_empty()); // reactions are not forwarded
+        assert!(reactions.is_empty()); // reactions are not forwarded
 
         // Alice reacts to forwarded message:
         // For reaction summary neither original message author nor "Forwarded" prefix is shown
@@ -841,7 +1118,7 @@ Content-Disposition: reaction\n\
         send_reaction(&alice, forwarded_msg_id, "🐳").await?;
         assert_summary(&alice, "You reacted 🐳 to \"foo\"").await;
         let reactions = get_msg_reactions(&alice, msg_id).await?;
-        assert_eq!(reactions.reactions.len(), 1);
+        assert_eq!(reactions.by_contact.len(), 1);
 
         Ok(())
     }
@@ -964,11 +1241,10 @@ Content-Transfer-Encoding: base64\r
         let encrypted_payload = pk_encrypt(
             plain_text.as_bytes().to_vec(),
             public_keys_for_encryption,
-            alice_secret_key,
+            Some(&alice_secret_key),
             compress,
             SeipdVersion::V2,
-        )
-        .await?;
+        )?;
 
         let boundary = "boundary123";
         let rcvd_mail = format!(
@@ -1028,11 +1304,10 @@ Content-Transfer-Encoding: 7bit\r
 
         // MDN request was ignored, but reaction was not.
         let reactions = get_msg_reactions(bob, bob_msg.id).await?;
-        assert_eq!(reactions.reactions.len(), 1);
-        assert_eq!(
-            reactions.emoji_sorted_by_frequency(),
-            vec![("👀".to_string(), 1)]
-        );
+        assert_eq!(reactions.by_contact.len(), 1);
+        assert_eq!(reactions.frequencies.len(), 1);
+        assert_eq!(reactions.frequencies[0].reaction.as_str(), "👀");
+        assert_eq!(reactions.frequencies[0].count, 1);
 
         Ok(())
     }

@@ -1,9 +1,10 @@
 //! Utilities to help writing tests.
 //!
 //! This private module is only compiled for test runs.
+
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::env::current_dir;
-use std::fmt::Write;
+use std::fmt::{Debug, Write};
 use std::ops::{Deref, DerefMut};
 use std::panic;
 use std::path::Path;
@@ -22,30 +23,28 @@ use tokio::runtime::Handle;
 use tokio::{fs, task};
 use uuid::Uuid;
 
+use crate::aheader::{Aheader, EncryptPreference};
 use crate::chat::{
     self, Chat, ChatId, ChatIdBlocked, MessageListOptions, add_to_chat_contacts_table, create_group,
 };
 use crate::chatlist::Chatlist;
 use crate::config::Config;
-use crate::constants::{Blocked, Chattype};
-use crate::constants::{DC_CHAT_ID_TRASH, DC_GCL_NO_SPECIALS};
-use crate::contact::{
-    Contact, ContactId, Modifier, Origin, import_vcard, make_vcard, mark_contact_id_as_verified,
-};
+use crate::constants::{Blocked, Chattype, DC_GCL_NO_SPECIALS};
+use crate::contact::{Contact, ContactId, Modifier, Origin, import_vcard, make_vcard};
 use crate::context::Context;
-use crate::e2ee::EncryptHelper;
 use crate::events::{Event, EventEmitter, EventType, Events};
 use crate::key::{self, DcKey, self_fingerprint};
-use crate::log::warn;
-use crate::login_param::EnteredLoginParam;
 use crate::message::{Message, MessageState, MsgId};
+use crate::mimefactory;
 use crate::mimeparser::{MimeMessage, SystemMessage};
 use crate::pgp::SeipdVersion;
 use crate::receive_imf::{ReceivedMsg, receive_imf};
 use crate::securejoin::{get_securejoin_qr, join_securejoin};
+use crate::smtp;
 use crate::smtp::msg_has_pending_smtp_job;
 use crate::stock_str::StockStrings;
 use crate::tools::time;
+use crate::transport::add_pseudo_transport;
 
 /// The number of info messages added to new e2ee chats.
 /// Currently this is "Messages are end-to-end encrypted.", string `ChatProtectionEnabled`.
@@ -68,19 +67,13 @@ static CONTEXT_NAMES: LazyLock<std::sync::RwLock<BTreeMap<u32, String>>> =
     LazyLock::new(|| std::sync::RwLock::new(BTreeMap::new()));
 
 /// Manage multiple [`TestContext`]s in one place.
-///
-/// The main advantage is that the log records of the contexts will appear in the order they
-/// occurred rather than grouped by context like would happen when you use separate
-/// [`TestContext`]s without managing your own [`LogSink`].
 pub struct TestContextManager {
-    log_sink: LogSink,
     used_names: BTreeSet<String>,
 }
 
 impl TestContextManager {
     pub fn new() -> Self {
         Self {
-            log_sink: LogSink::new(),
             used_names: BTreeSet::new(),
         }
     }
@@ -89,7 +82,6 @@ impl TestContextManager {
         TestContext::builder()
             .configure_alice()
             .with_id_offset(1000)
-            .with_log_sink(self.log_sink.clone())
             .build(Some(&mut self.used_names))
             .await
     }
@@ -98,7 +90,6 @@ impl TestContextManager {
         TestContext::builder()
             .configure_bob()
             .with_id_offset(2000)
-            .with_log_sink(self.log_sink.clone())
             .build(Some(&mut self.used_names))
             .await
     }
@@ -107,7 +98,6 @@ impl TestContextManager {
         TestContext::builder()
             .configure_charlie()
             .with_id_offset(3000)
-            .with_log_sink(self.log_sink.clone())
             .build(Some(&mut self.used_names))
             .await
     }
@@ -116,7 +106,6 @@ impl TestContextManager {
         TestContext::builder()
             .configure_dom()
             .with_id_offset(4000)
-            .with_log_sink(self.log_sink.clone())
             .build(Some(&mut self.used_names))
             .await
     }
@@ -126,7 +115,6 @@ impl TestContextManager {
         TestContext::builder()
             .configure_elena()
             .with_id_offset(5000)
-            .with_log_sink(self.log_sink.clone())
             .build(Some(&mut self.used_names))
             .await
     }
@@ -135,7 +123,6 @@ impl TestContextManager {
         TestContext::builder()
             .configure_fiona()
             .with_id_offset(6000)
-            .with_log_sink(self.log_sink.clone())
             .build(Some(&mut self.used_names))
             .await
     }
@@ -146,7 +133,6 @@ impl TestContextManager {
             .with_key_pair(pqc_keypair())
             .with_address("pqc@example.org".to_string())
             .with_id_offset(7000)
-            .with_log_sink(self.log_sink.clone())
             .build(Some(&mut self.used_names))
             .await
     }
@@ -154,21 +140,15 @@ impl TestContextManager {
     /// Creates a new unconfigured test account.
     pub async fn unconfigured(&mut self) -> TestContext {
         TestContext::builder()
-            .with_log_sink(self.log_sink.clone())
             .build(Some(&mut self.used_names))
             .await
     }
 
-    /// Writes info events to the log that mark a section, e.g.:
+    /// Prints a section to stdout, e.g.:
     ///
     /// ========== `msg` goes here ==========
     pub fn section(&self, msg: &str) {
-        self.log_sink
-            .sender
-            .try_send(LogEvent::Section(msg.to_string()))
-            .expect(
-            "The events channel should be unbounded and not closed, so try_send() shouldn't fail",
-        );
+        println!("\n========== {msg} ==========");
     }
 
     /// - Let one TestContext send a message
@@ -219,17 +199,7 @@ impl TestContextManager {
             test_context.name()
         ));
 
-        // Insert a transport for the new address.
-        test_context.sql
-          .execute(
-            "INSERT OR IGNORE INTO transports (addr, entered_param, configured_param) VALUES (?, ?, ?)",
-               (
-                   new_addr,
-                   serde_json::to_string(&EnteredLoginParam{addr: new_addr.to_string(), ..Default::default()}).unwrap(),
-                   format!(r#"{{"addr":"{new_addr}","imap":[],"imap_user":"","imap_password":"","smtp":[],"smtp_user":"","smtp_password":"","certificate_checks":"Automatic","oauth2":false}}"#)
-              ),
-          ).await.unwrap();
-
+        test_context.add_transport(new_addr).await;
         test_context.set_primary_self_addr(new_addr).await.unwrap();
         // ensure_secret_key_exists() is called during configure
         key::ensure_secret_key_exists(test_context).await.unwrap();
@@ -242,7 +212,7 @@ impl TestContextManager {
 
     /// Executes SecureJoin protocol between `scanner` and `scanned`.
     ///
-    /// Returns chat ID of the 1:1 chat for `scanner`.
+    /// Returns chat ID of the single chat for `scanner`.
     pub async fn execute_securejoin(&self, scanner: &TestContext, scanned: &TestContext) -> ChatId {
         self.section(&format!(
             "{} scans {}'s QR code",
@@ -256,7 +226,7 @@ impl TestContextManager {
 
     /// Executes SecureJoin initiated by `joiner` scanning `qr` generated by `inviter`.
     ///
-    /// The [`ChatId`] of the created chat is returned, for a SetupContact QR this is the 1:1
+    /// The [`ChatId`] of the created chat is returned, for a SetupContact QR this is the single
     /// chat with `inviter`, for a SecureJoin QR this is the group chat.
     pub async fn exec_securejoin_qr(
         &self,
@@ -273,7 +243,7 @@ impl TestContextManager {
     /// `inviters` devices must have the same primary address.
     /// All of the `inviters` devices will get the messages and send replies.
     ///
-    /// The [`ChatId`] of the created chat is returned, for a SetupContact QR this is the 1:1
+    /// The [`ChatId`] of the created chat is returned, for a SetupContact QR this is the single
     /// chat with the inviter, for a SecureJoin QR this is the group chat.
     pub async fn exec_securejoin_qr_multi_device(
         &self,
@@ -293,14 +263,14 @@ impl TestContextManager {
         for _ in 0..2 {
             let mut something_sent = false;
             let rev_order = false;
-            if let Some(sent) = joiner.pop_sent_msg_ex(rev_order).await {
+            if let Some(sent) = joiner.pop_sent_msg_ext(rev_order).await {
                 for inviter in inviters {
                     inviter.recv_msg_opt(&sent).await;
                 }
                 something_sent = true;
             }
             for inviter in inviters {
-                if let Some(sent) = inviter.pop_sent_msg_ex(rev_order).await {
+                if let Some(sent) = inviter.pop_sent_msg_ext(rev_order).await {
                     if sent.recipients.split(' ').any(|addr| addr == inviter_addr) {
                         for observer in inviters {
                             // `imap::prefetch_should_download()` returns false on the sender side.
@@ -329,18 +299,6 @@ pub struct TestContextBuilder {
 
     /// Email address.
     address: Option<String>,
-
-    /// Log sink if set.
-    ///
-    /// If log sink is not set,
-    /// a new one will be created and stored
-    /// inside the test context when it is built.
-    /// If log sink is provided by the caller,
-    /// it will be subscribed to the test context,
-    /// but not stored inside of it,
-    /// so the caller should store the LogSink elsewhere to
-    /// prevent it from being dropped immediately.
-    log_sink: Option<LogSink>,
 
     /// Offset for chat-,message-,contact ids.
     ///
@@ -412,17 +370,6 @@ impl TestContextBuilder {
         self
     }
 
-    /// Attaches a [`LogSink`] to this [`TestContext`].
-    ///
-    /// This is useful when using multiple [`TestContext`] instances in one test: it allows
-    /// using a single [`LogSink`] for both contexts.  This shows the log messages in
-    /// sequence as they occurred rather than all messages from each context in a single
-    /// block.
-    pub fn with_log_sink(mut self, sink: LogSink) -> Self {
-        self.log_sink = Some(sink);
-        self
-    }
-
     /// Adds an offset for chat-, message-, contact IDs.
     ///
     /// This makes it harder to accidentally mix up IDs from different accounts.
@@ -449,7 +396,7 @@ impl TestContextBuilder {
                 used_names.insert(unused_name.clone());
             }
 
-            let test_context = TestContext::new_internal(Some(unused_name), self.log_sink).await;
+            let test_context = TestContext::new_internal(Some(unused_name)).await;
             test_context.configure_addr(&addr).await;
             key::store_self_keypair(&test_context, &key_pair)
                 .await
@@ -472,7 +419,7 @@ impl TestContextBuilder {
 
             test_context
         } else {
-            TestContext::new_internal(None, self.log_sink).await
+            TestContext::new_internal(None).await
         }
     }
 }
@@ -487,15 +434,7 @@ pub struct TestContext {
 
     pub evtracker: EventTracker,
 
-    /// Reference to implicit [`LogSink`] so it is dropped together with the context.
-    ///
-    /// Only used if no explicit `log_sender` is passed into [`TestContext::new_internal`]
-    /// (which is assumed to be the sending end of a [`LogSink`]).
-    ///
-    /// This is a convenience in case only a single [`TestContext`] is used to avoid dealing
-    /// with [`LogSink`].  Never read, since the only purpose is to
-    /// control when Drop is invoked.
-    _log_sink: Option<LogSink>,
+    log_sink: LogSink,
 }
 
 impl TestContext {
@@ -512,7 +451,7 @@ impl TestContext {
     ///
     /// [Context]: crate::context::Context
     pub async fn new() -> Self {
-        Self::new_internal(None, None).await
+        Self::new_internal(None).await
     }
 
     /// Creates a new configured [`TestContext`].
@@ -563,11 +502,7 @@ impl TestContext {
     ///
     /// `name` is used to identify this context in e.g. log output.  This is useful mostly
     /// when you have multiple [`TestContext`]s in a test.
-    ///
-    /// `log_sender` is assumed to be the sender for a [`LogSink`].  If not supplied a new
-    /// [`LogSink`] will be created so that events are logged to this test when the
-    /// [`TestContext`] is dropped.
-    async fn new_internal(name: Option<String>, log_sink: Option<LogSink>) -> Self {
+    async fn new_internal(name: Option<String>) -> Self {
         let dir = tempdir().unwrap();
         let dbfile = dir.path().join("db.sqlite");
         let id = rand::random();
@@ -581,16 +516,8 @@ impl TestContext {
             .await
             .expect("failed to create context");
 
-        let _log_sink = if let Some(log_sink) = log_sink {
-            // Subscribe existing LogSink and don't store reference to it.
-            log_sink.subscribe(ctx.get_event_emitter());
-            None
-        } else {
-            // Create new LogSink and store it inside the `TestContext`.
-            let log_sink = LogSink::new();
-            log_sink.subscribe(ctx.get_event_emitter());
-            Some(log_sink)
-        };
+        let log_sink = LogSink::new();
+        log_sink.subscribe(ctx.get_event_emitter());
 
         ctx.set_config(Config::SkipStartMessages, Some("1"))
             .await
@@ -602,7 +529,7 @@ impl TestContext {
             ctx,
             dir,
             evtracker: EventTracker::new(evtracker_receiver),
-            _log_sink,
+            log_sink,
         }
     }
 
@@ -640,6 +567,22 @@ impl TestContext {
         }
     }
 
+    /// Adds a transport for `addr` without any network activity.
+    pub async fn add_transport(&self, addr: &str) {
+        add_pseudo_transport(self, addr).await.unwrap();
+        // A fresh `add_timestamp` makes the re-signed self key newer than the copies
+        // contacts hold, so that certificate merging prefers the new relay list.
+        self.sql
+            .execute(
+                "UPDATE transports SET add_timestamp=? WHERE addr=?",
+                (time(), addr),
+            )
+            .await
+            .unwrap();
+        // Invalidate the cached self key so that it is regenerated with the new list.
+        self.self_public_key.lock().await.take();
+    }
+
     /// Retrieves a sent message from the jobs table.
     ///
     /// This retrieves and removes a message which has been scheduled to send from the jobs
@@ -654,33 +597,51 @@ impl TestContext {
 
     pub async fn pop_sent_msg_opt(&self) -> Option<SentMessage<'_>> {
         let rev_order = true;
-        self.pop_sent_msg_ex(rev_order).await
+        self.pop_sent_msg_ext(rev_order).await
     }
 
-    pub async fn pop_sent_msg_ex(&self, rev_order: bool) -> Option<SentMessage<'_>> {
+    pub async fn pop_sent_msg_ext(&self, rev_order: bool) -> Option<SentMessage<'_>> {
         let mut query = "
-SELECT id, msg_id, mime, recipients
-FROM smtp
+SELECT id, msg_id
+FROM smtp2
 ORDER BY id"
             .to_string();
         if rev_order {
             query += " DESC";
         }
-        let (rowid, msg_id, payload, recipients) = self
+        let (rowid, msg_id) = self
             .ctx
             .sql
             .query_row_optional(&query, (), |row| {
                 let rowid: i64 = row.get(0)?;
                 let msg_id: MsgId = row.get(1)?;
-                let mime: String = row.get(2)?;
-                let recipients: String = row.get(3)?;
-                Ok((rowid, msg_id, mime, recipients))
+                Ok((rowid, msg_id))
             })
             .await
             .expect("query_row_optional failed")?;
+        let query_only = true;
+        let mut queued_mail = self
+            .ctx
+            .sql
+            .transaction_ext(query_only, |transaction| {
+                smtp::load_queued_mail(transaction, rowid)
+            })
+            .await
+            .expect("Failed to load queued mail");
+        if queued_mail.bcc_self {
+            smtp::add_self_recipients(
+                &self.ctx,
+                &mut queued_mail.recipients,
+                queued_mail.encryption.is_encrypted(),
+            )
+            .await
+            .expect("Failed to add self recipients");
+        }
+        let recipients = queued_mail.recipients.join(" ");
+        debug_assert!(!recipients.starts_with(" "));
         self.ctx
             .sql
-            .execute("DELETE FROM smtp WHERE id=?;", (rowid,))
+            .execute("DELETE FROM smtp2 WHERE id=?;", (rowid,))
             .await
             .expect("failed to remove job");
         if !msg_has_pending_smtp_job(self, msg_id)
@@ -699,6 +660,11 @@ ORDER BY id"
                 .await
                 .expect("Failed to update timestamp_sent");
         }
+
+        let rendered_mail = mimefactory::render_queued_mail_with_context(queued_mail, self)
+            .await
+            .expect("Failed to render queued mail");
+        let payload = rendered_mail.message;
 
         let payload_headers = payload.split("\r\n\r\n").next().unwrap().lines();
         let payload_header_names: Vec<_> = payload_headers
@@ -738,33 +704,56 @@ ORDER BY id"
     }
 
     pub async fn get_smtp_rows_for_msg<'a>(&'a self, msg_id: MsgId) -> Vec<SentMessage<'a>> {
-        let sent_msgs = self
+        let mut sent_msgs = Vec::new();
+
+        for rowid in self
             .ctx
             .sql
-            .query_map_vec(
-                "SELECT id, msg_id, mime, recipients FROM smtp WHERE msg_id=?",
-                (msg_id,),
-                |row| {
-                    let _id: MsgId = row.get(0)?;
-                    let msg_id: MsgId = row.get(1)?;
-                    let mime: String = row.get(2)?;
-                    let recipients: String = row.get(3)?;
-                    Ok((msg_id, mime, recipients))
-                },
-            )
+            .query_map_vec("SELECT id FROM smtp2 WHERE msg_id=?", (msg_id,), |row| {
+                let rowid: i64 = row.get(0)?;
+                Ok(rowid)
+            })
             .await
             .unwrap()
-            .into_iter()
-            .map(|(msg_id, mime, recipients)| SentMessage {
-                payload: mime,
+        {
+            let query_only = true;
+            let mut queued_mail = self
+                .ctx
+                .sql
+                .transaction_ext(query_only, |transaction| {
+                    smtp::load_queued_mail(transaction, rowid)
+                })
+                .await
+                .expect("Failed to load queued mail");
+            if queued_mail.bcc_self {
+                smtp::add_self_recipients(
+                    &self.ctx,
+                    &mut queued_mail.recipients,
+                    queued_mail.encryption.is_encrypted(),
+                )
+                .await
+                .expect("Failed to add self recipients");
+            }
+            let recipients = queued_mail.recipients.join(" ");
+
+            let rendered_mail = mimefactory::render_queued_mail_with_context(queued_mail, self)
+                .await
+                .expect("Failed to render queued mail");
+            let payload = rendered_mail.message;
+
+            debug_assert!(!recipients.starts_with(" "));
+            let sent_message = SentMessage {
+                payload,
                 sender_msg_id: msg_id,
                 sender_context: &self.ctx,
                 recipients,
-            })
-            .collect();
+            };
+            sent_msgs.push(sent_message)
+        }
+
         self.ctx
             .sql
-            .execute("DELETE FROM smtp WHERE msg_id=?", (msg_id,))
+            .execute("DELETE FROM smtp2 WHERE msg_id=?", (msg_id,))
             .await
             .expect("Delete smtp jobs");
         if msg_id
@@ -836,7 +825,7 @@ ORDER BY id"
         receive_imf(self, msg.payload().as_bytes(), false)
             .await
             .unwrap()
-            .filter(|msg| msg.chat_id != DC_CHAT_ID_TRASH)
+            .filter(|msg| msg.chat_id != ChatId::TRASH)
     }
 
     /// Receives a message and asserts that it goes to trash chat.
@@ -845,7 +834,7 @@ ORDER BY id"
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(received.chat_id, DC_CHAT_ID_TRASH);
+        assert_eq!(received.chat_id, ChatId::TRASH);
     }
 
     /// Gets the most recent message ID of a chat.
@@ -895,8 +884,8 @@ ORDER BY id"
                 .expect("add_or_lookup");
         match modified {
             Modifier::None => (),
-            Modifier::Modified => warn!(&self.ctx, "Contact {} modified by TestContext", &addr),
-            Modifier::Created => warn!(&self.ctx, "Contact {} created by TestContext", &addr),
+            Modifier::Modified => info!(&self.ctx, "Contact {} modified by TestContext", &addr),
+            Modifier::Created => info!(&self.ctx, "Contact {} created by TestContext", &addr),
         }
         contact_id
     }
@@ -945,34 +934,13 @@ ORDER BY id"
         let fingerprint = self_fingerprint(other).await.unwrap();
 
         let (contact_id, _modified) =
-            Contact::add_or_lookup_ex(self, "", &addr, fingerprint, Origin::MailinglistAddress)
+            Contact::add_or_lookup_ext(self, "", &addr, fingerprint, Origin::MailinglistAddress)
                 .await
                 .expect("add_or_lookup");
         contact_id
     }
 
-    /// Returns 1:1 [`Chat`] with another account address-contact.
-    /// Panics if it doesn't exist.
-    /// May return a blocked chat.
-    ///
-    /// This first creates a contact using the configured details on the other account, then
-    /// gets the 1:1 chat with this contact.
-    pub async fn get_email_chat(&self, other: &TestContext) -> Chat {
-        let contact = self.add_or_lookup_address_contact(other).await;
-
-        let chat_id = ChatIdBlocked::lookup_by_contact(&self.ctx, contact.id)
-            .await
-            .unwrap()
-            .map(|chat_id_blocked| chat_id_blocked.id)
-            .expect(
-                "There is no chat with this contact. \
-                Hint: Use create_email_chat() instead of get_email_chat() if this is expected.",
-            );
-
-        Chat::load_from_db(&self.ctx, chat_id).await.unwrap()
-    }
-
-    /// Returns 1:1 [`Chat`] with another account key-contact.
+    /// Returns a single [`Chat`] with another account key-contact.
     /// Panics if the chat does not exist.
     ///
     /// This first creates a contact, but does not import the key,
@@ -993,27 +961,27 @@ ORDER BY id"
         Chat::load_from_db(&self.ctx, chat_id).await.unwrap()
     }
 
-    /// Creates or returns an existing 1:1 [`ChatId`] with another account.
+    /// Creates or returns an existing single [`ChatId`] with another account.
     ///
     /// This first creates a contact by exporting a vCard from the `other`
     /// and importing it into `self`,
-    /// then creates a 1:1 chat with this contact.
+    /// then creates a single chat with this contact.
     pub async fn create_chat_id(&self, other: &TestContext) -> ChatId {
         let contact_id = self.add_or_lookup_contact_id(other).await;
         ChatId::create_for_contact(self, contact_id).await.unwrap()
     }
 
-    /// Creates or returns an existing 1:1 [`Chat`] with another account.
+    /// Creates or returns an existing single [`Chat`] with another account.
     ///
     /// This first creates a contact by exporting a vCard from the `other`
     /// and importing it into `self`,
-    /// then creates a 1:1 chat with this contact.
+    /// then creates a single chat with this contact.
     pub async fn create_chat(&self, other: &TestContext) -> Chat {
         let chat_id = self.create_chat_id(other).await;
         Chat::load_from_db(self, chat_id).await.unwrap()
     }
 
-    /// Creates or returns an existing 1:1 [`Chat`] with another account
+    /// Creates or returns an existing single [`Chat`] with another account
     /// by email address.
     ///
     /// This function can be used to create unencrypted chats.
@@ -1024,9 +992,9 @@ ORDER BY id"
         Chat::load_from_db(self, chat_id).await.unwrap()
     }
 
-    /// Creates or returns an existing [`Contact`] and 1:1 [`Chat`] with another email.
+    /// Creates or returns an existing [`Contact`] and single [`Chat`] with another email.
     ///
-    /// This first creates a contact from the `name` and `addr` and then creates a 1:1 chat
+    /// This first creates a contact from the `name` and `addr` and then creates a single chat
     /// with this contact.
     pub async fn create_chat_with_contact(&self, name: &str, addr: &str) -> Chat {
         let contact = Contact::create(self, name, addr)
@@ -1115,7 +1083,7 @@ ORDER BY id"
     async fn display_chat(&self, chat_id: ChatId) -> String {
         let mut res = String::new();
 
-        let msglist = chat::get_chat_msgs_ex(
+        let msglist = chat::get_chat_msgs_ext(
             self,
             chat_id,
             MessageListOptions {
@@ -1216,22 +1184,37 @@ ORDER BY id"
         chat_id
     }
 
-    /// Set the legacy `protected` column in the chats table to 1,
-    /// because for now, only these chats that were once protected can be used
-    /// to gossip verifications.
-    // TODO remove the next statement
-    // when we send the _verified header for all verified contacts
-    pub(crate) async fn set_chat_protected(self: &TestContext, chat_id: chat::ChatId) {
-        self.sql
-            .execute("UPDATE chats SET protected=1 WHERE id=?", (chat_id,))
-            .await
-            .unwrap();
-    }
-
     /// Allow reception of unencrypted messages.
     pub async fn allow_unencrypted(&self) -> Result<()> {
         self.set_config_bool(Config::ForceEncryption, false).await?;
         Ok(())
+    }
+
+    /// Asserts a warning containing `pat` should be logged.
+    ///
+    /// Delegates to [`InnerLogSink::assert_warn`].
+    pub async fn assert_warn(&self, pat: &str) {
+        self.log_sink.assert_warn(pat).await
+    }
+
+    /// Asserts an error containing `pat` should be logged.
+    ///
+    /// Delegates to [`InnerLogSink::assert_error`].
+    pub async fn assert_error(&self, pat: &str) {
+        self.log_sink.assert_error(pat).await
+    }
+
+    /// Asserts that a list of errors and/or warnings has been logged,
+    /// at least one time each and in any order.
+    ///
+    /// # Important
+    ///
+    /// Order of `pats` matters: if a log can be matched by multiple patterns,
+    /// the first one takes precedence.
+    ///
+    /// Delegates to [`InnerLogSink::assert_warns_or_errors`].
+    pub async fn assert_warns_or_errors(&self, pats: &[&str]) {
+        self.log_sink.assert_warns_or_errors(pats).await
     }
 }
 
@@ -1240,8 +1223,14 @@ pub async fn encrypt_raw_message(
     receivers: &[&TestContext],
     payload: &[u8],
 ) -> Result<String> {
-    let encryption_helper = EncryptHelper::new(context).await?;
-    let mut encryption_keyring = vec![encryption_helper.public_key.clone()];
+    let public_key = key::load_self_public_key(context).await?;
+    let aheader = Aheader {
+        addr: context.get_primary_self_addr().await?,
+        public_key: public_key.clone(),
+        prefer_encrypt: EncryptPreference::Mutual,
+    };
+
+    let mut encryption_keyring = vec![public_key.clone()];
 
     for receiver in receivers {
         encryption_keyring.push(key::load_self_public_key(receiver).await?);
@@ -1250,18 +1239,17 @@ pub async fn encrypt_raw_message(
     let from = context.get_primary_self_addr().await?;
     let compress = false;
 
-    let mut cleartext = format!("Autocrypt: {}", encryption_helper.get_aheader()).into_bytes();
+    let mut cleartext = format!("Autocrypt: {aheader}").into_bytes();
     cleartext.extend_from_slice(b"\r\n");
     cleartext.extend_from_slice(payload);
-    let encrypted_payload = encryption_helper
-        .encrypt_raw(
-            context,
-            encryption_keyring,
-            cleartext,
-            compress,
-            SeipdVersion::V2,
-        )
-        .await?;
+    let sign_key = Some(key::load_self_secret_key(context).await?);
+    let encrypted_payload = crate::pgp::pk_encrypt(
+        cleartext,
+        encryption_keyring,
+        sign_key.as_ref(),
+        compress,
+        SeipdVersion::V2,
+    )?;
     let boundary = Uuid::new_v4();
 
     let res = format!(
@@ -1337,25 +1325,9 @@ impl Drop for TestContext {
     }
 }
 
-pub enum LogEvent {
-    /// Logged event.
-    Event(Event),
-
-    /// Test output section.
-    Section(String),
-}
-
 /// A receiver of [`Event`]s which will log the events to the captured test stdout.
 ///
-/// Tests redirect the stdout of the test thread and capture this, showing the captured
-/// stdout if the test fails.  This means printing log messages must be done on the thread
-/// of the test itself and not from a spawned task.
-///
-/// This sink achieves this by printing the events, in the order received, at the time it is
-/// dropped.  Thus to use you must only make sure this sink is dropped in the test itself.
-///
-/// To use this create an instance using [`LogSink::new`] and then use the
-/// [`TestContextBuilder::with_log_sink`] or use [`TestContextManager`].
+/// Panics on [`drop`][`Drop::drop`], if an unexpected warning or error was received.
 #[derive(Debug, Clone, Default)]
 pub struct LogSink(Arc<InnerLogSink>);
 
@@ -1376,15 +1348,14 @@ impl Deref for LogSink {
 
 #[derive(Debug)]
 pub struct InnerLogSink {
-    events: Receiver<LogEvent>,
+    /// Log events receiver.
+    events: Receiver<Event>,
 
     /// Sender side of the log receiver.
     ///
     /// It is cloned when log sink is subscribed
-    /// to new event emitter
-    /// and can be used directly from the test to
-    /// add "sections" to the log.
-    sender: Sender<LogEvent>,
+    /// to new event emitter.
+    sender: Sender<Event>,
 }
 
 impl Default for InnerLogSink {
@@ -1403,16 +1374,118 @@ impl InnerLogSink {
         let sender = self.sender.clone();
         task::spawn(async move {
             while let Some(event) = event_emitter.recv().await {
-                sender.try_send(LogEvent::Event(event.clone())).ok();
+                print_event(&event);
+                sender.try_send(event).ok();
             }
         });
     }
+
+    async fn assert(&self, is_error: bool, pat: &str) {
+        while let Ok(Ok(event)) =
+            tokio::time::timeout(Duration::from_secs(1), self.events.recv()).await
+        {
+            if Self::assert_inner(event, is_error, pat) {
+                return;
+            }
+        }
+        if is_error {
+            panic!("Expected an error log {pat:?}.")
+        } else {
+            panic!("Expected a warning log {pat:?}.")
+        }
+    }
+
+    fn assert_inner(log_event: Event, is_error: bool, pat: &str) -> bool {
+        if let Some(log) = match is_error {
+            false => log_event.typ.get_warn(),
+            true => log_event.typ.get_error(),
+        } {
+            assert!(log.contains(pat), "'{log}' does not contain '{pat}'.");
+            true
+        } else {
+            if is_error {
+                assert!(
+                    !log_event.is_warn(),
+                    "Expected a warning log, but found an error log instead.",
+                );
+            } else {
+                assert!(
+                    !log_event.is_error(),
+                    "Expected an error log, but found a warning log instead.",
+                );
+            }
+            false
+        }
+    }
+
+    /// Asserts that a list of errors and/or warnings has been logged,
+    /// at least one time each and in any order.
+    ///
+    /// # Important
+    ///
+    /// Order of `pats` matters: if a log can be matched by multiple patterns,
+    /// the first one takes precedence.
+    pub async fn assert_warns_or_errors(&self, pats: &[&str]) {
+        let mut hits = BTreeSet::new();
+        'events: while let Ok(Ok(event)) =
+            tokio::time::timeout(Duration::from_secs(1), self.events.recv()).await
+        {
+            let Some(log) = event.typ.get_warn().or_else(|| event.typ.get_error()) else {
+                continue 'events;
+            };
+
+            for pat in pats {
+                if log.contains(*pat) {
+                    hits.insert(*pat);
+                    continue 'events;
+                }
+            }
+            panic!("Unexpected log event: {event:?}.")
+        }
+
+        let mut panic = false;
+        for pat in pats {
+            if !hits.contains(*pat) {
+                eprintln!("Expected at least one error or warning log matching: '{pat}'");
+                panic = true;
+            }
+        }
+        if panic {
+            panic!("One or more log assertions weren't met.")
+        }
+    }
+
+    /// Asserts that a warning containing `pat` should be logged.
+    pub async fn assert_warn(&self, pat: &str) {
+        self.assert(false, pat).await
+    }
+
+    /// Asserts that an error containing `pat` should be logged.
+    pub async fn assert_error(&self, pat: &str) {
+        self.assert(true, pat).await
+    }
+}
+
+/// Similar to [`assert!`], but doesn't panic if the thread is already panicking.
+///
+/// [`assert!`]: assert
+macro_rules! soft_assert {
+    ($cond:expr, $($arg:tt)+) => {
+        if std::thread::panicking() {
+            if !$cond {
+                eprintln!($($arg)+)
+            }
+        } else {
+            assert!($cond, $($arg)+);
+        }
+    };
 }
 
 impl Drop for InnerLogSink {
     fn drop(&mut self) {
         while let Ok(event) = self.events.try_recv() {
-            print_logevent(&event);
+            soft_assert!(!event.is_warn(), "Logged an unexpected warning: {event:?}");
+            soft_assert!(!event.is_error(), "Logged an unexpected error: {event:?}");
         }
         if std::env::var("DELTACHAT_SAVE_TMP_DB").is_err() {
             eprintln!(
@@ -1521,7 +1594,7 @@ pub fn pqc_keypair() -> SignedSecretKey {
 #[derive(Debug)]
 pub struct EventTracker(EventEmitter);
 
-/// See [`super::EventTracker::get_matching_ex`].
+/// See [`super::EventTracker::get_matching_ext`].
 pub struct ExpectedEvents<E: Fn(&EventType) -> bool, U: Fn(&EventType) -> bool> {
     pub expected: E,
     pub unexpected: U,
@@ -1569,7 +1642,7 @@ impl EventTracker {
         ctx: &Context,
         event_matcher: F,
     ) -> Option<EventType> {
-        self.get_matching_ex(
+        self.get_matching_ext(
             ctx,
             ExpectedEvents {
                 expected: event_matcher,
@@ -1581,7 +1654,7 @@ impl EventTracker {
 
     /// Consumes all emitted events returning the first matching one if any. Panics on unexpected
     /// events.
-    pub async fn get_matching_ex<E: Fn(&EventType) -> bool, U: Fn(&EventType) -> bool>(
+    pub async fn get_matching_ext<E: Fn(&EventType) -> bool, U: Fn(&EventType) -> bool>(
         &self,
         ctx: &Context,
         args: ExpectedEvents<E, U>,
@@ -1651,21 +1724,6 @@ pub(crate) async fn get_chat_msg(
         panic!("Wrong item type");
     };
     Message::load_from_db(&t.ctx, msg_id).await.unwrap()
-}
-
-fn print_logevent(logevent: &LogEvent) {
-    match logevent {
-        LogEvent::Event(event) => print_event(event),
-        LogEvent::Section(msg) => println!("\n========== {msg} =========="),
-    }
-}
-
-/// Saves the other account's public key as verified
-pub(crate) async fn mark_as_verified(this: &TestContext, other: &TestContext) {
-    let contact_id = this.add_or_lookup_contact_id(other).await;
-    mark_contact_id_as_verified(this, contact_id, Some(ContactId::SELF))
-        .await
-        .unwrap();
 }
 
 /// Pops a sync message from alice0 and receives it on alice1. Should be used after an action on

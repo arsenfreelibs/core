@@ -1,6 +1,5 @@
 use super::*;
-use crate::chat::{create_broadcast, load_broadcast_secret};
-use crate::constants::DC_CHAT_ID_TRASH;
+use crate::chat::{ChatId, create_broadcast, load_broadcast_secret};
 use crate::key::{load_self_secret_key, self_fingerprint};
 use crate::pgp;
 use crate::qr::{Qr, check_qr};
@@ -23,7 +22,7 @@ use anyhow::Result;
 ///
 /// To defeat this, a message that was unexpectedly
 /// encrypted with a symmetric secret must be dropped.
-async fn test_shared_secret_decryption_ex(
+async fn test_shared_secret_decryption_ext(
     recipient_ctx: &TestContext,
     from_addr: &str,
     secret_for_encryption: &str,
@@ -47,7 +46,7 @@ async fn test_shared_secret_decryption_ex(
 
     let encrypted_msg = pgp::symm_encrypt_message(
         plain_text.as_bytes().to_vec(),
-        signer_key,
+        signer_key.as_ref(),
         secret_for_encryption.to_string(),
         true,
     )?;
@@ -83,7 +82,7 @@ async fn test_shared_secret_decryption_ex(
         .expect("A trashed message should be created, otherwise we'll unnecessarily download it again");
 
     if let Some(error_pattern) = expected_error {
-        assert!(rcvd.chat_id == DC_CHAT_ID_TRASH);
+        assert_eq!(rcvd.chat_id, ChatId::TRASH);
         assert_eq!(
             previous_highest_msg_id,
             get_highest_msg_id(recipient_ctx).await,
@@ -112,7 +111,7 @@ async fn get_highest_msg_id(context: &Context) -> MsgId {
         .sql
         .query_get_value(
             "SELECT MAX(id) FROM msgs WHERE chat_id!=?",
-            (DC_CHAT_ID_TRASH,),
+            (ChatId::TRASH,),
         )
         .await
         .unwrap()
@@ -134,14 +133,17 @@ async fn test_broadcast_security_attacker_signature() -> Result<()> {
 
     let charlie_addr = charlie.get_config(Config::Addr).await?.unwrap();
 
-    test_shared_secret_decryption_ex(
+    test_shared_secret_decryption_ext(
         bob,
         &charlie_addr,
         &secret,
         Some(charlie),
         Some("This sender is not allowed to encrypt with this secret key"),
     )
-    .await
+    .await?;
+    bob.assert_warn("This sender is not allowed to encrypt with this secret key")
+        .await;
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -156,14 +158,17 @@ async fn test_broadcast_security_no_signature() -> Result<()> {
 
     let secret = load_broadcast_secret(alice, alice_chat_id).await?.unwrap();
 
-    test_shared_secret_decryption_ex(
+    test_shared_secret_decryption_ext(
         bob,
         "attacker@example.org",
         &secret,
         None,
         Some("Unsigned message is not allowed to be encrypted with this shared secret"),
     )
-    .await
+    .await?;
+    bob.assert_warn("Unsigned message is not allowed to be encrypted with this shared secret")
+        .await;
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -183,7 +188,7 @@ async fn test_broadcast_security_happy_path() -> Result<()> {
         .await?
         .unwrap();
 
-    test_shared_secret_decryption_ex(bob, &alice_addr, &secret, Some(alice), None).await
+    test_shared_secret_decryption_ext(bob, &alice_addr, &secret, Some(alice), None).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -204,14 +209,17 @@ async fn test_qr_code_security() -> Result<()> {
 
     let alice_fp = self_fingerprint(alice).await?;
     let secret_for_encryption = format!("securejoin/{alice_fp}/{authcode}");
-    test_shared_secret_decryption_ex(
+    test_shared_secret_decryption_ext(
         bob,
         &charlie_addr,
         &secret_for_encryption,
         Some(charlie),
         Some("This sender is not allowed to encrypt with this secret key"),
     )
-    .await
+    .await?;
+    bob.assert_warn("This sender is not allowed to encrypt with this secret key")
+        .await;
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -229,7 +237,7 @@ async fn test_qr_code_happy_path() -> Result<()> {
 
     let alice_fp = self_fingerprint(alice).await?;
     let secret_for_encryption = format!("securejoin/{alice_fp}/{authcode}");
-    test_shared_secret_decryption_ex(
+    test_shared_secret_decryption_ext(
         bob,
         "alice@example.net",
         &secret_for_encryption,
@@ -246,12 +254,16 @@ async fn test_unknown_secret() -> Result<()> {
     let alice = &tcm.alice().await;
     let bob = &tcm.bob().await;
 
-    test_shared_secret_decryption_ex(
+    test_shared_secret_decryption_ext(
         bob,
         "alice@example.net",
         "Some secret unknown to Bob",
         Some(alice),
         Some("Could not find symmetric secret for session key"),
     )
-    .await
+    .await?;
+    bob.assert_warn("Could not find symmetric secret for session key")
+        .await;
+    bob.assert_warn("unencrypted message").await;
+    Ok(())
 }

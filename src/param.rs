@@ -68,10 +68,17 @@ pub enum Param {
     DeprecatedSkipAutocrypt = b'o',
 
     /// For Messages
+    ///
+    /// Set if the message is incoming and requests an MDN.
+    /// Should not be set on outgoing messages,
+    /// we do not want to send MDNs to our own messages.
     WantsMdn = b'r',
 
-    /// For Messages: the message is a reaction.
+    /// For Messages: Render message as a RFC 9078 reaction.
     Reaction = b'x',
+
+    /// For Messages: Additional reactions that go to the `Chat-Broadcast-States:` header
+    BroadcastReactions = b'X',
 
     /// For Chats: the timestamp of the last reaction.
     LastReactionTimestamp = b'y',

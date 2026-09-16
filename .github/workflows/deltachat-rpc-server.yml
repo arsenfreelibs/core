@@ -30,11 +30,11 @@ jobs:
         arch: [aarch64, armv7l, armv6l, i686, x86_64]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           show-progress: false
           persist-credentials: false
-      - uses: cachix/install-nix-action@8aa03977d8d733052d78f4e008a241fd1dbf36b3 # v31.10.6
+      - uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
 
       - name: Build deltachat-rpc-server binaries
         run: nix build .#deltachat-rpc-server-${{ matrix.arch }}-linux
@@ -54,11 +54,11 @@ jobs:
         arch: [aarch64, armv7l, armv6l, i686, x86_64]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           show-progress: false
           persist-credentials: false
-      - uses: cachix/install-nix-action@8aa03977d8d733052d78f4e008a241fd1dbf36b3 # v31.10.6
+      - uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
 
       - name: Build deltachat-rpc-server wheels
         run: nix build .#deltachat-rpc-server-${{ matrix.arch }}-linux-wheel
@@ -78,11 +78,11 @@ jobs:
         arch: [win32, win64]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           show-progress: false
           persist-credentials: false
-      - uses: cachix/install-nix-action@8aa03977d8d733052d78f4e008a241fd1dbf36b3 # v31.10.6
+      - uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
 
       - name: Build deltachat-rpc-server binaries
         run: nix build .#deltachat-rpc-server-${{ matrix.arch }}
@@ -102,11 +102,11 @@ jobs:
         arch: [win32, win64]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           show-progress: false
           persist-credentials: false
-      - uses: cachix/install-nix-action@8aa03977d8d733052d78f4e008a241fd1dbf36b3 # v31.10.6
+      - uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
 
       - name: Build deltachat-rpc-server wheels
         run: nix build .#deltachat-rpc-server-${{ matrix.arch }}-wheel
@@ -127,7 +127,7 @@ jobs:
 
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           show-progress: false
           persist-credentials: false
@@ -153,11 +153,11 @@ jobs:
         arch: [arm64-v8a, armeabi-v7a]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           show-progress: false
           persist-credentials: false
-      - uses: cachix/install-nix-action@8aa03977d8d733052d78f4e008a241fd1dbf36b3 # v31.10.6
+      - uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
 
       - name: Build deltachat-rpc-server binaries
         run: nix build .#deltachat-rpc-server-${{ matrix.arch }}-android
@@ -177,11 +177,11 @@ jobs:
         arch: [arm64-v8a, armeabi-v7a]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           show-progress: false
           persist-credentials: false
-      - uses: cachix/install-nix-action@8aa03977d8d733052d78f4e008a241fd1dbf36b3 # v31.10.6
+      - uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
 
       - name: Build deltachat-rpc-server wheels
         run: nix build .#deltachat-rpc-server-${{ matrix.arch }}-android-wheel
@@ -204,11 +204,11 @@ jobs:
       contents: write
     runs-on: "ubuntu-latest"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           show-progress: false
           persist-credentials: false
-      - uses: cachix/install-nix-action@8aa03977d8d733052d78f4e008a241fd1dbf36b3 # v31.10.6
+      - uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
 
       - name: Download Linux aarch64 binary
         uses: actions/download-artifact@v7
@@ -370,6 +370,14 @@ jobs:
       - name: List artifacts
         run: ls -l dist/
 
+      - name: Check that the wheel metadata reads back
+        run: |
+          echo 'You can check a local `nix build` on non-Mac machines against the following checksums.'
+          sha256sum dist/*.whl
+          mkdir tagcheck
+          cp dist/*.whl tagcheck/
+          nix run --inputs-from . nixpkgs#python3Packages.wheel -- tags tagcheck/*.whl
+
       - name: Upload binaries to the GitHub release
         if: github.event_name == 'release'
         env:
@@ -382,7 +390,7 @@ jobs:
 
       - name: Publish deltachat-rpc-server to PyPI
         if: github.event_name == 'release'
-        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33
 
   publish_npm_package:
     name: Build & Publish npm prebuilds and deltachat-rpc-server
@@ -397,11 +405,11 @@ jobs:
       # Needed to publish the binaries to the release.
       contents: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           show-progress: false
           persist-credentials: false
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7.0.0
         with:
           python-version: "3.11"
 
@@ -513,15 +521,12 @@ jobs:
             deltachat-rpc-server/npm-package/*.tgz
 
       # Configure Node.js for publishing.
-      - uses: actions/setup-node@v6
+      # Check <https://docs.npmjs.com/trusted-publishers> for the version requirements.
+      - uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: 24
           registry-url: "https://registry.npmjs.org"
-
-      # Ensure npm 11.5.1 or later is installed.
-      # It is needed for <https://docs.npmjs.com/trusted-publishers>
-      - name: Update npm
-        run: npm install -g npm@latest
+          package-manager-cache: false  # never use caching in release builds
 
       - name: Publish npm packets for prebuilds and `@deltachat/stdio-rpc-server`
         if: github.event_name == 'release'

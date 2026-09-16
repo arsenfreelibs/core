@@ -1,13 +1,12 @@
 use super::*;
 use crate::chat::{
-    ChatVisibility, MuteDuration, add_contact_to_chat, marknoticed_chat, remove_contact_from_chat,
-    set_muted,
+    ChatId, ChatVisibility, MuteDuration, add_contact_to_chat, marknoticed_chat,
+    remove_contact_from_chat, set_muted,
 };
 use crate::config::Config;
-use crate::constants::DC_CHAT_ID_ARCHIVED_LINK;
 use crate::download::DownloadState;
 use crate::location;
-use crate::message::markseen_msgs;
+use crate::message::{estimate_deletion_cnt, markseen_msgs};
 use crate::receive_imf::receive_imf;
 use crate::test_utils;
 use crate::test_utils::{TestContext, TestContextManager};
@@ -15,6 +14,15 @@ use crate::{
     chat::{self, Chat, ChatItem, create_group, send_text_msg},
     tools::IsNoneOrEmpty,
 };
+
+/// Test helper to construct `Timer::Enabled`.
+///
+/// Panics if the value is zero as `Timer::Disabled` should be used instead.
+fn enabled(value: u32) -> Timer {
+    Timer::Enabled {
+        duration: NonZero::new(value).expect("Timer value cannot be zero"),
+    }
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_stock_ephemeral_messages() {
@@ -26,101 +34,52 @@ async fn test_stock_ephemeral_messages() {
     );
 
     assert_eq!(
-        stock_ephemeral_timer_changed(&context, Timer::Enabled { duration: 1 }, ContactId::SELF)
-            .await,
+        stock_ephemeral_timer_changed(&context, enabled(1), ContactId::SELF).await,
         "You set message deletion timer to 1 s."
     );
     assert_eq!(
-        stock_ephemeral_timer_changed(&context, Timer::Enabled { duration: 30 }, ContactId::SELF)
-            .await,
+        stock_ephemeral_timer_changed(&context, enabled(30), ContactId::SELF).await,
         "You set message deletion timer to 30 s."
     );
     assert_eq!(
-        stock_ephemeral_timer_changed(&context, Timer::Enabled { duration: 60 }, ContactId::SELF)
-            .await,
+        stock_ephemeral_timer_changed(&context, enabled(60), ContactId::SELF).await,
         "You set message deletion timer to 60 s."
     );
     assert_eq!(
-        stock_ephemeral_timer_changed(&context, Timer::Enabled { duration: 90 }, ContactId::SELF)
-            .await,
+        stock_ephemeral_timer_changed(&context, enabled(90), ContactId::SELF).await,
         "You set message deletion timer to 1.5 minutes."
     );
     assert_eq!(
-        stock_ephemeral_timer_changed(
-            &context,
-            Timer::Enabled { duration: 30 * 60 },
-            ContactId::SELF
-        )
-        .await,
+        stock_ephemeral_timer_changed(&context, enabled(30 * 60), ContactId::SELF).await,
         "You set message deletion timer to 30 minutes."
     );
     assert_eq!(
-        stock_ephemeral_timer_changed(
-            &context,
-            Timer::Enabled { duration: 60 * 60 },
-            ContactId::SELF
-        )
-        .await,
+        stock_ephemeral_timer_changed(&context, enabled(60 * 60), ContactId::SELF).await,
         "You set message deletion timer to 1 hour."
     );
     assert_eq!(
-        stock_ephemeral_timer_changed(&context, Timer::Enabled { duration: 5400 }, ContactId::SELF)
-            .await,
+        stock_ephemeral_timer_changed(&context, enabled(5400), ContactId::SELF).await,
         "You set message deletion timer to 1.5 hours."
     );
     assert_eq!(
-        stock_ephemeral_timer_changed(
-            &context,
-            Timer::Enabled {
-                duration: 2 * 60 * 60
-            },
-            ContactId::SELF
-        )
-        .await,
+        stock_ephemeral_timer_changed(&context, enabled(2 * 60 * 60), ContactId::SELF).await,
         "You set message deletion timer to 2 hours."
     );
     assert_eq!(
-        stock_ephemeral_timer_changed(
-            &context,
-            Timer::Enabled {
-                duration: 24 * 60 * 60
-            },
-            ContactId::SELF
-        )
-        .await,
+        stock_ephemeral_timer_changed(&context, enabled(24 * 60 * 60), ContactId::SELF).await,
         "You set message deletion timer to 1 day."
     );
     assert_eq!(
-        stock_ephemeral_timer_changed(
-            &context,
-            Timer::Enabled {
-                duration: 2 * 24 * 60 * 60
-            },
-            ContactId::SELF
-        )
-        .await,
+        stock_ephemeral_timer_changed(&context, enabled(2 * 24 * 60 * 60), ContactId::SELF).await,
         "You set message deletion timer to 2 days."
     );
     assert_eq!(
-        stock_ephemeral_timer_changed(
-            &context,
-            Timer::Enabled {
-                duration: 7 * 24 * 60 * 60
-            },
-            ContactId::SELF
-        )
-        .await,
+        stock_ephemeral_timer_changed(&context, enabled(7 * 24 * 60 * 60), ContactId::SELF).await,
         "You set message deletion timer to 1 week."
     );
     assert_eq!(
-        stock_ephemeral_timer_changed(
-            &context,
-            Timer::Enabled {
-                duration: 4 * 7 * 24 * 60 * 60
-            },
-            ContactId::SELF
-        )
-        .await,
+        stock_ephemeral_timer_changed(&context, enabled(4 * 7 * 24 * 60 * 60), ContactId::SELF)
+            .await,
         "You set message deletion timer to 4 weeks."
     );
 }
@@ -135,19 +94,14 @@ async fn test_ephemeral_enable_disable() -> Result<()> {
     let chat_alice = alice.create_chat(bob).await.id;
     let chat_bob = bob.create_chat(alice).await.id;
 
-    chat_alice
-        .set_ephemeral_timer(alice, Timer::Enabled { duration: 60 })
-        .await?;
+    chat_alice.set_ephemeral_timer(alice, enabled(60)).await?;
     let sent = alice.pop_sent_msg().await;
     let bob_received_message = bob.recv_msg(&sent).await;
     assert_eq!(
         bob_received_message.text,
         "Message deletion timer is set to 60 s by alice@example.org."
     );
-    assert_eq!(
-        chat_bob.get_ephemeral_timer(bob).await?,
-        Timer::Enabled { duration: 60 }
-    );
+    assert_eq!(chat_bob.get_ephemeral_timer(bob).await?, enabled(60));
 
     chat_alice
         .set_ephemeral_timer(alice, Timer::Disabled)
@@ -168,15 +122,10 @@ async fn test_ephemeral_unpromoted() -> Result<()> {
 
     // Group is unpromoted, the timer can be changed without sending a message.
     assert!(chat_id.is_unpromoted(&alice).await?);
-    chat_id
-        .set_ephemeral_timer(&alice, Timer::Enabled { duration: 60 })
-        .await?;
+    chat_id.set_ephemeral_timer(&alice, enabled(60)).await?;
     let sent = alice.pop_sent_msg_opt().await;
     assert!(sent.is_none());
-    assert_eq!(
-        chat_id.get_ephemeral_timer(&alice).await?,
-        Timer::Enabled { duration: 60 }
-    );
+    assert_eq!(chat_id.get_ephemeral_timer(&alice).await?, enabled(60));
 
     // Promote the group.
     send_text_msg(&alice, chat_id, "hi!".to_string()).await?;
@@ -205,11 +154,11 @@ async fn test_ephemeral_enable_lost() -> Result<()> {
 
     // Alice enables the timer.
     chat_alice
-        .set_ephemeral_timer(&alice.ctx, Timer::Enabled { duration: 60 })
+        .set_ephemeral_timer(&alice.ctx, enabled(60))
         .await?;
     assert_eq!(
         chat_alice.get_ephemeral_timer(&alice.ctx).await?,
-        Timer::Enabled { duration: 60 }
+        enabled(60)
     );
     // The message enabling the timer is lost.
     let _sent = alice.pop_sent_msg().await;
@@ -226,10 +175,7 @@ async fn test_ephemeral_enable_lost() -> Result<()> {
     // Bob receives text message and enables the timer, even though explicit timer update was
     // lost previously.
     bob.recv_msg(&sent).await;
-    assert_eq!(
-        chat_bob.get_ephemeral_timer(&bob.ctx).await?,
-        Timer::Enabled { duration: 60 }
-    );
+    assert_eq!(chat_bob.get_ephemeral_timer(&bob.ctx).await?, enabled(60));
 
     Ok(())
 }
@@ -261,15 +207,10 @@ async fn test_ephemeral_timer_rollback() -> Result<()> {
     );
 
     // Bob sets ephemeral timer and sends a message about timer change
-    chat_bob
-        .set_ephemeral_timer(&bob.ctx, Timer::Enabled { duration: 60 })
-        .await?;
+    chat_bob.set_ephemeral_timer(&bob.ctx, enabled(60)).await?;
     let sent_timer_change = bob.pop_sent_msg().await;
 
-    assert_eq!(
-        chat_bob.get_ephemeral_timer(&bob.ctx).await?,
-        Timer::Enabled { duration: 60 }
-    );
+    assert_eq!(chat_bob.get_ephemeral_timer(&bob.ctx).await?, enabled(60));
 
     // Bob receives message from Alice.
     // Alice message has no timer. However, Bob should not disable timer,
@@ -280,17 +221,16 @@ async fn test_ephemeral_timer_rollback() -> Result<()> {
         chat_alice.get_ephemeral_timer(&alice.ctx).await?,
         Timer::Disabled
     );
-    assert_eq!(
-        chat_bob.get_ephemeral_timer(&bob.ctx).await?,
-        Timer::Enabled { duration: 60 }
-    );
+    assert_eq!(chat_bob.get_ephemeral_timer(&bob.ctx).await?, enabled(60));
+    bob.assert_warn("Ignoring ephemeral timer change to Disabled")
+        .await;
 
     // Alice receives message from Bob
     alice.recv_msg(&sent_timer_change).await;
 
     assert_eq!(
         chat_alice.get_ephemeral_timer(&alice.ctx).await?,
-        Timer::Enabled { duration: 60 }
+        enabled(60)
     );
 
     // Bob disables the chat timer.
@@ -325,7 +265,7 @@ async fn test_ephemeral_delete_msgs() -> Result<()> {
 
     self_chat
         .id
-        .set_ephemeral_timer(t, Timer::Enabled { duration: 3600 })
+        .set_ephemeral_timer(t, enabled(3600))
         .await
         .unwrap();
 
@@ -339,12 +279,14 @@ async fn test_ephemeral_delete_msgs() -> Result<()> {
 
     // Set DeleteDeviceAfter to 1800s. Then send a saved message which will
     // still be deleted after 3600s because DeleteDeviceAfter doesn't apply to saved messages.
+    assert_eq!(estimate_deletion_cnt(t, false, 1800).await.unwrap(), 0);
     t.set_config(Config::DeleteDeviceAfter, Some("1800"))
         .await?;
 
     let now = time();
     let msg = t.send_text(self_chat.id, "Message text").await;
 
+    assert_eq!(estimate_deletion_cnt(t, false, 1800).await.unwrap(), 0);
     check_msg_will_be_deleted(t, msg.sender_msg_id, &self_chat, now + 3559, time() + 3601)
         .await
         .unwrap();
@@ -360,10 +302,7 @@ async fn test_ephemeral_delete_msgs() -> Result<()> {
 
     // Enable ephemeral messages with Bob -> message will be deleted after 60s.
     // This tests that the message is deleted at min(ephemeral deletion time, DeleteDeviceAfter deletion time).
-    bob_chat
-        .id
-        .set_ephemeral_timer(t, Timer::Enabled { duration: 60 })
-        .await?;
+    bob_chat.id.set_ephemeral_timer(t, enabled(60)).await?;
 
     let now = time();
     let msg = t.send_text(bob_chat.id, "Message text").await;
@@ -678,10 +617,7 @@ async fn test_ephemeral_timer_references() -> Result<()> {
     )
     .await?;
     receive_imf(alice, encrypted_msg.as_bytes(), false).await?;
-    assert_eq!(
-        chat_id.get_ephemeral_timer(alice).await?,
-        Timer::Enabled { duration: 60 }
-    );
+    assert_eq!(chat_id.get_ephemeral_timer(alice).await?, enabled(60));
     let msg = alice.get_last_msg().await;
 
     // Message is deleted when its timer expires.
@@ -736,11 +672,11 @@ async fn test_ephemeral_msg_offline() -> Result<()> {
     let chat = alice.create_chat(bob).await;
     let duration = 60;
     chat.id
-        .set_ephemeral_timer(alice, Timer::Enabled { duration })
+        .set_ephemeral_timer(alice, enabled(duration))
         .await?;
     let mut msg = Message::new_text("hi".to_string());
     assert!(chat::send_msg_sync(alice, chat.id, &mut msg).await.is_err());
-    let stmt = "SELECT COUNT(*) FROM smtp WHERE msg_id=?";
+    let stmt = "SELECT COUNT(*) FROM smtp2 WHERE msg_id=?";
     assert!(alice.sql.exists(stmt, (msg.id,)).await?);
     let now = time();
     check_msg_will_be_deleted(alice, msg.id, &chat, now, now + i64::from(duration) + 1).await?;
@@ -760,7 +696,7 @@ async fn test_ephemeral_poi_location() -> Result<()> {
 
     let duration = 60;
     chat.id
-        .set_ephemeral_timer(alice, Timer::Enabled { duration })
+        .set_ephemeral_timer(alice, enabled(duration))
         .await?;
     let sent = alice.pop_sent_msg().await;
     bob.recv_msg(&sent).await;
@@ -808,7 +744,7 @@ async fn test_noticed_ephemeral_timer() -> Result<()> {
     let chat = alice.create_chat(bob).await;
     let duration = 60;
     chat.id
-        .set_ephemeral_timer(alice, Timer::Enabled { duration })
+        .set_ephemeral_timer(alice, enabled(duration))
         .await?;
     let bob_received_message = tcm.send_recv(alice, bob, "Hello!").await;
 
@@ -835,7 +771,7 @@ async fn test_archived_ephemeral_timer() -> Result<()> {
     let chat = alice.create_chat(bob).await;
     let duration = 60;
     chat.id
-        .set_ephemeral_timer(alice, Timer::Enabled { duration })
+        .set_ephemeral_timer(alice, enabled(duration))
         .await?;
     let bob_received_message = tcm.send_recv(alice, bob, "Hello!").await;
 
@@ -861,7 +797,7 @@ async fn test_archived_ephemeral_timer() -> Result<()> {
     let bob_received_message_2 = tcm.send_recv(alice, bob, "Hello again!").await;
     assert_eq!(bob_received_message_2.state, MessageState::InFresh);
 
-    marknoticed_chat(bob, DC_CHAT_ID_ARCHIVED_LINK).await?;
+    marknoticed_chat(bob, ChatId::ARCHIVED_LINK).await?;
     SystemTime::shift(Duration::from_secs(100));
 
     delete_expired_messages(bob, time()).await?;
@@ -892,9 +828,7 @@ async fn test_ephemeral_timer_non_member() -> Result<()> {
 
     // Bob wants to modify the timer.
     bob_chat_id.accept(bob).await?;
-    bob_chat_id
-        .set_ephemeral_timer(bob, Timer::Enabled { duration: 60 })
-        .await?;
+    bob_chat_id.set_ephemeral_timer(bob, enabled(60)).await?;
     let sent_ephemeral_timer_change = bob.pop_sent_msg().await;
 
     // Alice removes Bob before receiving the timer change.
@@ -906,6 +840,10 @@ async fn test_ephemeral_timer_non_member() -> Result<()> {
         alice_chat_id.get_ephemeral_timer(alice).await?,
         Timer::Disabled
     );
+
+    alice
+        .assert_warn("Ignoring ephemeral timer change to Enabled")
+        .await;
 
     Ok(())
 }
@@ -922,7 +860,7 @@ async fn test_disappearing_unknown_viewtype() -> Result<()> {
 
     let duration = 60;
     chat.id
-        .set_ephemeral_timer(alice, Timer::Enabled { duration })
+        .set_ephemeral_timer(alice, enabled(duration))
         .await?;
 
     let mut msg = Message::new_text("Expiring message".to_string());
@@ -939,7 +877,11 @@ async fn test_disappearing_unknown_viewtype() -> Result<()> {
 
     // This should not fail.
     delete_expired_messages(alice, time()).await?;
-
+    alice
+        .assert_warn(
+            "Using default viewtype for ephemeral handling.: Integer 70 out of range at index 2",
+        )
+        .await;
     Ok(())
 }
 
@@ -953,12 +895,20 @@ async fn test_delete_device_after_unknown_viewtype() -> Result<()> {
     let bob = &tcm.bob().await;
 
     let chat = alice.create_chat(bob).await;
+
+    // There may be a message created saying that all messages are encrypted
+    // with timestamp 0 so it is always at the top.
+    // It should still be not deleted because of the "received timestamp" that is recent.
+    assert_eq!(estimate_deletion_cnt(alice, false, 600).await.unwrap(), 0);
     alice
         .set_config(Config::DeleteDeviceAfter, Some("600"))
         .await?;
 
     let mut msg = Message::new_text("Some message".to_string());
     let _alice_sent_message = alice.send_msg(chat.id, &mut msg).await;
+
+    // New message should not be deleted as well yet.
+    assert_eq!(estimate_deletion_cnt(alice, false, 600).await.unwrap(), 0);
 
     // Set message viewtype to unassigned
     // type 70 that was previously used for videochat invitations.
@@ -969,8 +919,16 @@ async fn test_delete_device_after_unknown_viewtype() -> Result<()> {
 
     SystemTime::shift(Duration::from_secs(1000));
 
+    // Now both the system message about the chat being encrypted
+    // and the message sent by Alice are going to be deleted.
+    assert_eq!(estimate_deletion_cnt(alice, false, 600).await.unwrap(), 2);
+
     // This should not fail.
     delete_expired_messages(alice, time()).await?;
-
+    alice
+        .assert_warn(
+            "Using default viewtype for delete-old handling.: Integer 70 out of range at index 2",
+        )
+        .await;
     Ok(())
 }

@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 
-use deltachat::contact::ContactId;
 use deltachat::reaction::Reactions;
 use serde::Serialize;
 use typescript_type_def::TypeDef;
@@ -24,8 +23,11 @@ pub struct JsonrpcReaction {
 #[serde(rename = "Reactions", rename_all = "camelCase")]
 pub struct JsonrpcReactions {
     /// Map from a contact to it's reaction to message.
+    ///
     /// There is only a single reaction per contact,
     /// but this contains a list of reactions for historical reasons.
+    ///
+    /// For channels subscribers, this map is empty or contains `ContactId::SELF` only.
     reactions_by_contact: BTreeMap<u32, Vec<String>>,
     /// Unique reactions and their count, sorted in descending order.
     reactions: Vec<JsonrpcReaction>,
@@ -34,30 +36,24 @@ pub struct JsonrpcReactions {
 impl From<Reactions> for JsonrpcReactions {
     fn from(reactions: Reactions) -> Self {
         let reactions_by_contact: BTreeMap<u32, Vec<String>> = reactions
+            .by_contact
             .iter()
             .map(|(key, value)| (key.to_u32(), vec![value.as_str().to_string()]))
             .collect();
-        let self_reaction = reactions_by_contact.get(&ContactId::SELF.to_u32());
 
-        let mut reactions_v = Vec::new();
-        for (emoji, count) in reactions.emoji_sorted_by_frequency() {
-            let is_from_self = if let Some(self_reaction) = self_reaction {
-                self_reaction.contains(&emoji)
-            } else {
-                false
-            };
-
-            let reaction = JsonrpcReaction {
-                emoji,
-                count,
-                is_from_self,
-            };
-            reactions_v.push(reaction)
-        }
+        let reactions = reactions
+            .frequencies
+            .into_iter()
+            .map(|entry| JsonrpcReaction {
+                emoji: entry.reaction.as_str().to_string(),
+                count: entry.count,
+                is_from_self: entry.is_from_self,
+            })
+            .collect();
 
         JsonrpcReactions {
             reactions_by_contact,
-            reactions: reactions_v,
+            reactions,
         }
     }
 }

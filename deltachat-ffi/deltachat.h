@@ -19,7 +19,6 @@ typedef struct _dc_chat      dc_chat_t;
 typedef struct _dc_msg       dc_msg_t;
 typedef struct _dc_contact   dc_contact_t;
 typedef struct _dc_lot       dc_lot_t;
-typedef struct _dc_provider  dc_provider_t;
 typedef struct _dc_event     dc_event_t;
 typedef struct _dc_event_emitter dc_event_emitter_t;
 typedef struct _dc_event_channel dc_event_channel_t;
@@ -503,7 +502,6 @@ char*           dc_get_blobdir               (const dc_context_t* context);
  * - `send_pw`      = SMTP-password, guessed if left out
  * - `send_port`    = SMTP-port, guessed if left out
  * - `send_security`= SMTP-socket, one of @ref DC_SOCKET, defaults to #DC_SOCKET_AUTO
- * - `server_flags` = IMAP-/SMTP-flags as a combination of @ref DC_LP flags, guessed if left out
  * - `proxy_enabled` = Proxy enabled. Disabled by default.
  * - `proxy_url` = Proxy URL. May contain multiple URLs separated by newline, but only the first one is used.
  * - `imap_certificate_checks` = how to check IMAP and SMTP certificates, one of the @ref DC_CERTCK flags, defaults to #DC_CERTCK_AUTO (0)
@@ -528,9 +526,10 @@ int             dc_set_config                (dc_context_t* context, const char*
  *
  * - `sys.version` = get the version string e.g. as `1.2.3` or as `1.2.3special4`.
  * - `sys.msgsize_max_recommended` = maximal recommended attachment size in bytes.
- *                    All possible overheads are already subtracted and this value can be used e.g. for direct comparison
- *                    with the size of a file the user wants to attach. If an attachment is larger than this value,
- *                    an error (no warning as it should be shown to the user) is logged but the attachment is sent anyway.
+ *                    All possible overheads are already subtracted and this value can be used
+ *                    e.g. for direct comparison with the size of a file the user wants to attach.
+ *                    If an attachment is larger than this value, the message is sent anyway,
+ *                    but email servers are likely to reject the message when receiving it or before trying to send.
  * - `sys.config_keys` = get a space-separated list of all config-keys available.
  *                    The config-keys are the keys that can be passed to the parameter `key` of this function.
  *
@@ -590,36 +589,7 @@ int             dc_set_config_from_qr   (dc_context_t* context, const char* qr);
 char*           dc_get_info                  (const dc_context_t* context);
 
 
-/**
- * Get URL that can be used to initiate an OAuth2 authorization.
- *
- * If an OAuth2 authorization is possible for a given e-mail address,
- * this function returns the URL that should be opened in a browser.
- *
- * If the user authorizes access,
- * the given redirect_uri is called by the provider.
- * It's up to the UI to handle this call.
- *
- * The provider will attach some parameters to the URL,
- * most important the parameter `code` that should be set as the `mail_pw`.
- * With `server_flags` set to #DC_LP_AUTH_OAUTH2,
- * dc_configure() can be called as usual afterwards.
- *
- * @memberof dc_context_t
- * @param context The context object.
- * @param addr E-mail address the user has entered.
- *     In case the user selects a different e-mail address during
- *     authorization, this is corrected in dc_configure()
- * @param redirect_uri URL that will get `code` that is used as `mail_pw` then.
- *     Not all URLs are allowed here, however, the following should work:
- *     `chat.delta:/PATH`, `http://localhost:PORT/PATH`,
- *     `https://localhost:PORT/PATH`, `urn:ietf:wg:oauth:2.0:oob`
- *     (the latter just displays the code the user can copy+paste then)
- * @return URL that can be opened in the browser to start OAuth2.
- *     Returned strings must be released using dc_str_unref().
- *     If OAuth2 is not possible for the given e-mail address, NULL is returned.
- */
-char*           dc_get_oauth2_url            (dc_context_t* context, const char* addr, const char* redirect_uri);
+
 
 
 #define DC_CONNECTIVITY_NOT_CONNECTED        1000
@@ -631,13 +601,10 @@ char*           dc_get_oauth2_url            (dc_context_t* context, const char*
 /**
  * Get the current connectivity, i.e. whether the device is connected to the IMAP server.
  * One of:
- * - DC_CONNECTIVITY_NOT_CONNECTED (1000-1999): Show e.g. the string "Not connected" or a red dot
- * - DC_CONNECTIVITY_CONNECTING (2000-2999): Show e.g. the string "Connecting…" or a yellow dot
- * - DC_CONNECTIVITY_WORKING (3000-3999): Show e.g. the string "Getting new messages" or a spinning wheel
- * - DC_CONNECTIVITY_CONNECTED (>=4000): Show e.g. the string "Connected" or a green dot
- *
- * We don't use exact values but ranges here so that we can split up
- * states into multiple states in the future.
+ * - DC_CONNECTIVITY_NOT_CONNECTED (1000): Show e.g. the string "Not connected" or a red dot
+ * - DC_CONNECTIVITY_CONNECTING (2000): Show e.g. the string "Connecting…" or a yellow dot
+ * - DC_CONNECTIVITY_WORKING (3000): Show e.g. the string "Getting new messages" or a spinning wheel
+ * - DC_CONNECTIVITY_CONNECTED (4000): Show e.g. the string "Connected" or a green dot
  *
  * Meant as a rough overview that can be shown 
  * e.g. in the title of the main screen.
@@ -669,24 +636,6 @@ int             dc_get_connectivity          (dc_context_t* context);
 char*           dc_get_connectivity_html     (dc_context_t* context);
 
 
-#define DC_PUSH_NOT_CONNECTED 0
-#define DC_PUSH_HEARTBEAT     1
-#define DC_PUSH_CONNECTED     2
-
-/**
- * Get the current push notification state.
- * One of:
- * - DC_PUSH_NOT_CONNECTED
- * - DC_PUSH_HEARTBEAT
- * - DC_PUSH_CONNECTED
- *
- * @memberof dc_context_t
- * @param context The context object.
- * @return Push notification state.
- */
-int              dc_get_push_state           (dc_context_t* context);
-
-
 // connect
 
 /**
@@ -713,7 +662,7 @@ int              dc_get_push_state           (dc_context_t* context);
  *       to get the full configuration from well-known URLs.
  *
  *     - If _more_ options as `mail_server`, `mail_port`, `send_server`,
- *       `send_port`, `send_user` or `server_flags` are specified,
+ *       `send_port` or `send_user` are specified,
  *       **autoconfigure/autodiscover is skipped**.
  *
  * While dc_configure() returns immediately,
@@ -921,14 +870,14 @@ uint32_t        dc_create_chat_by_contact_id (dc_context_t* context, uint32_t co
 
 
 /**
- * Check, if there is a normal chat with a given contact.
+ * Check, if there is a single chat with a given contact.
  * To get the chat messages, use dc_get_chat_msgs().
  *
  * @memberof dc_context_t
  * @param context The context object as returned from dc_context_new().
  * @param contact_id The contact ID to check.
- * @return If there is a normal chat with the given contact_id, this chat_id is
- *     returned. If there is no normal chat with the contact_id, the function
+ * @return If there is a single chat with the given contact_id, this chat_id is
+ *     returned. If there is no single chat with the contact_id, the function
  *     returns 0.
  */
 uint32_t        dc_get_chat_id_by_contact_id (dc_context_t* context, uint32_t contact_id);
@@ -1225,7 +1174,7 @@ uint32_t        dc_init_webxdc_integration    (dc_context_t* context, uint32_t c
  * @memberof dc_context_t
  * @param context The context object.
  * @param chat_id The chat to place a call for.
- *     This needs to be a one-to-one chat.
+ *     This needs to be a single chat.
  * @param place_call_info any data that other devices receive
  *     in #DC_EVENT_INCOMING_CALL.
  * @param has_video Whether the call has video initially.
@@ -1631,7 +1580,7 @@ void            dc_set_chat_visibility       (dc_context_t* context, uint32_t ch
  * - The chat or the contact is **not blocked**, so new messages from the user/the group may appear
  *   and the user may create the chat again.
  * - **Groups are not left** - this would
- *   be unexpected as (1) deleting a normal chat also does not prevent new mails
+ *   be unexpected as (1) deleting a single chat also does not prevent new mails
  *   from arriving, (2) leaving a group requires sending a message to
  *   all group members - especially for groups not used for a longer time, this is
  *   really unexpected when deletion results in contacting all members again,
@@ -1649,7 +1598,7 @@ void            dc_delete_chat               (dc_context_t* context, uint32_t ch
 /**
  * Block a chat.
  *
- * Blocking 1:1 chats blocks the corresponding contact. Blocking
+ * Blocking single chats blocks the corresponding contact. Blocking
  * mailing lists creates a pseudo-contact in the list of blocked
  * contacts, so blocked mailing lists can be discovered and unblocked
  * the same way as the contacts. Blocking group chats deletes the
@@ -1678,7 +1627,7 @@ void            dc_accept_chat               (dc_context_t* context, uint32_t ch
 /**
  * Get the contact IDs belonging to a chat.
  *
- * - for normal chats, the function always returns exactly one contact,
+ * - for single chats, the function always returns exactly one contact,
  *   DC_CONTACT_ID_SELF is returned only for SELF-chats.
  *
  * - for group chats all members are returned, DC_CONTACT_ID_SELF is returned
@@ -1828,8 +1777,6 @@ int             dc_is_contact_in_chat        (dc_context_t* context, uint32_t ch
  *
  * If the group is already _promoted_ (any message was sent to the group),
  * all group members are informed by a special status message that is sent automatically by this function.
- *
- * If the group has group protection enabled, only verified contacts can be added to the group.
  *
  * Sends out #DC_EVENT_CHAT_MODIFIED and #DC_EVENT_MSGS_CHANGED if a status message was sent.
  *
@@ -2116,7 +2063,7 @@ int             dc_resend_msgs               (dc_context_t* context, const uint3
  * The concrete action depends on the type of the chat and on the users settings
  * (dc_msgs_presented() may be a better name therefore, but well. :)
  *
- * - For normal chats, the IMAP state is updated, MDN is sent
+ * - For single chats, the IMAP state is updated, MDN is sent
  *   (if dc_set_config()-options `mdns_enabled` is set)
  *   and the internal state is changed to @ref DC_STATE_IN_SEEN to reflect these actions.
  *
@@ -2329,7 +2276,7 @@ void            dc_block_contact             (dc_context_t* context, uint32_t co
 /**
  * Get encryption info for a contact.
  * Get a multi-line encryption info, containing your fingerprint and the
- * fingerprint of the contact, used e.g. to compare the fingerprints for a simple out-of-band verification.
+ * fingerprint of the contact, used e.g. to compare the fingerprints out-of-band.
  *
  * @memberof dc_context_t
  * @param context The context object.
@@ -2496,7 +2443,7 @@ char*           dc_imex_has_backup           (dc_context_t* context, const char*
 void            dc_stop_ongoing_process      (dc_context_t* context);
 
 
-// out-of-band verification
+// securejoin
 
 #define         DC_QR_ASK_VERIFYCONTACT      200 // id=contact
 #define         DC_QR_ASK_VERIFYGROUP        202 // text1=groupname
@@ -2531,7 +2478,7 @@ void            dc_stop_ongoing_process      (dc_context_t* context);
  * The QR code state is returned in dc_lot_t::state as:
  *
  * - DC_QR_ASK_VERIFYCONTACT with dc_lot_t::id=Contact ID:
- *   ask whether to verify the contact;
+ *   ask whether to start chatting with the contact;
  *   if so, start the protocol with dc_join_securejoin().
  *
  * - DC_QR_ASK_VERIFYGROUP or DC_QR_ASK_VERIFYBROADCAST
@@ -2540,7 +2487,7 @@ void            dc_stop_ongoing_process      (dc_context_t* context);
  *   if so, start the protocol with dc_join_securejoin().
  *
  * - DC_QR_FPR_OK with dc_lot_t::id=Contact ID:
- *   contact fingerprint verified,
+ *   contact fingerprint matches,
  *   ask the user if they want to start chatting;
  *   if so, call dc_create_chat_by_contact_id().
  *
@@ -2616,23 +2563,24 @@ dc_lot_t*       dc_check_qr                  (dc_context_t* context, const char*
 
 
 /**
- * Get QR code text that will offer an Setup-Contact or Verified-Group invitation.
+ * Get QR code text that will offer a SecureJoin invitation.
  *
  * The scanning device will pass the scanned content to dc_check_qr() then;
  * if dc_check_qr() returns
  * DC_QR_ASK_VERIFYCONTACT, DC_QR_ASK_VERIFYGROUP or DC_QR_ASK_VERIFYBROADCAST
- * an out-of-band-verification can be joined using dc_join_securejoin()
+ * the SecureJoin protocol can be started using dc_join_securejoin()
  *
  * The returned text will also work as a normal https:-link,
  * so that the QR code is useful also without Delta Chat being installed
  * or can be passed to contacts through other channels.
  *
+ * To reset invitations, pass the link to dc_set_config_from_qr().
+ *
  * @memberof dc_context_t
  * @param context The context object.
  * @param chat_id If set to a group-chat-id,
- *     the Verified-Group-Invite protocol is offered in the QR code;
- *     works for protected groups as well as for normal groups.
- *     If set to 0, the Setup-Contact protocol is offered in the QR code.
+ *     the SecureJoin QR code for the group is returned.
+ *     If set to 0, the setup contact QR code is returned.
  *     See https://securejoin.delta.chat/
  *     for details about both protocols.
  * @return The text that should go to the QR code,
@@ -2658,7 +2606,7 @@ char*           dc_get_securejoin_qr         (dc_context_t* context, uint32_t ch
 char*           dc_get_securejoin_qr_svg         (dc_context_t* context, uint32_t chat_id);
 
 /**
- * Continue a Setup-Contact or Verified-Group-Invite protocol
+ * Continue the SecureJoin protocol
  * started on another device with dc_get_securejoin_qr().
  * This function is typically called when dc_check_qr() returns
  * lot.state=DC_QR_ASK_VERIFYCONTACT, lot.state=DC_QR_ASK_VERIFYGROUP or lot.state=DC_QR_ASK_VERIFYBROADCAST
@@ -2678,7 +2626,6 @@ char*           dc_get_securejoin_qr_svg         (dc_context_t* context, uint32_
  *     to dc_check_qr().
  * @return The chat ID of the joined chat, the UI may redirect to the this chat.
  *     On errors, 0 is returned, however, most errors will happen during handshake later on.
- *     A returned chat ID does not guarantee that the chat is protected or the belonging contact is verified.
  */
 uint32_t        dc_join_securejoin           (dc_context_t* context, const char* qr);
 
@@ -3240,19 +3187,22 @@ void           dc_accounts_maybe_network_lost    (dc_accounts_t* accounts);
 
 /**
  * Perform a background fetch for all accounts in parallel with a timeout.
- * Pauses the scheduler, fetches messages from imap and then resumes the scheduler.
+ * Pauses the scheduler, fetches from all transports at once and then resumes the scheduler.
+ * The fetch for an account ends as soon as one of its transports received messages.
  *
  * dc_accounts_background_fetch() was created for the iOS Background fetch.
  *
- * The `DC_EVENT_ACCOUNTS_BACKGROUND_FETCH_DONE` event is emitted at the end
- * even in case of timeout, unless the function fails and returns 0.
+ * The `DC_EVENT_ACCOUNTS_BACKGROUND_FETCH_DONE` event is emitted at the end,
+ * also on timeout, when another background fetch is already running
+ * and when the call is ignored because the timeout is too small,
+ * so it is safe to wait for the event whenever `accounts` is not NULL.
  * Process all events until you get this one and you can safely return to the background
  * without forgetting to create notifications caused by timing race conditions.
  *
  * @memberof dc_accounts_t
  * @param accounts The account manager as created by dc_accounts_new().
  * @param timeout The timeout in seconds
- * @return Return 1 if DC_EVENT_ACCOUNTS_BACKGROUND_FETCH_DONE was emitted and 0 otherwise.
+ * @return Return 0 if the call was ignored because `accounts` is NULL or the timeout is too small, 1 otherwise.
  */
 int            dc_accounts_background_fetch    (dc_accounts_t* accounts, uint64_t timeout);
 
@@ -3608,17 +3558,9 @@ dc_lot_t*        dc_chatlist_get_summary2    (dc_context_t* context, uint32_t ch
 
 
 /**
- * Helper function to get the associated context object.
- *
- * @memberof dc_chatlist_t
- * @param chatlist The chatlist object to empty.
- * @return The context object associated with the chatlist. NULL if none or on errors.
- */
-dc_context_t*    dc_chatlist_get_context     (dc_chatlist_t* chatlist);
-
-
-/**
  * Get info summary for a chat, in JSON format.
+ *
+ * @deprecated 2026-08-13, use dedicated dc_chat_get_*() getters or jsonrpc
  *
  * The returned JSON string has the following key/values:
  *
@@ -3630,7 +3572,6 @@ dc_context_t*    dc_chatlist_get_context     (dc_chatlist_t* chatlist);
  * last-message-state: @ref DC_STATE constant
  * last-message-date:
  * avatar-path: path-to-blobfile
- * is_verified: yes/no
  * @return a UTF8-encoded JSON string containing all requested info. Must be freed using dc_str_unref(). NULL is never returned.
  */
 char*            dc_chat_get_info_json       (dc_context_t* context, size_t chat_id);
@@ -3700,7 +3641,7 @@ char*           dc_chat_get_mailinglist_addr (const dc_chat_t* chat);
 
 
 /**
- * Get name of a chat. For one-to-one chats, this is the name of the contact.
+ * Get name of a chat. For single chats, this is the name of the contact.
  * For group chats, this is the name given e.g. to dc_create_group_chat() or
  * received by a group-creation message.
  *
@@ -3717,7 +3658,7 @@ char*           dc_chat_get_name             (const dc_chat_t* chat);
  * Get the chat's profile image.
  * For groups, this is the image set by any group member
  * using dc_set_chat_profile_image().
- * For normal chats, this is the image set by each remote user on their own
+ * For single chats, this is the image set by each remote user on their own
  * using dc_set_config(context, "selfavatar", image).
  *
  * @memberof dc_chat_t
@@ -3731,7 +3672,7 @@ char*           dc_chat_get_profile_image    (const dc_chat_t* chat);
 
 /**
  * Get a color for the chat.
- * For 1:1 chats, the color is calculated from the contact's e-mail address.
+ * For single chats, the color is calculated from the contact's e-mail address.
  * Otherwise, the chat name is used.
  * The color can be used for an fallback avatar with white initials
  * as well as for headlines in bubbles of group chats.
@@ -3798,7 +3739,7 @@ int             dc_chat_is_unpromoted        (const dc_chat_t* chat);
 
 
 /**
- * Check if a chat is a self talk. Self talks are normal chats with
+ * Check if a chat is a self talk. Self talks are single chats with
  * the only contact DC_CONTACT_ID_SELF.
  *
  * @memberof dc_chat_t
@@ -3840,22 +3781,11 @@ int             dc_chat_can_send              (const dc_chat_t* chat);
 
 
 /**
- * Deprecated, always returns 0.
- *
- * @memberof dc_chat_t
- * @param chat The chat object.
- * @return Always 0.
- * @deprecated 2025-09-09
- */
-int             dc_chat_is_protected         (const dc_chat_t* chat);
-
-
-/**
  * Check if the chat is encrypted.
  *
- * 1:1 chats with key-contacts and group chats with key-contacts
+ * Single chats with key-contacts and group chats with key-contacts
  * are encrypted.
- * 1:1 chats with emails contacts and ad-hoc groups
+ * Single chats with emails contacts and ad-hoc groups
  * created for email threads are not encrypted.
  *
  * @memberof dc_chat_t
@@ -4389,16 +4319,16 @@ char*           dc_msg_get_summarytext        (const dc_msg_t* msg, int approx_c
  * display name, or NULL.
  *
  * If this returns non-NULL, put a `~` before the override-sender-name and show the
- * override-sender-name and the sender's avatar even in 1:1 chats.
+ * override-sender-name and the sender's avatar even in single chats.
  *
  * In mailing lists, sender display name and sender address do not always belong together.
  * In this case, this function gives you the name that should actually be shown over the message.
  *
- * Also, sometimes, we need to indicate a different sender in 1:1 chats:
+ * Also, sometimes, we need to indicate a different sender in single chats:
  * Suppose that our user writes an e-mail to support@delta.chat, which forwards to 
  * Bob <bob@delta.chat>, and Bob replies.
  * 
- * Then, Bob's reply is shown in our 1:1 chat with support@delta.chat and the override-sender-name is
+ * Then, Bob's reply is shown in our single chat with support@delta.chat and the override-sender-name is
  * set to `Bob`. The UI should show the sender name as `~Bob` and show the avatar, just
  * as in group messages. If the user then taps on the avatar, they can see that this message
  * comes from bob@delta.chat.
@@ -4532,6 +4462,7 @@ int             dc_msg_is_info                (const dc_msg_t* msg);
  * - DC_INFO_WEBXDC_INFO_MESSAGE (32) - Info-message created by webxdc app sending `update.info`
  * - DC_INFO_CHAT_E2EE (50) - Info-message for "Chat is end-to-end-encrypted"
  * - DC_INFO_GROUP_DESCRIPTION_CHANGED (70) - Info-message "Description changed", UI should open the profile with the description
+ * - DC_INFO_MESSAGE_PINNED (71) - Message pinned, UI should scroll to the pinned message returned by dc_msg_get_parent()
  *
  * For the messages that refer to a CONTACT,
  * dc_msg_get_info_contact_id() returns the contact ID.
@@ -4591,6 +4522,7 @@ uint32_t        dc_msg_get_info_contact_id    (const dc_msg_t* msg);
 #define         DC_INFO_WEBXDC_INFO_MESSAGE       32
 #define         DC_INFO_CHAT_E2EE                 50
 #define         DC_INFO_GROUP_DESCRIPTION_CHANGED 70
+#define         DC_INFO_MESSAGE_PINNED            71
 
 
 /**
@@ -4908,6 +4840,8 @@ dc_msg_t*       dc_msg_get_quoted_msg         (const dc_msg_t* msg);
  * Used for Webxdc-info-messages
  * to jump to the corresponding instance that created the info message.
  *
+ * For Pinned-info-messages, this refers to the pinned message.
+ *
  * For quotes, please use the more specialized
  * dc_msg_get_quoted_text() and dc_msg_get_quoted_msg().
  *
@@ -4946,6 +4880,20 @@ uint32_t        dc_msg_get_original_msg_id    (const dc_msg_t* msg);
  *     0 if the given message object is not saved.
  */
 uint32_t        dc_msg_get_saved_msg_id     (const dc_msg_t* msg);
+
+
+/**
+ * Check if the message is pinned.
+ *
+ * Pinned messages should be marked by a pin needle in the UI.
+ * To pin messages or get all pinned messages, use jsonrpc's "setPinnedMessageState" and "getPinnedMessages".
+ *
+ * @memberof dc_msg_t
+ * @param msg The message object.
+ * @return 1=message is pinned, 0=message not pinned.
+ */
+ int             dc_msg_is_pinned           (const dc_msg_t* msg);
+
 
 /**
  * @class dc_contact_t
@@ -5164,19 +5112,6 @@ int             dc_contact_is_blocked        (const dc_contact_t* contact);
 
 
 /**
- * Check if the contact
- * can be added to protected chats.
- *
- * See dc_contact_get_verifier_id() for a guidance how to display these information.
- *
- * @memberof dc_contact_t
- * @param contact The contact object.
- * @return 0: contact is not verified.
- *    2: SELF and contact have verified their fingerprints in both directions.
- */
-int             dc_contact_is_verified       (dc_contact_t* contact);
-
-/**
  * Returns whether contact is a bot.
  *
  * @memberof dc_contact_t
@@ -5198,128 +5133,6 @@ int             dc_contact_is_bot            (dc_contact_t* contact);
  * @return 1 if the contact is a key-contact, 0 if it is an address-contact.
  */
 int             dc_contact_is_key_contact    (dc_contact_t* contact);
-
-
-/**
- * Return the contact ID that verified a contact.
- *
- * As verifier may be unknown,
- * use dc_contact_is_verified() to check if a contact can be added to a protected chat.
- *
- * UI should display the information in the contact's profile as follows:
- *
- * - If dc_contact_get_verifier_id() != 0,
- *   display text "Introduced by ..."
- *   with the name of the contact
- *   formatted by dc_contact_get_name().
- *   Prefix the text by a green checkmark.
- *
- * - If dc_contact_get_verifier_id() == 0 and dc_contact_is_verified() != 0,
- *   display "Introduced" prefixed by a green checkmark.
- *
- * - if dc_contact_get_verifier_id() == 0 and dc_contact_is_verified() == 0,
- *   display nothing
- *
- * @memberof dc_contact_t
- * @param contact The contact object.
- * @return 
- *    The contact ID of the verifier. If it is DC_CONTACT_ID_SELF,
- *    we verified the contact ourself. If it is 0, we don't have verifier information or 
- *    the contact is not verified.
- */
-uint32_t       dc_contact_get_verifier_id      (dc_contact_t* contact);
-
-
-/**
- * @class dc_provider_t
- *
- * Opaque object containing information about one single e-mail provider.
- */
-
-
-/**
- * Create a provider struct for the given e-mail address by local lookup.
- *
- * Lookup is done from the local database by extracting the domain from the e-mail address.
- * Therefore the provider for custom domains cannot be identified.
- *
- * @memberof dc_provider_t
- * @param context The context object.
- * @param email The user's e-mail address to extract the provider info form.
- * @return A dc_provider_t struct which can be used with the dc_provider_get_*
- *     accessor functions. If no provider info is found, NULL will be
- *     returned.
- */
-dc_provider_t*  dc_provider_new_from_email            (const dc_context_t* context, const char* email);
-
-
-/**
- * Create a provider struct for the given e-mail address by local lookup.
- *
- * DNS lookup is not used anymore and this function is deprecated.
- *
- * @memberof dc_provider_t
- * @param context The context object.
- * @param email The user's e-mail address to extract the provider info form.
- * @return A dc_provider_t struct which can be used with the dc_provider_get_*
- *     accessor functions. If no provider info is found, NULL will be
- *     returned.
- * @deprecated 2025-10-17 use dc_provider_new_from_email() instead.
- */
-dc_provider_t*  dc_provider_new_from_email_with_dns    (const dc_context_t* context, const char* email);
-
-
-/**
- * URL of the overview page.
- *
- * This URL allows linking to the providers page on providers.delta.chat.
- *
- * @memberof dc_provider_t
- * @param provider The dc_provider_t struct.
- * @return A string with a fully-qualified URL,
- *     if there is no such URL, an empty string is returned, NULL is never returned.
- *     The returned value must be released using dc_str_unref().
- */
-char*           dc_provider_get_overview_page         (const dc_provider_t* provider);
-
-
-/**
- * Get hints to be shown to the user on the login screen.
- * Depending on the @ref DC_PROVIDER_STATUS returned by dc_provider_get_status(),
- * the UI may want to highlight the hint.
- *
- * Moreover, the UI should display a "More information" link
- * that forwards to the URL returned by dc_provider_get_overview_page().
- *
- * @memberof dc_provider_t
- * @param provider The dc_provider_t struct.
- * @return A string with the hint to show to the user, may contain multiple lines,
- *     if there is no such hint, an empty string is returned, NULL is never returned.
- *     The returned value must be released using dc_str_unref().
- */
-char*           dc_provider_get_before_login_hint     (const dc_provider_t* provider);
-
-
-/**
- * Whether DC works with this provider.
- *
- * Can be one of #DC_PROVIDER_STATUS_OK,
- * #DC_PROVIDER_STATUS_PREPARATION or #DC_PROVIDER_STATUS_BROKEN.
- *
- * @memberof dc_provider_t
- * @param provider The dc_provider_t struct.
- * @return The status as a constant number.
- */
-int             dc_provider_get_status                (const dc_provider_t* provider);
-
-
-/**
- * Free the provider info struct.
- *
- * @memberof dc_provider_t
- * @param provider The dc_provider_t struct.
- */
-void            dc_provider_unref                     (dc_provider_t* provider);
 
 
 /**
@@ -5635,7 +5448,7 @@ int64_t         dc_lot_get_timestamp     (const dc_lot_t* lot);
 #define         DC_CHAT_TYPE_UNDEFINED       0
 
 /**
- * A one-to-one chat with a single contact.
+ * A single chat with a single contact.
  *
  * dc_get_chat_contacts() contains one record for the user.
  * DC_CONTACT_ID_SELF is added _only_ for a self talk.
@@ -5736,41 +5549,6 @@ int64_t         dc_lot_get_timestamp     (const dc_lot_t* lot);
  * @}
  */
 
-
-/**
- * @defgroup DC_LP DC_LP
- *
- * Flags for configuring IMAP and SMTP servers.
- * These flags are optional
- * and may be set together with the username, password etc.
- * via dc_set_config() using the key "server_flags".
- *
- * @addtogroup DC_LP
- * @{
- */
-
-
-/**
- * Force OAuth2 authorization. This flag does not skip automatic configuration.
- * Before calling dc_configure() with DC_LP_AUTH_OAUTH2 set,
- * the user has to confirm access at the URL returned by dc_get_oauth2_url().
- */
-#define DC_LP_AUTH_OAUTH2                0x2
-
-
-/**
- * Force NORMAL authorization, this is the default.
- * If this flag is set, automatic configuration is skipped.
- */
-#define DC_LP_AUTH_NORMAL                0x4
-
-
-/**
- * @}
- */
-
-#define DC_LP_AUTH_FLAGS        (DC_LP_AUTH_OAUTH2|DC_LP_AUTH_NORMAL) // if none of these flags are set, the default is chosen
-
 /**
  * @defgroup DC_CERTCK DC_CERTCK
  *
@@ -5858,6 +5636,7 @@ void dc_jsonrpc_unref(dc_jsonrpc_instance_t* jsonrpc_instance);
  * - getAccountFileSize()
  * - importVcard(), parseVcard(), makeVcard()
  * - sendWebxdcRealtimeData, sendWebxdcRealtimeAdvertisement(), leaveWebxdcRealtime()
+ * - setPinnedMessageState(), getPinnedMessages()
  *
  * @memberof dc_jsonrpc_instance_t
  * @param jsonrpc_instance jsonrpc instance as returned from dc_jsonrpc_init().
@@ -6386,7 +6165,7 @@ void dc_event_unref(dc_event_t* event);
 
 
 /**
- * Contact(s) created, renamed, verified, blocked or deleted.
+ * Contact(s) created, renamed, blocked or deleted.
  *
  * @param data1 (int) contact_id of the changed contact or 0 on batch-changes or deletion.
  * @param data2 0
@@ -6458,8 +6237,7 @@ void dc_event_unref(dc_event_t* event);
  *
  * @param data1 (int) The ID of the inviting contact.
  * @param data2 (int) The progress as:
- *     400=vg-/vc-request-with-auth sent, typically shown as "alice@addr verified, introducing myself."
- *     (Bob has verified alice and waits until Alice does the same for him)
+ *     400=vg-/vc-request-with-auth sent, typically shown as "introducing myself."
  *     1000=vg-member-added/vc-contact-confirm received
  */
 #define DC_EVENT_SECUREJOIN_JOINER_PROGRESS       2061
@@ -6542,11 +6320,14 @@ void dc_event_unref(dc_event_t* event);
 #define DC_EVENT_WEBXDC_REALTIME_ADVERTISEMENT    2151
 
 /**
- * Tells that the Background fetch was completed (or timed out).
+ * Tells that a call to dc_accounts_background_fetch() is done:
+ * the fetch completed, timed out, was stopped or was not started.
  *
- * This event acts as a marker, when you reach this event you can be sure
- * that all events emitted during the background fetch were processed.
- * 
+ * For the call that started the fetch, this event acts as a marker:
+ * when you reach it, all events emitted during the fetch were processed.
+ * A call made while another background fetch is running gets the event immediately,
+ * and the running fetch keeps emitting events until its own marker.
+ *
  * This event is only emitted by the account manager
  */
 
@@ -6642,7 +6423,7 @@ void dc_event_unref(dc_event_t* event);
 
 /**
  * An incoming or outgoing call was ended using dc_end_call() on this or another device, by caller or callee.
- * Moreover, the event is sent when the call was not accepted within 1 minute timeout.
+ * Moreover, the event is sent when the call was not accepted within two minutes.
  *
  * UI usually only takes action in case call UI was opened before, otherwise the event should be ignored.
  *
@@ -6654,9 +6435,10 @@ void dc_event_unref(dc_event_t* event);
  * Transport relay added/deleted or default has changed.
  * UI should update the list.
  *
- * The event is emitted when the transports are modified on another device
- * using the JSON-RPC calls `add_or_update_transport`, `add_transport_from_qr`, `delete_transport`,
- * `set_transport_unpublished` or `set_config(configured_addr)`.
+ * The event is emitted on the device modifying the transports
+ * as well as on other devices applying the synced change,
+ * for the JSON-RPC calls `add_or_update_transport`, `add_transport_from_qr`,
+ * `delete_transport` or `set_config(configured_addr)`.
  */
 #define DC_EVENT_TRANSPORTS_MODIFIED           2600
 
@@ -6675,61 +6457,6 @@ void dc_event_unref(dc_event_t* event);
  */
 #define DC_MEDIA_QUALITY_BALANCED 0
 #define DC_MEDIA_QUALITY_WORSE    1
-
-
-/**
- * @defgroup DC_PROVIDER_STATUS DC_PROVIDER_STATUS
- *
- * These constants are used as return values for dc_provider_get_status().
- *
- * @addtogroup DC_PROVIDER_STATUS
- * @{
- */
-
-/**
- * Provider works out-of-the-box.
- * This provider status is returned for provider where the login
- * works by just entering the name or the e-mail address.
- *
- * - There is no need for the user to do any special things
- *   (enable IMAP or so) in the provider's web interface or at other places.
- * - There is no need for the user to enter advanced settings;
- *   server, port etc. are known by the core.
- *
- * The status is returned by dc_provider_get_status().
- */
-#define         DC_PROVIDER_STATUS_OK           1
-
-/**
- * Provider works, but there are preparations needed.
- *
- * - The user has to do some special things as "Enable IMAP in the web interface",
- *   what exactly, is described in the string returned by dc_provider_get_before_login_hints()
- *   and, typically more detailed, in the page linked by dc_provider_get_overview_page().
- * - There is no need for the user to enter advanced settings;
- *   server, port etc. should be known by the core.
- *
- * The status is returned by dc_provider_get_status().
- */
-#define         DC_PROVIDER_STATUS_PREPARATION  2
-
-/**
- * Provider is not working.
- * This provider status is returned for providers
- * that are known to not work with Delta Chat.
- * The UI should block logging in with this provider.
- *
- * More information about that is typically provided
- * in the string returned by dc_provider_get_before_login_hints()
- * and in the page linked by dc_provider_get_overview_page().
- *
- * The status is returned by dc_provider_get_status().
- */
-#define         DC_PROVIDER_STATUS_BROKEN       3
-
-/**
- * @}
- */
 
 
 /**
@@ -6896,21 +6623,12 @@ void dc_event_unref(dc_event_t* event);
 /// Used to build the string returned by dc_get_contact_encrinfo().
 #define DC_STR_FINGERPRINTS               30
 
-/// "%1$s verified"
-///
-/// Used in status messages.
-/// - %1$s will be replaced by the name of the verified contact
-#define DC_STR_CONTACT_VERIFIED           35
-
 /// "Archived chats"
 ///
 /// Used as the name for the corresponding chatlist entry.
 #define DC_STR_ARCHIVEDCHATS              40
 
-/// "Cannot login as %1$s."
-///
-/// Used in error strings.
-/// - %1$s will be replaced by the failing login name
+/// @deprecated 2026-08-24
 #define DC_STR_CANNOT_LOGIN               60
 
 /// "Location streaming enabled."
@@ -6955,7 +6673,7 @@ void dc_event_unref(dc_event_t* event);
 
 /// "Message from %1$s"
 ///
-/// Used in subjects of outgoing messages in one-to-one chats.
+/// Used in subjects of outgoing messages in single chats.
 /// - %1$s will be replaced by the name of the sender,
 ///   this is the dc_set_config()-option `displayname` or `addr`
 #define DC_STR_SUBJECT_FOR_NEW_CONTACT    73
@@ -7083,7 +6801,7 @@ void dc_event_unref(dc_event_t* event);
 ///
 /// Added as an info-message directly after scanning a QR code for joining a group.
 /// May be followed by the info-messages
-/// #DC_STR_SECURE_JOIN_REPLIES, #DC_STR_CONTACT_VERIFIED and #DC_STR_MSGADDMEMBER.
+/// #DC_STR_SECURE_JOIN_REPLIES and #DC_STR_MSGADDMEMBER.
 ///
 /// `%1$s` and `%2$s` will be replaced by name of the inviter.
 #define DC_STR_SECURE_JOIN_STARTED        117
@@ -7092,15 +6810,13 @@ void dc_event_unref(dc_event_t* event);
 ///
 /// Info-message on scanning a QR code for joining a group.
 /// Added after #DC_STR_SECURE_JOIN_STARTED.
-/// If the handshake allows to skip a step and go for #DC_STR_CONTACT_VERIFIED directly,
-/// this info-message is skipped.
 ///
 /// `%1$s` will be replaced by the name of the inviter.
 #define DC_STR_SECURE_JOIN_REPLIES        118
 
 /// "Scan to chat with %1$s"
 ///
-/// Subtitle for verification qrcode svg image generated by the core.
+/// Subtitle for the invite qrcode svg image generated by the core.
 ///
 /// `%1$s` will be replaced by name of the inviter.
 #define DC_STR_SETUP_CONTACT_QR_DESC      119
@@ -7395,6 +7111,30 @@ void dc_event_unref(dc_event_t* event);
 /// `%1$s` will be replaced by name of the removed contact.
 #define DC_STR_REMOVE_MEMBER 178
 
+/// "You were removed by %1$s."
+///
+/// `%1$s` will be replaced by name of the contact who did the action.
+///
+/// Used in status messages.
+#define DC_STR_REMOVE_YOU_BY 179
+
+/// "You were added by %1$s."
+///
+/// `%1$s` will be replaced by name of the contact who did the action.
+///
+/// Used in status messages.
+#define DC_STR_ADD_YOU_BY 180
+
+/// "You were removed."
+///
+/// Used in status messages.
+#define DC_STR_REMOVE_YOU 181
+
+/// "You were added."
+///
+/// Used in status messages.
+#define DC_STR_ADD_YOU 182
+
 /// "Establishing connection, please wait…"
 ///
 /// Used as info message.
@@ -7490,6 +7230,14 @@ void dc_event_unref(dc_event_t* event);
 /// Used when creating text for the "Encryption Info" dialogs.
 #define DC_STR_MESSAGES_ARE_E2EE 242
 
+/// "You pinned a message."
+#define DC_STR_MESSAGE_PINNED_BY_YOU 243
+
+/// "Message pinned by %1$s."
+#define DC_STR_MESSAGE_PINNED_BY_OTHER 244
+
+/// @deprecated 2026-08-31
+#define DC_STR_PHASING_OUT 245
 
 /**
  * @}

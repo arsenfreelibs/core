@@ -328,6 +328,7 @@ async fn test_file_handling() {
 
     assert!(delete_file(context, Path::new(fn0)).await.is_ok());
     assert!(!file_exist!(context, &fn0));
+    t.assert_warn("refusing to delete non-file").await;
 }
 
 #[test]
@@ -524,57 +525,6 @@ fn test_remove_subject_prefix() {
     assert_eq!(remove_subject_prefix("Re: Subject"), "Subject");
     assert_eq!(remove_subject_prefix("Fwd: Subject"), "Subject");
     assert_eq!(remove_subject_prefix("Fw: Subject"), "Subject");
-}
-
-#[test]
-fn test_parse_mailto() {
-    let mailto_url = "mailto:someone@example.com";
-    let reps = parse_mailto(mailto_url);
-    assert_eq!(
-        Some(MailTo {
-            to: vec![EmailAddress {
-                local: "someone".to_string(),
-                domain: "example.com".to_string()
-            }],
-            subject: None,
-            body: None
-        }),
-        reps
-    );
-
-    let mailto_url = "mailto:someone@example.com?subject=Hello%20World";
-    let reps = parse_mailto(mailto_url);
-    assert_eq!(
-        Some(MailTo {
-            to: vec![EmailAddress {
-                local: "someone".to_string(),
-                domain: "example.com".to_string()
-            }],
-            subject: Some("Hello World".to_string()),
-            body: None
-        }),
-        reps
-    );
-
-    let mailto_url = "mailto:someone@example.com,someoneelse@example.com?subject=Hello%20World&body=This%20is%20a%20test";
-    let reps = parse_mailto(mailto_url);
-    assert_eq!(
-        Some(MailTo {
-            to: vec![
-                EmailAddress {
-                    local: "someone".to_string(),
-                    domain: "example.com".to_string()
-                },
-                EmailAddress {
-                    local: "someoneelse".to_string(),
-                    domain: "example.com".to_string()
-                }
-            ],
-            subject: Some("Hello World".to_string()),
-            body: Some("This is a test".to_string())
-        }),
-        reps
-    );
 }
 
 #[test]

@@ -9,10 +9,9 @@ pub use dclogin_scheme::LoginOptions;
 pub(crate) use dclogin_scheme::login_param_from_login_qr;
 use deltachat_contact_tools::{ContactAddress, addr_normalize, may_be_valid_addr};
 use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, percent_encode};
-use rand::TryRngCore as _;
-use rand::distr::{Alphanumeric, SampleString};
 use serde::Deserialize;
 
+use crate::autorelay::login_param_from_host;
 use crate::config::Config;
 use crate::contact::{Contact, ContactId, Origin};
 use crate::context::Context;
@@ -46,7 +45,7 @@ pub(crate) const DCBACKUP_VERSION: i32 = 5;
 /// Scanned QR code.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Qr {
-    /// Ask the user whether to verify the contact.
+    /// Ask the user whether to start chatting with the contact.
     ///
     /// If the user agrees, pass this QR code to [`crate::securejoin::join_securejoin`].
     AskVerifyContact {
@@ -55,6 +54,9 @@ pub enum Qr {
 
         /// Fingerprint of the contact key as scanned from the QR code.
         fingerprint: Fingerprint,
+
+        /// The inviter's addresses.
+        addrs: Vec<String>,
 
         /// Invite number.
         invitenumber: String,
@@ -79,6 +81,9 @@ pub enum Qr {
 
         /// Fingerprint of the contact key as scanned from the QR code.
         fingerprint: Fingerprint,
+
+        /// The inviter's addresses.
+        addrs: Vec<String>,
 
         /// Invite number.
         invitenumber: String,
@@ -108,6 +113,9 @@ pub enum Qr {
         /// Fingerprint of the contact's key as scanned from the QR code.
         fingerprint: Fingerprint,
 
+        /// The inviter's addresses.
+        addrs: Vec<String>,
+
         /// Invite number.
         invitenumber: String,
         /// Authentication code.
@@ -117,7 +125,7 @@ pub enum Qr {
         is_v3: bool,
     },
 
-    /// Contact fingerprint is verified.
+    /// Contact fingerprint matches.
     ///
     /// Ask the user if they want to start chatting.
     FprOk {
@@ -455,6 +463,8 @@ pub fn format_backup(qr: &Qr) -> Result<String> {
 ///     or: `OPENPGP4FPR:FINGERPRINT#a=ADDR&g=GROUPNAME&x=GROUPID&i=INVITENUMBER&s=AUTH`
 ///     or: `OPENPGP4FPR:FINGERPRINT#a=ADDR&b=BROADCAST_NAME&x=BROADCAST_ID&j=INVITENUMBER&s=AUTH`
 ///     or: `OPENPGP4FPR:FINGERPRINT#a=ADDR`
+///
+/// with optional `&r=ADDRS` param.
 async fn decode_openpgp(context: &Context, qr: &str) -> Result<Qr> {
     let payload = qr
         .get(OPENPGP4FPR_SCHEME.len()..)
@@ -484,10 +494,17 @@ async fn decode_openpgp(context: &Context, qr: &str) -> Result<Qr> {
         })
         .collect();
 
-    let addr = if let Some(addr) = param.get("a") {
-        Some(normalize_address(addr)?)
-    } else {
-        None
+    let addrs = {
+        let mut addrs = Vec::new();
+        if let Some(primary_addr) = param.get("a") {
+            addrs.push(normalize_address(primary_addr)?);
+        };
+        if let Some(secondary_addrs_raw) = param.get("r") {
+            for secondary_address in secondary_addrs_raw.split(',') {
+                addrs.push(normalize_address(secondary_address)?)
+            }
+        }
+        addrs
     };
 
     let name = decode_name(&param, "n")?.unwrap_or_default();
@@ -520,9 +537,11 @@ async fn decode_openpgp(context: &Context, qr: &str) -> Result<Qr> {
         invitenumber = Some("".to_string());
     }
 
-    if let (Some(addr), Some(invitenumber), Some(authcode)) = (&addr, invitenumber, authcode) {
+    if let (Some(addr), Some(invitenumber), Some(authcode)) =
+        (addrs.first(), invitenumber, authcode)
+    {
         let addr = ContactAddress::new(addr)?;
-        let (contact_id, _) = Contact::add_or_lookup_ex(
+        let (contact_id, _) = Contact::add_or_lookup_ext(
             context,
             &name,
             &addr,
@@ -563,6 +582,7 @@ async fn decode_openpgp(context: &Context, qr: &str) -> Result<Qr> {
                     grpid,
                     contact_id,
                     fingerprint,
+                    addrs,
                     invitenumber,
                     authcode,
                     is_v3,
@@ -599,6 +619,7 @@ async fn decode_openpgp(context: &Context, qr: &str) -> Result<Qr> {
                     grpid,
                     contact_id,
                     fingerprint,
+                    addrs,
                     invitenumber,
                     authcode,
                     is_v3,
@@ -624,15 +645,16 @@ async fn decode_openpgp(context: &Context, qr: &str) -> Result<Qr> {
             Ok(Qr::AskVerifyContact {
                 contact_id,
                 fingerprint,
+                addrs,
                 invitenumber,
                 authcode,
                 is_v3,
             })
         }
-    } else if let Some(addr) = addr {
+    } else if let Some(addr) = addrs.first() {
         let fingerprint = fingerprint.hex();
         let (contact_id, _) =
-            Contact::add_or_lookup_ex(context, "", &addr, &fingerprint, Origin::UnhandledQrScan)
+            Contact::add_or_lookup_ext(context, "", addr, &fingerprint, Origin::UnhandledQrScan)
                 .await?;
         let contact = Contact::get_by_id(context, contact_id).await?;
 
@@ -816,21 +838,7 @@ pub(crate) async fn login_param_from_account_qr(
         .context("Invalid DCACCOUNT scheme")?;
 
     if !payload.starts_with(HTTPS_SCHEME) {
-        let rng = &mut rand::rngs::OsRng.unwrap_err();
-        let username = Alphanumeric.sample_string(rng, 9);
-        let addr = username + "@" + payload;
-        let password = Alphanumeric.sample_string(rng, 50);
-
-        let param = EnteredLoginParam {
-            addr,
-            imap: EnteredImapLoginParam {
-                password,
-                ..Default::default()
-            },
-            smtp: Default::default(),
-            certificate_checks: EnteredCertificateChecks::Strict,
-            oauth2: false,
-        };
+        let param = login_param_from_host(payload);
         return Ok(param);
     }
 

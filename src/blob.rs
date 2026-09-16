@@ -68,11 +68,10 @@ impl<'a> BlobObject<'a> {
         // so we are doing essentially the same here.
         task::block_in_place(|| {
             let temp_path;
-            let src_in_blobdir: &Path;
             let blobdir = context.get_blobdir();
 
-            if src.starts_with(blobdir) {
-                src_in_blobdir = src;
+            let src_in_blobdir = if src.starts_with(blobdir) {
+                src
             } else {
                 info!(
                     context,
@@ -84,8 +83,8 @@ impl<'a> BlobObject<'a> {
                     std::fs::create_dir_all(blobdir).log_err(context).ok();
                     std::fs::copy(src, &temp_path).context("Copying new blobfile failed")?;
                 };
-                src_in_blobdir = &temp_path;
-            }
+                &temp_path
+            };
 
             let hash = file_hash(src_in_blobdir)?.to_hex();
             let hash = hash.as_str();
@@ -387,7 +386,7 @@ impl<'a> BlobObject<'a> {
             let exceeds_wh = img.width() > max_wh || img.height() > max_wh;
             let exceeds_max_bytes = nr_bytes > max_bytes as u64;
 
-            let jpeg_quality = 75;
+            let jpeg_quality = 75; // 70-80 is the sweet spot of quality vs. bytes/pixel. if one wants to spend more bytes in quality, better increase resolution
             let ofmt = match fmt {
                 ImageFormat::Png if !exceeds_max_bytes => ImageOutputFormat::Png,
                 ImageFormat::Jpeg => {
@@ -573,7 +572,7 @@ fn exif_orientation(exif: &exif::Exif, context: &Context) -> Orientation {
         && let Some(val) = orientation.value.get_uint(0)
         && let Ok(val) = TryInto::<u8>::try_into(val)
     {
-        return Orientation::from_exif(val).unwrap_or({
+        return Orientation::from_exif(val).unwrap_or_else(|| {
             warn!(context, "Exif orientation value ignored: {val:?}.");
             Orientation::NoTransforms
         });

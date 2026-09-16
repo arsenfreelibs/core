@@ -1,22 +1,23 @@
 //! Bob's side of SecureJoin handling, the joiner-side.
 
 use anyhow::{Context as _, Result};
+use pgp::composed::SignedPublicKey;
 
 use super::HandshakeMessage;
 use super::qrinvite::QrInvite;
 use crate::chat::{self, ChatId, is_contact_in_chat};
 use crate::constants::{Blocked, Chattype};
-use crate::contact::{Contact, Origin};
+use crate::contact::Origin;
 use crate::context::Context;
 use crate::events::EventType;
-use crate::key::self_fingerprint;
+use crate::key::{DcKey as _, self_fingerprint};
 use crate::log::LogExt;
-use crate::message::{self, Message, MsgId, Viewtype};
+use crate::message::{Message, MsgId, Viewtype};
 use crate::mimeparser::{MimeMessage, SystemMessage};
 use crate::param::{Param, Params};
-use crate::securejoin::{
-    ContactId, encrypted_and_signed, insert_into_smtp, verify_sender_by_fingerprint,
-};
+use crate::pgp::addresses_from_public_key;
+use crate::securejoin::{ContactId, encrypted_and_signed, verify_sender_by_fingerprint};
+use crate::smtp::insert_into_smtp;
 use crate::stock_str;
 use crate::sync::Sync::*;
 use crate::tools::{create_outgoing_rfc724_mid, time};
@@ -41,10 +42,10 @@ use crate::{chatlist_events, mimefactory};
 ///
 /// # Returns
 ///
-/// The [`ChatId`] of the created chat is returned, for a SetupContact QR this is the 1:1
+/// The [`ChatId`] of the created chat is returned, for a SetupContact QR this is the single
 /// chat with Alice, for a SecureJoin QR this is the group chat.
 pub(super) async fn start_protocol(context: &Context, invite: QrInvite) -> Result<ChatId> {
-    // A 1:1 chat is needed to send messages to Alice.  When joining a group this chat is
+    // A single chat is needed to send messages to Alice.  When joining a group this chat is
     // hidden, if a user starts sending messages in it it will be unhidden in
     // receive_imf.
     let private_chat_id = private_chat_id(context, &invite).await?;
@@ -58,13 +59,27 @@ pub(super) async fn start_protocol(context: &Context, invite: QrInvite) -> Resul
         QrInvite::Broadcast { .. } => {}
     }
 
-    let has_key = context
+    let public_key_bytes: Option<Vec<u8>> = context
         .sql
-        .exists(
-            "SELECT COUNT(*) FROM public_keys WHERE fingerprint=?",
+        .query_get_value(
+            "SELECT public_key FROM public_keys WHERE fingerprint=?",
             (invite.fingerprint().hex(),),
         )
         .await?;
+
+    let key_contains_all_invite_addrs = if let Some(public_key_bytes) = public_key_bytes {
+        let public_key = SignedPublicKey::from_slice(&public_key_bytes)?;
+        if let Some(addrs_in_key) = addresses_from_public_key(&public_key) {
+            invite.addrs().iter().all(|a| addrs_in_key.contains(a))
+        } else {
+            // This can happen if the inviter is using an old version of Delta Chat
+            // that doesn't put the relay list into the key.
+            // In this case, we never take the securejoin protocol shortcut, which is fine.
+            false
+        }
+    } else {
+        false
+    };
 
     // Now start the protocol and initialise the state.
     {
@@ -91,13 +106,12 @@ pub(super) async fn start_protocol(context: &Context, invite: QrInvite) -> Resul
             // If QR code is a group invite
             // and we are already in the chat,
             // nothing needs to be done.
-            // Even if Alice is not verified, we don't send anything.
             context.emit_event(EventType::SecurejoinJoinerProgress {
                 contact_id: invite.contact_id(),
                 progress: JoinerProgress::Succeeded.into_u16(),
             });
             return Ok(joining_chat_id);
-        } else if has_key
+        } else if key_contains_all_invite_addrs
             && verify_sender_by_fingerprint(context, invite.fingerprint(), invite.contact_id())
                 .await?
         {
@@ -152,9 +166,9 @@ pub(super) async fn start_protocol(context: &Context, invite: QrInvite) -> Resul
             Ok(joining_chat_id)
         }
         QrInvite::Contact { .. } => {
-            // For setup-contact the BobState already ensured the 1:1 chat exists because it is
+            // For setup-contact the BobState already ensured the single chat exists because it is
             // used to send the handshake messages.
-            if !has_key {
+            if !key_contains_all_invite_addrs {
                 chat::add_info_msg_with_cmd(
                     context,
                     private_chat_id,
@@ -255,7 +269,7 @@ pub(super) async fn handle_auth_required_or_pubkey(
             continue;
         }
 
-        info!(context, "Fingerprint verified.",);
+        info!(context, "Fingerprint matches.",);
         let chat_id = private_chat_id(context, &invite).await?;
         delete_securejoin_wait_msg(context, chat_id)
             .await
@@ -272,7 +286,7 @@ pub(super) async fn handle_auth_required_or_pubkey(
             QrInvite::Contact { .. } | QrInvite::Broadcast { .. } => {}
             QrInvite::Group { .. } => {
                 // The message reads "Alice replied, waiting to be added to the group…",
-                // so only show it when joining a group and not for a 1:1 chat or broadcast channel.
+                // so only show it when joining a group and not for a single chat or broadcast channel.
                 let contact_id = invite.contact_id();
                 let msg = stock_str::secure_join_replies(context, contact_id).await;
                 let chat_id = joining_chat_id(context, &invite, chat_id).await?;
@@ -310,24 +324,23 @@ pub(crate) async fn send_handshake_message(
     if invite.is_v3() && matches!(step, BobHandshakeMsg::Request) {
         // Send a minimal symmetrically-encrypted vc-request-pubkey message
         let rfc724_mid = create_outgoing_rfc724_mid();
-        let contact = Contact::get_by_id(context, invite.contact_id()).await?;
-        let recipient = contact.get_addr();
+        let recipients = invite.addrs();
         let alice_fp = invite.fingerprint().hex();
         let auth = invite.authcode();
         let shared_secret = format!("securejoin/{alice_fp}/{auth}");
         let attach_self_pubkey = false;
-        let rendered_message = mimefactory::render_symm_encrypted_securejoin_message(
+        let queued_msg = mimefactory::symm_encrypted_securejoin_message(
             context,
             "vc-request-pubkey",
             &rfc724_mid,
             attach_self_pubkey,
             auth,
             &shared_secret,
+            recipients.to_vec(),
         )
         .await?;
+        insert_into_smtp(context, &rfc724_mid, &queued_msg).await?;
 
-        let msg_id = message::insert_tombstone(context, &rfc724_mid).await?;
-        insert_into_smtp(context, &rfc724_mid, recipient, rendered_message, msg_id).await?;
         context.scheduler.interrupt_smtp().await;
     } else {
         let mut msg = Message {
@@ -415,10 +428,10 @@ impl BobHandshakeMsg {
     }
 }
 
-/// Returns the 1:1 chat with the inviter.
+/// Returns the single chat with the inviter.
 ///
 /// This is the chat in which securejoin messages are sent.
-/// The 1:1 chat will be created if it does not yet exist.
+/// The single chat will be created if it does not yet exist.
 async fn private_chat_id(context: &Context, invite: &QrInvite) -> Result<ChatId> {
     let hidden = match invite {
         QrInvite::Contact { .. } => Blocked::Not,
@@ -435,8 +448,8 @@ async fn private_chat_id(context: &Context, invite: &QrInvite) -> Result<ChatId>
 ///
 /// This is the chat in which you want to notify the user as well.
 ///
-/// When joining a group this is the [`ChatId`] of the group chat, when verifying a
-/// contact this is the [`ChatId`] of the 1:1 chat.
+/// When joining a group this is the [`ChatId`] of the group chat,
+/// when setting up a contact this is the [`ChatId`] of the single chat.
 /// The group chat will be created if it does not yet exist.
 async fn joining_chat_id(
     context: &Context,
@@ -454,7 +467,7 @@ async fn joining_chat_id(
 
             let chat_id = match chat::get_chat_id_by_grpid(context, grpid).await? {
                 Some((chat_id, _blocked)) => {
-                    chat_id.unblock_ex(context, Nosync).await?;
+                    chat_id.unblock_ext(context, Nosync).await?;
                     chat_id
                 }
                 None => {
@@ -482,7 +495,7 @@ async fn joining_chat_id(
 pub(crate) enum JoinerProgress {
     /// vg-vc-request-with-auth sent.
     ///
-    /// Typically shows as "alice@addr verified, introducing myself."
+    /// Typically shows as "introducing myself."
     RequestWithAuthSent,
     /// Completed securejoin.
     Succeeded,

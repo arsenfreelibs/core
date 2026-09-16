@@ -63,7 +63,6 @@ pub enum HeaderDef {
     ChatGroupDescription,
     ChatGroupDescriptionChanged,
     ChatGroupDescriptionTimestamp,
-    ChatVerified,
     ChatGroupAvatar,
     ChatUserAvatar,
     ChatVoiceMessage,
@@ -121,6 +120,10 @@ pub enum HeaderDef {
     /// and thus this message can be skipped while fetching messages.
     /// This is an unprotected header.
     ChatIsPostMessage,
+
+    /// Broadcasted reactions for this or other chat messages.
+    /// See broadcast_reactions.rs for the wire format.
+    ChatBroadcastStates,
 
     /// [Autocrypt](https://autocrypt.org/) header.
     Autocrypt,

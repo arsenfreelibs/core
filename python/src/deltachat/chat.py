@@ -74,7 +74,7 @@ class Chat:
         return lib.dc_chat_get_type(self._dc_chat) == const.DC_CHAT_TYPE_GROUP
 
     def is_single(self) -> bool:
-        """Return True if this chat is a single/direct chat, False otherwise."""
+        """Return True if this chat is a single chat, False otherwise."""
         return lib.dc_chat_get_type(self._dc_chat) == const.DC_CHAT_TYPE_SINGLE
 
     def is_mailinglist(self) -> bool:
@@ -259,6 +259,15 @@ class Chat:
 
     # ------  chat messaging API ------------------------------
 
+    def _reload_sent_msg(self, msg: Message, sent_id: int) -> Message:
+        """Helper to reload just sent message"""
+        sent_msg = Message.from_db(self.account, sent_id)
+        if sent_msg is None:
+            raise ValueError("cannot load just sent message from the database")
+        # modify message in place to avoid bad state for the caller
+        msg._dc_msg = sent_msg._dc_msg
+        return msg
+
     def send_msg(self, msg: Message) -> Message:
         """send a message by using a ready Message object.
 
@@ -274,12 +283,25 @@ class Chat:
         sent_id = lib.dc_send_msg(self.account._dc_context, self.id, msg._dc_msg)
         if sent_id == 0:
             raise ValueError("message could not be sent")
-        # modify message in place to avoid bad state for the caller
-        sent_msg = Message.from_db(self.account, sent_id)
-        if sent_msg is None:
-            raise ValueError("cannot load just sent message from the database")
-        msg._dc_msg = sent_msg._dc_msg
-        return msg
+        return self._reload_sent_msg(msg, sent_id)
+
+    def send_msg_sync(self, msg: Message) -> Message:
+        """Send a message synchronously.
+        This bypasses the IO scheduler and creates its own SMTP connection.
+
+        :param msg: a :class:`deltachat.message.Message` instance
+           previously returned by
+           e.g. :meth:`deltachat.message.Message.new_empty`.
+        :raises ValueError: if message can not be sent.
+
+        :returns: a :class:`deltachat.message.Message` instance as
+           sent out.  This is the same object as was passed in, which
+           has been modified with the new state of the core.
+        """
+        sent_id = lib.dc_send_msg_sync(self.account._dc_context, self.id, msg._dc_msg)
+        if sent_id == 0:
+            raise ValueError("message could not be sent")
+        return self._reload_sent_msg(msg, sent_id)
 
     def send_text(self, text):
         """send a text message and return the resulting Message instance.
@@ -458,7 +480,7 @@ class Chat:
         """Get group profile image.
 
         For groups, this is the image set by any group member using
-        set_chat_profile_image(). For normal chats, this is the image
+        set_chat_profile_image(). For single chats, this is the image
         set by each remote user on their own using dc_set_config(context,
         "selfavatar", image).
         :returns: path to profile image, None if no profile image exists.

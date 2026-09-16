@@ -131,7 +131,13 @@ pub(crate) fn secret_key_to_public_key(
     relay_addrs: &str,
 ) -> Result<SignedPublicKey> {
     info!(context, "Converting secret key to public key.");
-    let timestamp = pgp::types::Timestamp::from_secs(timestamp);
+
+    // Make sure timestamp of created signatures
+    // is not in the past compared to the primary key timestamp.
+    let timestamp = std::cmp::max(
+        signed_secret_key.primary_key.created_at(),
+        pgp::types::Timestamp::from_secs(timestamp),
+    );
 
     // Subpackets that we want to share between DKS and User ID signature.
     let common_subpackets = || -> Result<Vec<Subpacket>> {
@@ -296,7 +302,7 @@ pub(crate) async fn load_self_public_key_opt(context: &Context) -> Result<Option
         .await?
         .context("No transports configured")?;
     let addr = context.get_primary_self_addr().await?;
-    let all_addrs = context.get_published_self_addrs().await?.join(",");
+    let all_addrs = context.get_self_addrs().await?.join(",");
     let signed_public_key =
         secret_key_to_public_key(context, signed_secret_key, timestamp, &addr, &all_addrs)?;
     *lock = Some(signed_public_key.clone());
@@ -653,10 +659,12 @@ impl std::str::FromStr for Fingerprint {
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, LazyLock};
+    use std::time::Duration;
 
     use super::*;
     use crate::config::Config;
-    use crate::test_utils::{TestContext, alice_keypair};
+    use crate::test_utils::{TestContext, TestContextManager, alice_keypair};
+    use crate::tools::SystemTime;
 
     static KEYPAIR: LazyLock<SignedSecretKey> = LazyLock::new(alice_keypair);
 
@@ -875,6 +883,25 @@ i8pcjGO+IZffvyZJVRWfVooBJmWWbPB1pueo3tx8w3+fcuzpxz+RLFKaPyqXO+dD
         assert!(res.is_err());
 
         assert_eq!(nrows().await, 1);
+    }
+
+    /// Tests that key signature timestamp
+    /// is not in the past compared to the primary key creation timestamp.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_signature_not_in_the_past() -> Result<()> {
+        let mut tcm = TestContextManager::new();
+
+        let t = &tcm.unconfigured().await;
+        t.configure_addr("foo@example.org").await;
+
+        SystemTime::shift(Duration::from_secs(600));
+
+        let key = load_self_public_key(t).await?;
+        assert!(
+            key.details.direct_signatures[0].created().unwrap() >= key.primary_key.created_at()
+        );
+
+        Ok(())
     }
 
     #[test]

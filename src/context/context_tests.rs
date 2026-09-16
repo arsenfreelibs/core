@@ -278,14 +278,12 @@ async fn test_get_info_completeness() {
         "mail_pw",
         "mail_port",
         "mail_security",
-        "notify_about_wrong_pw",
         "selfstatus",
         "send_server",
         "send_user",
         "send_pw",
         "send_port",
         "send_security",
-        "server_flags",
         "skip_start_messages",
         "proxy_url",      // May contain passwords, don't leak it to the logs.
         "socks5_enabled", // SOCKS5 options are deprecated.
@@ -300,6 +298,7 @@ async fn test_get_info_completeness() {
         "stats_last_update",
         "stats_last_old_contact_id",
         "simulate_receive_imf_error", // only used in tests
+        "keyupdate_baseline",         // Our own addresses, don't leak them to the logs.
     ];
     let t = TestContext::new().await;
     let info = t.get_info().await.unwrap();
@@ -617,6 +616,11 @@ async fn test_cache_is_cleared_when_io_is_started() -> Result<()> {
     // Starting IO will fail of course because no server settings are configured,
     // but it should invalidate the caches:
     alice.start_io().await;
+
+    alice
+        .assert_warn("No IMAP connection candidates provided")
+        .await;
+    alice.assert_warn("IMAP got rate limited").await;
 
     assert_eq!(
         alice.get_config(Config::Displayname).await?,

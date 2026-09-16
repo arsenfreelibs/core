@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::str;
 
-use anyhow::{Context as _, Result, ensure, format_err};
+use anyhow::{Context as _, Result, ensure};
 use deltachat_contact_tools::{VcardContact, parse_vcard};
 use deltachat_derive::{FromSql, ToSql};
 use humansize::BINARY;
@@ -17,7 +17,7 @@ use crate::blob::BlobObject;
 use crate::chat::{Chat, ChatId, ChatIdBlocked, ChatVisibility, send_msg};
 use crate::chatlist_events;
 use crate::config::Config;
-use crate::constants::{Blocked, Chattype, DC_CHAT_ID_TRASH, DC_MSG_ID_LAST_SPECIAL};
+use crate::constants::{Blocked, Chattype};
 use crate::contact::{self, Contact, ContactId};
 use crate::context::Context;
 use crate::debug_logging::set_debug_logging_xdc;
@@ -49,13 +49,18 @@ use crate::tools::{
 pub struct MsgId(u32);
 
 impl MsgId {
+    /// Markers added before each day in a local timezone.
+    pub const DAYMARKER: MsgId = MsgId::new(9);
+    /// Largest reserved message ID.
+    pub const LAST_SPECIAL: MsgId = MsgId::new(9);
+
     /// Create a new [MsgId].
-    pub fn new(id: u32) -> MsgId {
+    pub const fn new(id: u32) -> MsgId {
         MsgId(id)
     }
 
     /// Create a new unset [MsgId].
-    pub fn new_unset() -> MsgId {
+    pub const fn new_unset() -> MsgId {
         MsgId(0)
     }
 
@@ -63,7 +68,7 @@ impl MsgId {
     ///
     /// This kind of message ID can not be used for real messages.
     pub fn is_special(self) -> bool {
-        self.0 <= DC_MSG_ID_LAST_SPECIAL
+        (0..=Self::LAST_SPECIAL.0).contains(&self.0)
     }
 
     /// Whether the message ID is unset.
@@ -126,13 +131,13 @@ impl MsgId {
             .sql
             .execute(
                 // If you change which information is preserved here, also change
-                // `ChatId::delete_ex()`, `delete_expired_messages()` and which information
+                // `ChatId::delete_ext()`, `delete_expired_messages()` and which information
                 // `receive_imf::add_parts()` still adds to the db if chat_id is TRASH.
                 "
 INSERT OR REPLACE INTO msgs (id, rfc724_mid, pre_rfc724_mid, timestamp, chat_id, deleted)
 SELECT ?1, rfc724_mid, pre_rfc724_mid, timestamp, ?, ? FROM msgs WHERE id=?1
                 ",
-                (self, DC_CHAT_ID_TRASH, on_server),
+                (self, ChatId::TRASH, on_server),
             )
             .await?;
 
@@ -355,18 +360,8 @@ impl std::fmt::Display for MsgId {
 /// Allow converting [MsgId] to an SQLite type.
 ///
 /// This allows you to directly store [MsgId] into the database.
-///
-/// # Errors
-///
-/// This **does** ensure that no special message IDs are written into
-/// the database and the conversion will fail if this is not the case.
 impl rusqlite::types::ToSql for MsgId {
     fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
-        if self.0 <= DC_MSG_ID_LAST_SPECIAL {
-            return Err(rusqlite::Error::ToSqlConversionFailure(
-                format_err!("Invalid MsgId {}", self.0).into(),
-            ));
-        }
         let val = rusqlite::types::Value::Integer(i64::from(self.0));
         let out = rusqlite::types::ToSqlOutput::Owned(val);
         Ok(out)
@@ -385,29 +380,6 @@ impl rusqlite::types::FromSql for MsgId {
             }
         })
     }
-}
-
-#[derive(
-    Debug,
-    Copy,
-    Clone,
-    PartialEq,
-    FromPrimitive,
-    ToPrimitive,
-    FromSql,
-    ToSql,
-    Serialize,
-    Deserialize,
-    Default,
-)]
-#[repr(u8)]
-pub(crate) enum MessengerMessage {
-    #[default]
-    No = 0,
-    Yes = 1,
-
-    /// No, but reply to messenger message.
-    Reply = 2,
 }
 
 /// An object representing a single message in memory.
@@ -459,8 +431,8 @@ pub struct Message {
 
     /// `In-Reply-To` header value.
     pub(crate) in_reply_to: Option<String>,
-    pub(crate) is_dc_message: MessengerMessage,
     pub(crate) original_msg_id: MsgId,
+    pub(crate) pinned: bool,
     pub(crate) mime_modified: bool,
     pub(crate) chat_visibility: ChatVisibility,
     pub(crate) chat_blocked: Blocked,
@@ -528,8 +500,8 @@ impl Message {
                     mdns.msg_id AS mdn_msg_id,
                     m.download_state AS download_state,
                     m.error AS error,
-                    m.msgrmsg AS msgrmsg,
                     m.starred AS original_msg_id,
+                    m.pinned AS pinned,
                     m.mime_modified AS mime_modified,
                     m.txt AS txt,
                     m.subject AS subject,
@@ -541,7 +513,7 @@ impl Message {
                  FROM msgs m
                  LEFT JOIN chats c ON c.id=m.chat_id
                  LEFT JOIN msgs_mdns mdns ON mdns.msg_id=m.id
-                 WHERE m.id=? AND chat_id!=3 -- DC_CHAT_ID_TRASH
+                 WHERE m.id=? AND chat_id!=3 -- ChatId::TRASH
                  LIMIT 1",
                 (id,),
                 |row| {
@@ -586,8 +558,8 @@ impl Message {
                         download_state: row.get("download_state")?,
                         error: Some(row.get::<_, String>("error")?)
                             .filter(|error| !error.is_empty()),
-                        is_dc_message: row.get("msgrmsg")?,
                         original_msg_id: row.get("original_msg_id")?,
+                        pinned: row.get("pinned")?,
                         mime_modified: row.get("mime_modified")?,
                         text,
                         additional_text: String::new(),
@@ -625,7 +597,7 @@ impl Message {
             .sql
             .query_row_optional(
                 "SELECT id FROM msgs WHERE rfc724_mid=? AND chat_id != ?",
-                (rfc724_mid, DC_CHAT_ID_TRASH),
+                (rfc724_mid, ChatId::TRASH),
                 |row| {
                     let msg_id: MsgId = row.get(0)?;
                     Ok(msg_id)
@@ -1080,6 +1052,8 @@ impl Message {
             | SystemMessage::IrohNodeAddr
             | SystemMessage::CallAccepted
             | SystemMessage::CallEnded
+            | SystemMessage::MessagePinned // UI should scroll to pinned message on tapping
+            | SystemMessage::MessageUnpinned // UI should scroll to unpinned message on tapping
             | SystemMessage::Unknown => Ok(None),
         }
     }
@@ -1340,10 +1314,15 @@ impl Message {
             .sql
             .query_get_value(
                 "SELECT id FROM msgs WHERE starred=? AND chat_id!=?",
-                (self.id, DC_CHAT_ID_TRASH),
+                (self.id, ChatId::TRASH),
             )
             .await?;
         Ok(res)
+    }
+
+    /// Returns true if the message is pinned.
+    pub fn is_pinned(&self) -> bool {
+        self.pinned
     }
 
     /// Force the message to be sent in plain text.
@@ -1683,13 +1662,13 @@ pub(crate) async fn delete_msgs_locally_done(
 
 /// Delete messages on all devices and on IMAP.
 pub async fn delete_msgs(context: &Context, msg_ids: &[MsgId]) -> Result<()> {
-    delete_msgs_ex(context, msg_ids, false).await
+    delete_msgs_ext(context, msg_ids, false).await
 }
 
 /// Delete messages on all devices, on IMAP and optionally for all chat members.
 /// Deleted messages are moved to the trash chat and scheduling for deletion on IMAP.
 /// When deleting messages for others, all messages must be self-sent and in the same chat.
-pub async fn delete_msgs_ex(
+pub async fn delete_msgs_ext(
     context: &Context,
     msg_ids: &[MsgId],
     delete_for_all: bool,
@@ -1718,7 +1697,7 @@ pub async fn delete_msgs_ex(
             if !msg.pre_rfc724_mid.is_empty() {
                 stmt.execute((&msg.pre_rfc724_mid,))?;
             }
-            trans.execute("DELETE FROM smtp WHERE msg_id=?", (msg_id,))?;
+            trans.execute("DELETE FROM smtp2 WHERE msg_id=?", (msg_id,))?;
             trans.execute(
                 "DELETE FROM download WHERE rfc724_mid=?",
                 (&msg.rfc724_mid,),
@@ -1947,7 +1926,7 @@ pub async fn get_existing_msg_ids(context: &Context, ids: &[MsgId]) -> Result<Ve
     let query_only = true;
     let res = context
         .sql
-        .transaction_ex(query_only, |transaction| {
+        .transaction_ext(query_only, |transaction| {
             let mut res: Vec<MsgId> = Vec::new();
             for id in ids {
                 if transaction.query_one(
@@ -2034,7 +2013,7 @@ pub(crate) async fn insert_tombstone(context: &Context, rfc724_mid: &str) -> Res
         .sql
         .insert(
             "INSERT INTO msgs(rfc724_mid, chat_id) VALUES (?,?)",
-            (rfc724_mid, DC_CHAT_ID_TRASH),
+            (rfc724_mid, ChatId::TRASH),
         )
         .await?;
     let msg_id = MsgId::new(u32::try_from(row_id)?);
@@ -2116,27 +2095,28 @@ pub async fn estimate_deletion_cnt(
         .count(
             "SELECT COUNT(*)
              FROM msgs m
-             WHERE m.id > ?
-               AND timestamp < ?
-               AND chat_id != ?
-               AND chat_id != ? AND hidden = 0;",
+             WHERE m.id > ?1
+               AND timestamp < ?2      -- Sorting timestamp may be 0 for system messages
+               AND timestamp_rcvd < ?2 -- so we check 'received' timestamp as well.
+               AND chat_id != ?3
+               AND chat_id != ?4 AND hidden = 0;",
             (
-                DC_MSG_ID_LAST_SPECIAL,
+                MsgId::LAST_SPECIAL,
                 threshold_timestamp,
                 self_chat_id,
-                DC_CHAT_ID_TRASH,
+                ChatId::TRASH,
             ),
         )
         .await?;
     Ok(cnt)
 }
 
-/// See [`rfc724_mid_exists_ex()`].
+/// See [`rfc724_mid_exists_ext()`].
 pub(crate) async fn rfc724_mid_exists(
     context: &Context,
     rfc724_mid: &str,
 ) -> Result<Option<MsgId>> {
-    Ok(rfc724_mid_exists_ex(context, rfc724_mid, "1")
+    Ok(rfc724_mid_exists_ext(context, rfc724_mid, "1")
         .await?
         .map(|(id, _)| id))
 }
@@ -2146,7 +2126,7 @@ pub(crate) async fn rfc724_mid_exists(
 ///
 /// * `expr`: SQL expression additionally passed into `SELECT`. Evaluated to `true` iff it is true
 ///   for all messages with the given `rfc724_mid`.
-pub(crate) async fn rfc724_mid_exists_ex(
+pub(crate) async fn rfc724_mid_exists_ext(
     context: &Context,
     rfc724_mid: &str,
     expr: &str,
@@ -2177,25 +2157,38 @@ pub(crate) async fn rfc724_mid_exists_ex(
     Ok(res)
 }
 
-/// Returns `true` iff there is a message
-/// with the given `rfc724_mid`
-/// and a download state other than `DownloadState::Available`,
-/// i.e. it was already tried to download the message or it's sent locally.
-pub(crate) async fn rfc724_mid_download_tried(context: &Context, rfc724_mid: &str) -> Result<bool> {
+/// Returns `true` if the given `rfc724_mid` has nothing left to fetch from a server,
+/// i.e. it was already fetched or is an outgoing message.
+///
+/// For post-messages, this returns `true` if an attempt to fetch was made or is ongoing,
+/// even if this was not successful,
+/// because we don't want to automatically try fetching these messages over and over again
+/// (this function is not called when the user manually clicked "Download").
+pub(crate) async fn rfc724_mid_fetch_tried(context: &Context, rfc724_mid: &str) -> Result<bool> {
     let rfc724_mid = rfc724_mid.trim_start_matches('<').trim_end_matches('>');
     if rfc724_mid.is_empty() {
-        warn!(
-            context,
-            "Empty rfc724_mid passed to rfc724_mid_download_tried"
-        );
+        warn!(context, "Empty rfc724_mid passed to rfc724_mid_fetch_tried");
         return Ok(false);
     }
 
+    // Explanation of the SQL statement:
+    // - For messages that were not split into pre- and post-messages,
+    //   the SQL statement is equal to `rfc724_mid=?1`
+    //   because `download_state` is always `Done` and `pre_rfc724_mid` is always an empty string.
+    // - For post-messages, we want to select them only if an attempt to fetch was made,
+    //   i.e. if `download_state!=Available`.
+    //   The Message-Id header of the post-message goes into the rfc724_mid column,
+    //   so that this is where we need to check for post-messages.
+    // - For pre-messages, the `pre_rfc724_mid` column is checked.
+    //   The pre-message is always immediately fully downloaded,
+    //   just as messages that were not split into pre- and post-messages,
+    //   so that we do not need to check the download state.
     let res = context
         .sql
         .exists(
             "SELECT COUNT(*) FROM msgs
-             WHERE rfc724_mid=? AND download_state<>?",
+             WHERE (rfc724_mid=?1 AND download_state<>?2)
+                OR pre_rfc724_mid=?1",
             (rfc724_mid, DownloadState::Available),
         )
         .await?;

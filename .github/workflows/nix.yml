@@ -5,11 +5,13 @@ on:
     paths:
       - flake.nix
       - flake.lock
+      - nix/**
       - .github/workflows/nix.yml
   push:
     paths:
       - flake.nix
       - flake.lock
+      - nix/**
       - .github/workflows/nix.yml
     branches:
       - main
@@ -21,12 +23,12 @@ jobs:
     name: check flake formatting
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           show-progress: false
           persist-credentials: false
-      - uses: cachix/install-nix-action@8aa03977d8d733052d78f4e008a241fd1dbf36b3 # v31.10.6
-      - run: nix fmt flake.nix -- --check
+      - uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
+      - run: nix fmt flake.nix nix/ -- --check
 
   build:
     name: nix build
@@ -79,11 +81,11 @@ jobs:
           #- deltachat-rpc-server-x86_64-android
           #- deltachat-rpc-server-x86-android
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           show-progress: false
           persist-credentials: false
-      - uses: cachix/install-nix-action@8aa03977d8d733052d78f4e008a241fd1dbf36b3 # v31.10.6
+      - uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
       - run: nix build .#${{ matrix.installable }}
 
   build-macos:
@@ -100,9 +102,9 @@ jobs:
           # because of <https://github.com/NixOS/nixpkgs/issues/413910>.
           # - deltachat-rpc-server-aarch64-darwin
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           show-progress: false
           persist-credentials: false
-      - uses: cachix/install-nix-action@8aa03977d8d733052d78f4e008a241fd1dbf36b3 # v31.10.6
+      - uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
       - run: nix build .#${{ matrix.installable }}

@@ -38,7 +38,7 @@ use crate::param::{Param, Params};
 use crate::pgp::{addresses_from_public_key, merge_openpgp_certificates};
 use crate::sync::{self, Sync::*};
 use crate::tools::{SystemTime, duration_to_str, get_abs_path, normalize_text, time, to_lowercase};
-use crate::{chat, chatlist_events, ensure_and_debug_assert_ne, stock_str};
+use crate::{chat, chatlist_events, ensure_and_debug_assert, stock_str};
 
 /// Time during which a contact is considered as seen recently.
 const SEEN_RECENTLY_SECONDS: i64 = 600;
@@ -104,10 +104,10 @@ impl ContactId {
     /// for this contact will switch to the
     /// contact's authorized name.
     pub async fn set_name(self, context: &Context, name: &str) -> Result<()> {
-        self.set_name_ex(context, Sync, name).await
+        self.set_name_ext(context, Sync, name).await
     }
 
-    pub(crate) async fn set_name_ex(
+    pub(crate) async fn set_name_ext(
         self,
         context: &Context,
         sync: sync::Sync,
@@ -285,7 +285,7 @@ pub async fn make_vcard(context: &Context, contacts: &[ContactId]) -> Result<Str
     for id in contacts {
         let c = Contact::get_by_id(context, *id).await?;
         let key = c.public_key(context).await?.map(|k| k.to_base64());
-        let profile_image = match c.get_profile_image_ex(context, false).await? {
+        let profile_image = match c.get_profile_image_ext(context, false).await? {
             None => None,
             Some(path) => tokio::fs::read(path)
                 .await
@@ -424,7 +424,7 @@ async fn import_vcard_contact(context: &Context, contact: &VcardContact) -> Resu
     };
 
     let (id, modified) =
-        match Contact::add_or_lookup_ex(context, &contact.authname, &addr, &fingerprint, origin)
+        match Contact::add_or_lookup_ext(context, &contact.authname, &addr, &fingerprint, origin)
             .await
         {
             Err(e) => return Err(e).context("Contact::add_or_lookup() failed"),
@@ -560,10 +560,10 @@ pub enum Origin {
     /// To: of incoming messages of unknown sender
     IncomingUnknownTo = 0x40,
 
-    /// Address scanned but not verified.
+    /// Address scanned from a QR code.
     UnhandledQrScan = 0x80,
 
-    /// Address scanned from a SecureJoin QR code, but not verified yet.
+    /// Address scanned from a SecureJoin QR code.
     UnhandledSecurejoinQrScan = 0x81,
 
     /// Reply-To: of incoming message of known sender
@@ -594,14 +594,14 @@ pub enum Origin {
     /// address is in our address book
     AddressBook = 0x80000,
 
-    /// set on Alice's side for contacts like Bob that have scanned the QR code offered by her. Only means the contact has once been established using the "securejoin" procedure in the past, getting the current key verification status requires calling contact_is_verified() !
+    /// Set on Alice's side for contacts like Bob that have scanned the QR code offered by her.
+    /// Only means the contact has once been established using the "securejoin" procedure.
     SecurejoinInvited = 0x0100_0000,
 
     /// Set on Bob's side for contacts scanned from a QR code.
     /// Only means the contact has been scanned from the QR code,
     /// but does not mean that securejoin succeeded
     /// or the key has not changed since the last scan.
-    /// Getting the current key verification status requires calling contact_is_verified() !
     SecurejoinJoined = 0x0200_0000,
 
     /// contact added manually by create_contact(), this should be the largest origin as otherwise the user cannot modify the names
@@ -763,10 +763,10 @@ impl Contact {
     ///
     /// May result in a `#DC_EVENT_CONTACTS_CHANGED` event.
     pub async fn create(context: &Context, name: &str, addr: &str) -> Result<ContactId> {
-        Self::create_ex(context, Sync, name, addr).await
+        Self::create_ext(context, Sync, name, addr).await
     }
 
-    pub(crate) async fn create_ex(
+    pub(crate) async fn create_ext(
         context: &Context,
         sync: sync::Sync,
         name: &str,
@@ -846,12 +846,12 @@ impl Contact {
         addr: &str,
         min_origin: Origin,
     ) -> Result<Option<ContactId>> {
-        Self::lookup_id_by_addr_ex(context, addr, min_origin, Some(Blocked::Not)).await
+        Self::lookup_id_by_addr_ext(context, addr, min_origin, Some(Blocked::Not)).await
     }
 
     /// The same as `lookup_id_by_addr()`, but internal function. Currently also allows looking up
     /// not unblocked contacts.
-    pub(crate) async fn lookup_id_by_addr_ex(
+    pub(crate) async fn lookup_id_by_addr_ext(
         context: &Context,
         addr: &str,
         min_origin: Origin,
@@ -892,7 +892,7 @@ impl Contact {
                     blocked.is_none(),
                     blocked.unwrap_or(Blocked::Not),
                     Chattype::Single,
-                    constants::DC_CHAT_ID_LAST_SPECIAL,
+                    ChatId::LAST_SPECIAL,
                     blocked.unwrap_or(Blocked::Not),
                 ),
             )
@@ -906,7 +906,7 @@ impl Contact {
         addr: &ContactAddress,
         origin: Origin,
     ) -> Result<(ContactId, Modifier)> {
-        Self::add_or_lookup_ex(context, name, addr, "", origin).await
+        Self::add_or_lookup_ext(context, name, addr, "", origin).await
     }
 
     /// Lookup a contact and create it if it does not exist yet.
@@ -936,7 +936,7 @@ impl Contact {
     ///   Depending on the origin, both, "row_name" and "row_authname" are updated from "name".
     ///
     /// Returns the contact_id and a `Modifier` value indicating if a modification occurred.
-    pub(crate) async fn add_or_lookup_ex(
+    pub(crate) async fn add_or_lookup_ext(
         context: &Context,
         name: &str,
         addr: &str,
@@ -1174,7 +1174,7 @@ VALUES (?, ?, ?, ?, ?, ?)
         query: Option<&str>,
     ) -> Result<Vec<ContactId>> {
         let self_addrs = context
-            .get_all_self_addrs()
+            .get_self_addrs()
             .await?
             .into_iter()
             .collect::<HashSet<_>>();
@@ -1230,17 +1230,13 @@ ORDER BY c.origin>=? DESC, c.last_seen DESC, c.id DESC
                 .await?;
 
             if let Some(query) = query {
-                let self_addr = context
-                    .get_config(Config::ConfiguredAddr)
-                    .await?
-                    .unwrap_or_default();
                 let self_name = context
                     .get_config(Config::Displayname)
                     .await?
                     .unwrap_or_default();
                 let self_name2 = stock_str::self_msg(context);
 
-                if self_addr.contains(query)
+                if self_addrs.iter().any(|a| a.contains(query))
                     || self_name.contains(query)
                     || self_name2.contains(query)
                 {
@@ -1624,33 +1620,37 @@ WHERE addr=?
     /// This is the image set by each remote user on their own
     /// using set_config(context, "selfavatar", image).
     pub async fn get_profile_image(&self, context: &Context) -> Result<Option<PathBuf>> {
-        self.get_profile_image_ex(context, true).await
+        self.get_profile_image_ext(context, true).await
     }
 
     /// Get the contact's profile image.
     /// This is the image set by each remote user on their own
     /// using set_config(context, "selfavatar", image).
-    async fn get_profile_image_ex(
+    async fn get_profile_image_ext(
         &self,
         context: &Context,
         show_fallback_icon: bool,
     ) -> Result<Option<PathBuf>> {
         if self.id == ContactId::SELF {
             if let Some(p) = context.get_config(Config::Selfavatar).await? {
-                return Ok(Some(PathBuf::from(p))); // get_config() calls get_abs_path() internally already
+                Ok(Some(PathBuf::from(p))) // get_config() calls get_abs_path() internally already
+            } else {
+                Ok(None)
             }
         } else if self.id == ContactId::DEVICE {
-            return Ok(Some(chat::get_device_icon(context).await?));
-        }
-        if show_fallback_icon && !self.id.is_special() && !self.is_key_contact() {
-            return Ok(Some(chat::get_unencrypted_icon(context).await?));
-        }
-        if let Some(image_rel) = self.param.get(Param::ProfileImage)
+            Ok(Some(chat::get_device_icon(context).await?))
+        } else if self.id.is_special() {
+            // All special contacts are handled above.
+            Ok(None)
+        } else if show_fallback_icon && !self.is_key_contact() {
+            Ok(Some(chat::get_unencrypted_icon(context).await?))
+        } else if let Some(image_rel) = self.param.get(Param::ProfileImage)
             && !image_rel.is_empty()
         {
-            return Ok(Some(get_abs_path(context, Path::new(image_rel))));
+            Ok(Some(get_abs_path(context, Path::new(image_rel))))
+        } else {
+            Ok(None)
         }
-        Ok(None)
     }
 
     /// Returns a color for the contact.
@@ -1686,52 +1686,6 @@ WHERE addr=?
             return Ok(true);
         }
         Ok(self.public_key(context).await?.is_some())
-    }
-
-    /// Returns true if the contact
-    /// can be added to verified chats.
-    ///
-    /// If contact is verified
-    /// UI should display green checkmark after the contact name
-    /// in contact list items and
-    /// in chat member list items.
-    ///
-    /// In contact profile view, use this function only if there is no chat with the contact,
-    /// otherwise use is_chat_protected().
-    /// Use [Self::get_verifier_id] to display the verifier contact
-    /// in the info section of the contact profile.
-    pub async fn is_verified(&self, context: &Context) -> Result<bool> {
-        // We're always sort of secured-verified as we could verify the key on this device any time with the key
-        // on this device
-        if self.id == ContactId::SELF {
-            return Ok(true);
-        }
-
-        Ok(self.get_verifier_id(context).await?.is_some())
-    }
-
-    /// Returns the `ContactId` that verified the contact.
-    ///
-    /// If this returns Some(_),
-    /// display green checkmark in the profile and "Introduced by ..." line
-    /// with the name of the contact.
-    ///
-    /// If this returns `Some(None)`, then the contact is verified,
-    /// but it's unclear by whom.
-    pub async fn get_verifier_id(&self, context: &Context) -> Result<Option<Option<ContactId>>> {
-        let verifier_id: u32 = context
-            .sql
-            .query_get_value("SELECT verifier FROM contacts WHERE id=?", (self.id,))
-            .await?
-            .with_context(|| format!("Contact {} does not exist", self.id))?;
-
-        if verifier_id == 0 {
-            Ok(None)
-        } else if verifier_id == self.id.to_u32() {
-            Ok(Some(None))
-        } else {
-            Ok(Some(Some(ContactId::new(verifier_id))))
-        }
     }
 
     /// Returns the number of real (i.e. non-special) contacts in the database.
@@ -1856,7 +1810,7 @@ pub(crate) async fn set_blocked(
 
         // also (un)block all chats with _only_ this contact - we do not delete them to allow a
         // non-destructive blocking->unblocking.
-        // (Maybe, beside normal chats (type=100) we should also block group chats with only this user.
+        // (Maybe, beside single chats (type=100) we should also block group chats with only this user.
         // However, I'm not sure about this point; it may be confusing if the user wants to add other people;
         // this would result in recreating the same group...)
         if context
@@ -1884,7 +1838,7 @@ WHERE type=? AND id IN (
             && contact.origin == Origin::MailinglistAddress
             && let Some((chat_id, ..)) = chat::get_chat_id_by_grpid(context, &contact.addr).await?
         {
-            chat_id.unblock_ex(context, Nosync).await?;
+            chat_id.unblock_ext(context, Nosync).await?;
         }
 
         if sync.into() {
@@ -1914,36 +1868,27 @@ WHERE type=? AND id IN (
 /// The given profile image is expected to be already in the blob directory
 /// as profile images can be set only by receiving messages, this should be always the case, however.
 ///
-/// For contact SELF, the image is not saved in the contact-database but as Config::Selfavatar.
+/// Cannot be used to set own profile picture, set [`Config::Selfavatar`] instead.
 pub(crate) async fn set_profile_image(
     context: &Context,
     contact_id: ContactId,
     profile_image: &AvatarAction,
 ) -> Result<()> {
+    ensure_and_debug_assert!(
+        !contact_id.is_special(),
+        "Cannot set avatar for special contacts"
+    );
+
     let mut contact = Contact::get_by_id(context, contact_id).await?;
-    let changed = match profile_image {
-        AvatarAction::Change(profile_image) => {
-            if contact_id == ContactId::SELF {
-                context
-                    .set_config_ex(Nosync, Config::Selfavatar, Some(profile_image))
-                    .await?;
-            } else {
-                contact.param.set(Param::ProfileImage, profile_image);
-            }
-            true
-        }
-        AvatarAction::Delete => {
-            if contact_id == ContactId::SELF {
-                context
-                    .set_config_ex(Nosync, Config::Selfavatar, None)
-                    .await?;
-            } else {
-                contact.param.remove(Param::ProfileImage);
-            }
-            true
-        }
+    let profile_image_opt = match profile_image {
+        AvatarAction::Change(profile_image) => Some(profile_image),
+        AvatarAction::Delete => None,
     };
+    let changed = contact.param.get(Param::ProfileImage) != profile_image_opt.map(|s| s.as_str());
     if changed {
+        contact
+            .param
+            .set_optional(Param::ProfileImage, profile_image_opt);
         contact.update_param(context).await?;
         context.emit_event(EventType::ContactsChanged(Some(contact_id)));
         chatlist_events::emit_chatlist_item_changed_for_contact_chat(context, contact_id).await;
@@ -1961,7 +1906,7 @@ pub(crate) async fn set_status(
 ) -> Result<()> {
     if contact_id == ContactId::SELF {
         context
-            .set_config_ex(Nosync, Config::Selfstatus, Some(&status))
+            .set_config_ext(Nosync, Config::Selfstatus, Some(&status))
             .await?;
     } else {
         let mut contact = Contact::get_by_id(context, contact_id).await?;
@@ -2003,68 +1948,6 @@ pub(crate) async fn update_last_seen(
             .interrupt_recently_seen(contact_id, timestamp)
             .await;
     }
-    Ok(())
-}
-
-/// Marks contact `contact_id` as verified by `verifier_id`.
-///
-/// `verifier_id == None` means that the verifier is unknown.
-pub(crate) async fn mark_contact_id_as_verified(
-    context: &Context,
-    contact_id: ContactId,
-    verifier_id: Option<ContactId>,
-) -> Result<()> {
-    ensure_and_debug_assert_ne!(contact_id, ContactId::SELF,);
-    ensure_and_debug_assert_ne!(
-        Some(contact_id),
-        verifier_id,
-        "Contact cannot be verified by self",
-    );
-    let by_self = verifier_id == Some(ContactId::SELF);
-    let mut verifier_id = verifier_id.unwrap_or(contact_id);
-    context
-        .sql
-        .transaction(|transaction| {
-            let contact_fingerprint: String = transaction.query_row(
-                "SELECT fingerprint FROM contacts WHERE id=?",
-                (contact_id,),
-                |row| row.get(0),
-            )?;
-            if contact_fingerprint.is_empty() {
-                bail!("Non-key-contact {contact_id} cannot be verified");
-            }
-            if verifier_id != ContactId::SELF {
-                let (verifier_fingerprint, verifier_verifier_id): (String, ContactId) = transaction
-                    .query_row(
-                        "SELECT fingerprint, verifier FROM contacts WHERE id=?",
-                        (verifier_id,),
-                        |row| Ok((row.get(0)?, row.get(1)?)),
-                    )?;
-                if verifier_fingerprint.is_empty() {
-                    bail!(
-                        "Contact {contact_id} cannot be verified by non-key-contact {verifier_id}"
-                    );
-                }
-                ensure!(
-                    verifier_id == contact_id || verifier_verifier_id != ContactId::UNDEFINED,
-                    "Contact {contact_id} cannot be verified by unverified contact {verifier_id}",
-                );
-                if verifier_verifier_id == verifier_id {
-                    // Avoid introducing incorrect reverse chains: if the verifier itself has an
-                    // unknown verifier, it may be `contact_id` actually (directly or indirectly) on
-                    // the other device (which is needed for getting "verified by unknown contact"
-                    // in the first place).
-                    verifier_id = contact_id;
-                }
-            }
-            transaction.execute(
-                "UPDATE contacts SET verifier=?1
-                 WHERE id=?2 AND (verifier=0 OR verifier=id OR ?3)",
-                (verifier_id, contact_id, by_self),
-            )?;
-            Ok(())
-        })
-        .await?;
     Ok(())
 }
 

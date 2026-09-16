@@ -337,8 +337,7 @@ pub enum EventType {
         contact_id: u32,
 
         /// Progress as:
-        /// 400=vg-/vc-request-with-auth sent, typically shown as "alice@addr verified, introducing myself."
-        /// (Bob has verified alice and waits until Alice does the same for him)
+        /// 400=vg-/vc-request-with-auth sent, typically shown as "introducing myself."
         /// 1000=vg-member-added/vc-contact-confirm received
         progress: u16,
     },
@@ -394,11 +393,15 @@ pub enum EventType {
         msg_id: u32,
     },
 
-    /// Tells that the Background fetch was completed (or timed out).
-    /// This event acts as a marker, when you reach this event you can be sure
-    /// that all events emitted during the background fetch were processed.
+    /// Tells that a background fetch call is done:
+    /// the fetch completed, timed out, was stopped or was not started.
     ///
-    /// This event is only emitted by the account manager
+    /// For the call that started the fetch, this event acts as a marker:
+    /// all events emitted during the fetch were processed once it is reached.
+    /// A call made while another background fetch is running gets the event immediately,
+    /// and the running fetch keeps emitting events until its own marker.
+    ///
+    /// This event is only emitted by the account manager.
     AccountsBackgroundFetchDone,
     /// Inform that set of chats or the order of the chats in the chatlist has changed.
     ///
@@ -478,9 +481,9 @@ pub enum EventType {
     ///
     /// UI should update the list.
     ///
-    /// This event is emitted when transport
-    /// synchronization messages arrives,
-    /// but not when the UI modifies the transport list by itself.
+    /// The event is emitted on the device modifying
+    /// the transports as well as on other devices
+    /// applying the synced change.
     TransportsModified,
 }
 

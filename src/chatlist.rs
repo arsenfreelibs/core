@@ -5,8 +5,8 @@ use std::sync::LazyLock;
 
 use crate::chat::{Chat, ChatId, ChatVisibility, update_special_chat_names};
 use crate::constants::{
-    Blocked, Chattype, DC_CHAT_ID_ALLDONE_HINT, DC_CHAT_ID_ARCHIVED_LINK, DC_GCL_ADD_ALLDONE_HINT,
-    DC_GCL_ARCHIVED_ONLY, DC_GCL_FOR_FORWARDING, DC_GCL_NO_SPECIALS,
+    Blocked, Chattype, DC_GCL_ADD_ALLDONE_HINT, DC_GCL_ARCHIVED_ONLY, DC_GCL_FOR_FORWARDING,
+    DC_GCL_NO_SPECIALS,
 };
 use crate::contact::{Contact, ContactId};
 use crate::context::Context;
@@ -61,19 +61,19 @@ impl Chatlist {
     ///
     /// By default, the function adds some special entries to the list.
     /// These special entries can be identified by the ID returned by chatlist.get_chat_id():
-    /// - DC_CHAT_ID_ARCHIVED_LINK (6) - this special chat is present if the user has
+    /// - ChatId::ARCHIVED_LINK (6) - this special chat is present if the user has
     ///   archived *any* chat using dc_set_chat_visibility(). The UI should show a link as
     ///   "Show archived chats", if the user clicks this item, the UI should show a
     ///   list of all archived chats that can be created by this function hen using
     ///   the DC_GCL_ARCHIVED_ONLY flag.
-    /// - DC_CHAT_ID_ALLDONE_HINT (7) - this special chat is present
+    /// - ChatId::ALLDONE_HINT (7) - this special chat is present
     ///   if DC_GCL_ADD_ALLDONE_HINT is added to listflags
     ///   and if there are only archived chats.
     ///
     /// The `listflags` is a combination of flags:
     /// - if the flag DC_GCL_ARCHIVED_ONLY is set, only archived chats are returned.
     ///   if DC_GCL_ARCHIVED_ONLY is not set, only unarchived chats are returned and
-    ///   the pseudo-chat DC_CHAT_ID_ARCHIVED_LINK is added if there are *any* archived
+    ///   the pseudo-chat ChatId::ARCHIVED_LINK is added if there are *any* archived
     ///   chats
     /// - the flag DC_GCL_FOR_FORWARDING sorts "Saved messages" to the top of the chatlist
     ///   and hides the device-chat, contact requests and incoming broadcasts.
@@ -81,7 +81,7 @@ impl Chatlist {
     /// - if the flag DC_GCL_NO_SPECIALS is set, archive link is not added
     ///   to the list (may be used eg. for selecting chats on forwarding, the flag is
     ///   not needed when DC_GCL_ARCHIVED_ONLY is already set)
-    /// - if the flag DC_GCL_ADD_ALLDONE_HINT is set, DC_CHAT_ID_ALLDONE_HINT
+    /// - if the flag DC_GCL_ADD_ALLDONE_HINT is set, ChatId::ALLDONE_HINT
     ///   is added as needed.
     ///
     /// `query`: An optional query for filtering the list. Only chats matching this query
@@ -115,35 +115,40 @@ impl Chatlist {
             ChatId::new(0)
         };
 
-        // select with left join and minimum:
-        //
-        // - the inner select must use `hidden` and _not_ `m.hidden`
-        //   which would refer the outer select and take a lot of time
-        // - `GROUP BY` is needed several messages may have the same
-        //   timestamp
-        // - the list starts with the newest chats
+        macro_rules! last_visible_msg_id_in {
+            ($chat_id:expr) => {
+                concat!(
+                    "
+(SELECT id FROM msgs WHERE
+    -- state=`OutDraft`.
+    state=19 AND hidden=1 AND chat_id=",
+                    $chat_id,
+                    " OR
+    -- `InFresh`...`OutDelivered` inclusive, except `OutDraft`.
+    state IN (10,13,16,20,24,26) AND hidden=0 AND chat_id=",
+                    $chat_id,
+                    "
+ORDER BY timestamp DESC, id DESC LIMIT 1)"
+                )
+            };
+        }
+        // The list starts with the newest chats.
         //
         // The query shows messages from blocked contacts in
         // groups. Otherwise it would be hard to follow conversations.
         let ids = if let Some(query_contact_id) = query_contact_id {
             // show chats shared with a given contact
-            context.sql.query_map_vec(
+            context.sql.query_map_vec(concat!(
                 "SELECT c.id, m.id
                  FROM chats c
                  LEFT JOIN msgs m
                         ON c.id=m.chat_id
-                       AND m.id=(
-                               SELECT id
-                                 FROM msgs
-                                WHERE chat_id=c.id
-                                  AND (hidden=0 OR state=?1)
-                                  ORDER BY timestamp DESC, id DESC LIMIT 1)
+                       AND m.id=", last_visible_msg_id_in!("c.id"), "
                  WHERE c.id>9
                    AND c.blocked!=1
-                   AND c.id IN(SELECT chat_id FROM chats_contacts WHERE contact_id=?2 AND add_timestamp >= remove_timestamp)
-                 GROUP BY c.id
-                 ORDER BY c.archived=?3 DESC, IFNULL(NULLIF(m.timestamp,0),c.created_timestamp) DESC, m.id DESC;",
-                (MessageState::OutDraft, query_contact_id, ChatVisibility::Pinned),
+                   AND c.id IN(SELECT chat_id FROM chats_contacts WHERE contact_id=? AND add_timestamp >= remove_timestamp)
+                 ORDER BY c.archived=? DESC, IFNULL(NULLIF(m.timestamp,0),c.created_timestamp) DESC, m.id DESC"),
+                (query_contact_id, ChatVisibility::Pinned),
                 process_row,
             ).await?
         } else if flag_archived_only {
@@ -154,22 +159,21 @@ impl Chatlist {
             context
                 .sql
                 .query_map_vec(
-                    "SELECT c.id, m.id
+                    concat!(
+                        "
+                 SELECT c.id, m.id
                  FROM chats c
                  LEFT JOIN msgs m
                         ON c.id=m.chat_id
-                       AND m.id=(
-                               SELECT id
-                                 FROM msgs
-                                WHERE chat_id=c.id
-                                  AND (hidden=0 OR state=?)
-                                  ORDER BY timestamp DESC, id DESC LIMIT 1)
+                       AND m.id=",
+                        last_visible_msg_id_in!("c.id"),
+                        "
                  WHERE c.id>9
                    AND c.blocked!=1
                    AND c.archived=1
-                 GROUP BY c.id
-                 ORDER BY IFNULL(NULLIF(m.timestamp,0),c.created_timestamp) DESC, m.id DESC;",
-                    (MessageState::OutDraft,),
+                 ORDER BY IFNULL(NULLIF(m.timestamp,0),c.created_timestamp) DESC, m.id DESC"
+                    ),
+                    (),
                     process_row,
                 )
                 .await?
@@ -188,24 +192,18 @@ impl Chatlist {
             let str_like_cmd = format!("%{}%", query.to_lowercase());
             context
                 .sql
-                .query_map_vec(
+                .query_map_vec(concat!(
                     "SELECT c.id, m.id
                  FROM chats c
                  LEFT JOIN msgs m
                         ON c.id=m.chat_id
-                       AND m.id=(
-                               SELECT id
-                                 FROM msgs
-                                WHERE chat_id=c.id
-                                  AND (hidden=0 OR state=?1)
-                                  ORDER BY timestamp DESC, id DESC LIMIT 1)
-                 WHERE c.id>9 AND c.id!=?2
+                       AND m.id=", last_visible_msg_id_in!("c.id"), "
+                 WHERE c.id>9 AND c.id!=?
                    AND c.blocked!=1
-                   AND IFNULL(c.name_normalized,c.name) LIKE ?3
-                   AND (NOT ?4 OR EXISTS (SELECT 1 FROM msgs m WHERE m.chat_id = c.id AND m.state == ?5 AND hidden=0))
-                 GROUP BY c.id
-                 ORDER BY IFNULL(NULLIF(m.timestamp,0),c.created_timestamp) DESC, m.id DESC;",
-                    (MessageState::OutDraft, skip_id, str_like_cmd, only_unread, MessageState::InFresh),
+                   AND IFNULL(c.name_normalized,c.name) LIKE ?
+                   AND (NOT ? OR EXISTS (SELECT 1 FROM msgs m WHERE m.chat_id = c.id AND m.state == ? AND hidden=0))
+                 ORDER BY IFNULL(NULLIF(m.timestamp,0),c.created_timestamp) DESC, m.id DESC"),
+                    (skip_id, str_like_cmd, only_unread, MessageState::InFresh),
                     process_row,
                 )
                 .await?
@@ -237,25 +235,19 @@ impl Chatlist {
                     })
                     .collect::<std::result::Result<Vec<_>, _>>()
                 };
-                context.sql.query_map(
+                context.sql.query_map(concat!(
                     "SELECT c.id, c.type, c.param, m.id
                      FROM chats c
                      LEFT JOIN msgs m
                             ON c.id=m.chat_id
-                           AND m.id=(
-                                   SELECT id
-                                     FROM msgs
-                                    WHERE chat_id=c.id
-                                      AND (hidden=0 OR state=?)
-                                      ORDER BY timestamp DESC, id DESC LIMIT 1)
+                           AND m.id=", last_visible_msg_id_in!("c.id"), "
                      WHERE c.id>9 AND c.id!=?
                        AND c.blocked=0
                        AND NOT c.archived=?
                        AND (c.type!=? OR c.id IN(SELECT chat_id FROM chats_contacts WHERE contact_id=? AND add_timestamp >= remove_timestamp))
-                     GROUP BY c.id
-                     ORDER BY c.id=? DESC, c.archived=? DESC, IFNULL(NULLIF(m.timestamp,0),c.created_timestamp) DESC, m.id DESC;",
+                     ORDER BY c.id=? DESC, c.archived=? DESC, IFNULL(NULLIF(m.timestamp,0),c.created_timestamp) DESC, m.id DESC"),
                     (
-                        MessageState::OutDraft, skip_id, ChatVisibility::Archived,
+                        skip_id, ChatVisibility::Archived,
                         Chattype::Group, ContactId::SELF,
                         sort_id_up, ChatVisibility::Pinned,
                     ),
@@ -264,31 +256,25 @@ impl Chatlist {
                 ).await?
             } else {
                 //  show normal chatlist
-                context.sql.query_map_vec(
+                context.sql.query_map_vec(concat!(
                     "SELECT c.id, m.id
                      FROM chats c
                      LEFT JOIN msgs m
                             ON c.id=m.chat_id
-                           AND m.id=(
-                                   SELECT id
-                                     FROM msgs
-                                    WHERE chat_id=c.id
-                                      AND (hidden=0 OR state=?)
-                                      ORDER BY timestamp DESC, id DESC LIMIT 1)
+                           AND m.id=", last_visible_msg_id_in!("c.id"), "
                      WHERE c.id>9 AND c.id!=?
                        AND (c.blocked=0 OR c.blocked=2)
                        AND NOT c.archived=?
-                     GROUP BY c.id
-                     ORDER BY c.id=0 DESC, c.archived=? DESC, IFNULL(NULLIF(m.timestamp,0),c.created_timestamp) DESC, m.id DESC;",
-                    (MessageState::OutDraft, skip_id, ChatVisibility::Archived, ChatVisibility::Pinned),
+                     ORDER BY c.id=0 DESC, c.archived=? DESC, IFNULL(NULLIF(m.timestamp,0),c.created_timestamp) DESC, m.id DESC"),
+                    (skip_id, ChatVisibility::Archived, ChatVisibility::Pinned),
                     process_row,
                 ).await?
             };
             if !flag_no_specials && get_archived_cnt(context).await? > 0 {
                 if ids.is_empty() && flag_add_alldone_hint {
-                    ids.push((DC_CHAT_ID_ALLDONE_HINT, None));
+                    ids.push((ChatId::ALLDONE_HINT, None));
                 }
-                ids.insert(0, (DC_CHAT_ID_ARCHIVED_LINK, None));
+                ids.insert(0, (ChatId::ARCHIVED_LINK, None));
             }
             ids
         };
@@ -667,7 +653,7 @@ mod tests {
         let t = TestContext::new_alice().await;
         t.allow_unencrypted().await?;
 
-        // receive a one-to-one-message
+        // receive a single chat message
         receive_imf(
             &t,
             b"From: Bob Authname <bob@example.org>\n\
@@ -695,12 +681,12 @@ mod tests {
         let chat = Chat::load_from_db(&t, chat_id).await?;
         assert_eq!(chat.get_name(), "Bob Authname");
 
-        // check, the one-to-one-chat can be found using chatlist search query
+        // check, the single chat can be found using chatlist search query
         let chats = Chatlist::try_load(&t, 0, Some("bob authname"), None).await?;
         assert_eq!(chats.len(), 1);
         assert_eq!(chats.get_chat_id(0).unwrap(), chat_id);
 
-        // change the name of the contact; this also changes the name of the one-to-one-chat
+        // change the name of the contact; this also changes the name of the single chat
         let test_id = Contact::create(&t, "Bob Nickname", "bob@example.org").await?;
         assert_eq!(contact_id, test_id);
         let chat = Chat::load_from_db(&t, chat_id).await?;
@@ -710,7 +696,7 @@ mod tests {
         let chats = Chatlist::try_load(&t, 0, Some("bob nickname"), None).await?;
         assert_eq!(chats.len(), 1);
 
-        // revert contact to authname, this again changes the name of the one-to-one-chat
+        // revert contact to authname, this again changes the name of the single chat
         let test_id = Contact::create(&t, "", "bob@example.org").await?;
         assert_eq!(contact_id, test_id);
         let chat = Chat::load_from_db(&t, chat_id).await?;
@@ -728,7 +714,7 @@ mod tests {
         let t = TestContext::new_alice().await;
         t.allow_unencrypted().await?;
 
-        // receive a one-to-one-message without authname set
+        // receive a single chat message without authname set
         receive_imf(
             &t,
             b"From: bob@example.org\n\
@@ -751,12 +737,12 @@ mod tests {
         let chat = Chat::load_from_db(&t, chat_id).await?;
         assert_eq!(chat.get_name(), "bob@example.org");
 
-        // check, the one-to-one-chat can be found using chatlist search query
+        // check, the single chat can be found using chatlist search query
         let chats = Chatlist::try_load(&t, 0, Some("bob@example.org"), None).await?;
         assert_eq!(chats.len(), 1);
         assert_eq!(chats.get_chat_id(0)?, chat_id);
 
-        // change the name of the contact; this also changes the name of the one-to-one-chat
+        // change the name of the contact; this also changes the name of the single chat
         let test_id = Contact::create(&t, "Bob Nickname", "bob@example.org").await?;
         assert_eq!(contact_id, test_id);
         let chat = Chat::load_from_db(&t, chat_id).await?;
@@ -767,7 +753,7 @@ mod tests {
         assert_eq!(chats.len(), 1);
         assert_eq!(chats.get_chat_id(0)?, chat_id);
 
-        // revert name change, this again changes the name of the one-to-one-chat to the email-address
+        // revert name change, this again changes the name of the single chat to the email-address
         let test_id = Contact::create(&t, "", "bob@example.org").await?;
         assert_eq!(contact_id, test_id);
         let chat = Chat::load_from_db(&t, chat_id).await?;

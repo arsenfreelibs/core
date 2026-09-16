@@ -9,14 +9,12 @@ extern crate deltachat;
 
 use std::borrow::Cow::{self, Borrowed, Owned};
 
-use anyhow::{bail, Error};
+use anyhow::{Error, bail};
+use deltachat::EventType;
 use deltachat::chat::ChatId;
-use deltachat::config;
 use deltachat::context::*;
-use deltachat::oauth2::*;
 use deltachat::qr_code_generator::get_securejoin_qr_svg;
 use deltachat::securejoin::*;
-use deltachat::EventType;
 use log::{error, info, warn};
 use nu_ansi_term::Color;
 use rustyline::completion::{Completer, FilenameCompleter, Pair};
@@ -162,11 +160,10 @@ const IMEX_COMMANDS: [&str; 10] = [
     "stop",
 ];
 
-const DB_COMMANDS: [&str; 11] = [
+const DB_COMMANDS: [&str; 10] = [
     "info",
     "set",
     "get",
-    "oauth2",
     "configure",
     "connect",
     "disconnect",
@@ -176,7 +173,7 @@ const DB_COMMANDS: [&str; 11] = [
     "housekeeping",
 ];
 
-const CHAT_COMMANDS: [&str; 39] = [
+const CHAT_COMMANDS: [&str; 38] = [
     "listchats",
     "listarchived",
     "start-realtime",
@@ -185,7 +182,6 @@ const CHAT_COMMANDS: [&str; 39] = [
     "createchat",
     "creategroup",
     "createbroadcast",
-    "createprotected",
     "addmember",
     "removemember",
     "groupname",
@@ -240,7 +236,7 @@ const CONTACT_COMMANDS: [&str; 9] = [
     "import-vcard",
     "make-vcard",
 ];
-const MISC_COMMANDS: [&str; 14] = [
+const MISC_COMMANDS: [&str; 13] = [
     "getqr",
     "getqrsvg",
     "getbadqr",
@@ -248,7 +244,6 @@ const MISC_COMMANDS: [&str; 14] = [
     "joinqr",
     "setqr",
     "createqrsvg",
-    "providerinfo",
     "fileinfo",
     "estimatedeletion",
     "clear",
@@ -270,10 +265,11 @@ impl Hinter for DcHelper {
                 &CONTACT_COMMANDS[..],
                 &MISC_COMMANDS[..],
             ] {
-                if let Some(entry) = cmds.iter().find(|el| el.starts_with(&line[..pos])) {
-                    if *entry != line && *entry != &line[..pos] {
-                        return Some(entry[pos..].to_owned());
-                    }
+                if let Some(entry) = cmds.iter().find(|el| el.starts_with(&line[..pos]))
+                    && *entry != line
+                    && *entry != &line[..pos]
+                {
+                    return Some(entry[pos..].to_owned());
                 }
             }
         }
@@ -424,19 +420,6 @@ async fn handle_cmd(
         }
         "configure" => {
             ctx.configure().await?;
-        }
-        "oauth2" => {
-            if let Some(addr) = ctx.get_config(config::Config::Addr).await? {
-                if let Some(oauth2_url) =
-                    get_oauth2_url(&ctx, &addr, "chat.delta:/com.b44t.messenger").await?
-                {
-                    println!("Open the following url, set mail_pw to the generated token and server_flags to 2:\n{oauth2_url}");
-                } else {
-                    println!("OAuth2 not available for {addr}.");
-                }
-            } else {
-                println!("oauth2: set addr first.");
-            }
         }
         "clear" => {
             println!("\n\n\n");

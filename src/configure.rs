@@ -1,11 +1,9 @@
 //! # Email accounts autoconfiguration process.
 //!
-//! The module provides automatic lookup of configuration
-//! for email providers based on the built-in [provider database],
-//! [Mozilla Thunderbird Autoconfiguration protocol]
+//! The module provides automatic lookup of configuration for email providers
+//! using [Mozilla Thunderbird Autoconfiguration protocol]
 //! and [Outlook's Autodiscover].
 //!
-//! [provider database]: crate::provider
 //! [Mozilla Thunderbird Autoconfiguration protocol]: auto_mozilla
 //! [Outlook's Autodiscover]: auto_outlook
 
@@ -20,6 +18,7 @@ use deltachat_contact_tools::{EmailAddress, addr_normalize};
 use futures::FutureExt;
 use futures_lite::FutureExt as _;
 use percent_encoding::utf8_percent_encode;
+use rusqlite::OptionalExtension;
 use server_params::{ServerParams, expand_param_vector};
 use tokio::task;
 
@@ -28,41 +27,25 @@ use crate::constants::NON_ALPHANUMERIC_WITHOUT_DOT;
 use crate::context::Context;
 use crate::imap::Imap;
 use crate::log::warn;
+use crate::login_param::EnteredCertificateChecks;
 pub use crate::login_param::EnteredLoginParam;
-use crate::login_param::{EnteredCertificateChecks, TransportListEntry};
-use crate::message::Message;
 use crate::net::proxy::ProxyConfig;
-use crate::oauth2::get_oauth2_addr;
-use crate::provider::{Protocol, Provider, Socket, UsernamePattern};
+use crate::provider::{self, Protocol, Socket};
 use crate::qr::{login_param_from_account_qr, login_param_from_login_qr};
 use crate::smtp::Smtp;
-use crate::sync::Sync::*;
+use crate::sync::Sync::Nosync;
 use crate::tools::time;
 use crate::transport::{
     ConfiguredCertificateChecks, ConfiguredLoginParam, ConfiguredServerLoginParam,
-    ConnectionCandidate, send_sync_transports,
+    ConnectionCandidate, delete_transport_row, maybe_update_sending_transport,
+    purge_transport_caches, send_sync_transports, transport_addrs,
 };
 use crate::{EventType, stock_str};
-use crate::{chat, provider};
 
-/// Maximum number of relays
-/// see <https://github.com/chatmail/core/issues/7608>
-pub(crate) const MAX_TRANSPORT_RELAYS: usize = 5;
-
-/// Hard-coded candidates for default relays.
-/// In the future, we want to use it during onboarding;
-/// note that before onboarding automatically on any of these,
-/// we need to ask the admins whether their relay is able to handle this.
-/// For now, this is just the first 6 relays from chatmail.at/relays.
-#[allow(unused)]
-const DEFAULT_RELAY_CANDIDATES: &[&str] = &[
-    "mehl.cloud",
-    "mailchat.pl",
-    "chatmail.woodpeckersnest.space",
-    "chatmail.culturanerd.it",
-    "tarpit.fun",
-    "d.gaufr.es",
-];
+/// Maximum number of relays.
+///
+/// See <https://github.com/chatmail/core/issues/7608>.
+pub(crate) const MAX_RELAYS: usize = 5;
 
 macro_rules! progress {
     ($context:tt, $progress:expr, $comment:expr) => {
@@ -125,7 +108,6 @@ impl Context {
     ///   from a server encoded in a QR code.
     /// - [Self::list_transports()] to get a list of all configured transports.
     /// - [Self::delete_transport()] to remove a transport.
-    /// - [Self::set_transport_unpublished()] to set whether contacts see this transport.
     pub async fn add_or_update_transport(&self, param: &mut EnteredLoginParam) -> Result<()> {
         self.stop_io().await;
         let result = self.add_transport_inner(param).await;
@@ -140,6 +122,23 @@ impl Context {
     }
 
     pub(crate) async fn add_transport_inner(&self, param: &mut EnteredLoginParam) -> Result<()> {
+        match self.add_transport_unreported(param).await {
+            Ok(()) => {
+                progress!(self, 1000);
+                Ok(())
+            }
+            Err(err) => {
+                // We are using Anyhow's .context() and to show the
+                // inner error, too, we need the {:#}:
+                let error_msg = stock_str::configuration_failed(self, &format!("{err:#}"));
+                progress!(self, 0, Some(error_msg.clone()));
+                bail!(error_msg);
+            }
+        }
+    }
+
+    /// Adds a transport without reporting the outcome.
+    async fn add_transport_unreported(&self, param: &mut EnteredLoginParam) -> Result<()> {
         ensure!(
             !self.scheduler.is_running().await,
             "cannot configure, already running"
@@ -157,19 +156,9 @@ impl Context {
             .await;
 
         self.free_ongoing().await;
+        res?;
 
-        if let Err(err) = res.as_ref() {
-            // We are using Anyhow's .context() and to show the
-            // inner error, too, we need the {:#}:
-            let error_msg = stock_str::configuration_failed(self, &format!("{err:#}"));
-            progress!(self, 0, Some(error_msg.clone()));
-            bail!(error_msg);
-        } else {
-            param.save_legacy(self).await?;
-            progress!(self, 1000);
-        }
-
-        res
+        param.save_legacy(self).await
     }
 
     /// Adds a new email account as a transport
@@ -204,25 +193,13 @@ impl Context {
     /// Returns the list of all email accounts that are used as a transport in the current profile.
     /// Use [Self::add_or_update_transport()] to add or change a transport
     /// and [Self::delete_transport()] to delete a transport.
-    pub async fn list_transports(&self) -> Result<Vec<TransportListEntry>> {
-        let transports = self
-            .sql
-            .query_map_vec(
-                "SELECT entered_param, is_published FROM transports",
-                (),
-                |row| {
-                    let param: String = row.get(0)?;
-                    let param: EnteredLoginParam = serde_json::from_str(&param)?;
-                    let is_published: bool = row.get(1)?;
-                    Ok(TransportListEntry {
-                        param,
-                        is_unpublished: !is_published,
-                    })
-                },
-            )
-            .await?;
-
-        Ok(transports)
+    pub async fn list_transports(&self) -> Result<Vec<EnteredLoginParam>> {
+        self.sql
+            .query_map_vec("SELECT entered_param FROM transports", (), |row| {
+                let param: String = row.get(0)?;
+                Ok(serde_json::from_str(&param)?)
+            })
+            .await
     }
 
     /// Returns the number of configured transports.
@@ -230,182 +207,103 @@ impl Context {
         self.sql.count("SELECT COUNT(*) FROM transports", ()).await
     }
 
-    /// Removes the transport with the specified email address
-    /// (i.e. [EnteredLoginParam::addr]).
+    /// Removes a transport.
+    /// UIs should call this function when the user removes a relay.
+    ///
+    /// The last transport cannot be removed.
+    /// If the removed transport was the one used for sending,
+    /// another one is chosen automatically.
     pub async fn delete_transport(&self, addr: &str) -> Result<()> {
         let now = time();
-        let removed_transport_id = self
+        let (removed_transport_id, reelected) = self
             .sql
             .transaction(|transaction| {
-                let primary_addr = transaction.query_row(
-                    "SELECT value FROM config WHERE keyname='configured_addr'",
-                    (),
-                    |row| {
-                        let addr: String = row.get(0)?;
-                        Ok(addr)
-                    },
-                )?;
-
-                if primary_addr == addr {
-                    bail!("Cannot delete primary transport");
+                if transport_addrs(transaction)?.len() <= 1 {
+                    bail!("Cannot remove the last transport");
                 }
-                let (transport_id, add_timestamp) = transaction.query_row(
-                    "DELETE FROM transports WHERE addr=? RETURNING id, add_timestamp",
-                    (addr,),
-                    |row| {
-                        let id: u32 = row.get(0)?;
-                        let add_timestamp: i64 = row.get(1)?;
-                        Ok((id, add_timestamp))
-                    },
-                )?;
-
+                let add_timestamp: i64 = transaction
+                    .query_row(
+                        "SELECT add_timestamp FROM transports WHERE addr=?",
+                        (addr,),
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .context("Transport does not exist")?;
                 // Removal timestamp should not be lower than addition timestamp
                 // to be accepted by other devices when synced.
                 let remove_timestamp = std::cmp::max(now, add_timestamp);
-
-                transaction.execute(
-                    "INSERT INTO removed_transports (addr, remove_timestamp)
-                     VALUES (?, ?)
-                     ON CONFLICT (addr)
-                     DO UPDATE SET remove_timestamp = excluded.remove_timestamp",
-                    (addr, remove_timestamp),
-                )?;
-
-                Ok(transport_id)
+                let transport_id = delete_transport_row(transaction, addr, remove_timestamp)?
+                    .context("Transport disappeared")?;
+                let reelected = maybe_update_sending_transport(transaction)?;
+                Ok((transport_id, reelected))
             })
             .await?;
+        if let Some(new_addr) = reelected {
+            info!(self, "Using transport {new_addr:?} for sending now.");
+            self.sql.uncache_raw_config("configured_addr").await;
+        }
         send_sync_transports(self).await?;
-        self.quota.write().await.remove(&removed_transport_id);
+        purge_transport_caches(self, removed_transport_id).await;
+        // Restarting all IO also stops the removed transport's IMAP loop.
+        // Scheduler reconciliation would stop only that one loop,
+        // see https://github.com/chatmail/core/issues/8513
         self.restart_io_if_running().await;
 
-        Ok(())
-    }
-
-    /// Change whether the transport is unpublished.
-    ///
-    /// Unpublished transports are not advertised to contacts,
-    /// and self-sent messages are not sent there,
-    /// so that we don't cause extra messages to the corresponding inbox,
-    /// but can still receive messages from contacts who don't know our new transport addresses yet.
-    ///
-    /// The default is false, but when the user updates from a version that didn't have this flag,
-    /// existing secondary transports are set to unpublished,
-    /// so that an existing transport address doesn't suddenly get spammed with a lot of messages.
-    pub async fn set_transport_unpublished(&self, addr: &str, unpublished: bool) -> Result<()> {
-        self.sql
-            .transaction(|trans| {
-                let primary_addr: String = trans
-                    .query_row(
-                        "SELECT value FROM config WHERE keyname='configured_addr'",
-                        (),
-                        |row| row.get(0),
-                    )
-                    .context("Select primary address")?;
-                if primary_addr == addr && unpublished {
-                    bail!("Can't set primary relay as unpublished");
-                }
-                // We need to update the timestamp so that the key's timestamp changes
-                // and is recognized as newer by our peers
-                trans
-                    .execute(
-                        "UPDATE transports SET is_published=?, add_timestamp=? WHERE addr=? AND is_published!=?1",
-                        (!unpublished, time(), addr),
-                    )
-                    .context("Update transports")?;
-                Ok(())
-            })
-            .await?;
-        send_sync_transports(self).await?;
         Ok(())
     }
 
     async fn inner_configure(&self, param: &EnteredLoginParam) -> Result<()> {
         info!(self, "Configure ...");
 
-        let old_addr = self.get_config(Config::ConfiguredAddr).await?;
-        if old_addr.is_some()
-            && !self
-                .sql
-                .exists(
-                    "SELECT COUNT(*) FROM transports WHERE addr=?",
-                    (&param.addr,),
-                )
-                .await?
-            && self
-                .sql
-                .count("SELECT COUNT(*) FROM transports", ())
-                .await?
-                >= MAX_TRANSPORT_RELAYS
-        {
-            bail!(
-                "You have reached the maximum number of relays ({}).",
-                MAX_TRANSPORT_RELAYS
+        if !self
+            .sql
+            .exists(
+                "SELECT COUNT(*) FROM transports WHERE addr=?",
+                (&param.addr,),
             )
+            .await?
+        {
+            self.check_relay_limit().await?;
         }
 
-        let provider = match configure(self, param).await {
-            Err(error) => {
-                // Log entered and actual params
-                let configured_param = get_configured_param(self, param).await;
-                warn!(
-                    self,
-                    "configure failed: Entered params: {}. Used params: {}. Error: {error}.",
-                    param.to_string(),
-                    configured_param
-                        .map(|param| param.to_string())
-                        .unwrap_or("error".to_owned())
-                );
-                return Err(error);
-            }
-            Ok(provider) => provider,
+        let skip_network = false;
+        if let Err(error) = configure(self, param, skip_network).await {
+            // Log entered and actual params
+            let configured_param = get_configured_param(self, param, skip_network).await;
+            warn!(
+                self,
+                "configure failed: Entered params: {}. Used params: {}. Error: {error}.",
+                param.to_string(),
+                configured_param
+                    .map(|param| param.to_string())
+                    .unwrap_or("error".to_owned())
+            );
+            return Err(error);
         };
-        self.set_config_internal(Config::NotifyAboutWrongPw, Some("1"))
-            .await?;
-        on_configure_completed(self, provider).await?;
+        if provider::legacy_settings_for_addr(&param.addr)?.worse_media_quality
+            && !self.config_exists(Config::MediaQuality).await?
+        {
+            self.set_config_ext(Nosync, Config::MediaQuality, Some("1"))
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn check_relay_limit(&self) -> Result<()> {
+        ensure!(
+            self.count_transports().await? < MAX_RELAYS,
+            "You have reached the maximum number of relays ({MAX_RELAYS})"
+        );
         Ok(())
     }
 }
 
-async fn on_configure_completed(
-    context: &Context,
-    provider: Option<&'static Provider>,
-) -> Result<()> {
-    if let Some(provider) = provider {
-        if let Some(config_defaults) = provider.config_defaults {
-            for def in config_defaults {
-                if !context.config_exists(def.key).await? {
-                    info!(context, "apply config_defaults {}={}", def.key, def.value);
-                    context
-                        .set_config_ex(Nosync, def.key, Some(def.value))
-                        .await?;
-                } else {
-                    info!(
-                        context,
-                        "skip already set config_defaults {}={}", def.key, def.value
-                    );
-                }
-            }
-        }
-
-        if !provider.after_login_hint.is_empty() {
-            let mut msg = Message::new_text(provider.after_login_hint.to_string());
-            if chat::add_device_msg(context, Some("core-provider-info"), Some(&mut msg))
-                .await
-                .is_err()
-            {
-                warn!(context, "cannot add after_login_hint as core-provider-info");
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Retrieves data from autoconfig and provider database
+/// Retrieves data from autoconfig
 /// to transform user-entered login parameters into complete configuration.
 async fn get_configured_param(
     ctx: &Context,
     param: &EnteredLoginParam,
+    skip_network: bool,
 ) -> Result<ConfiguredLoginParam> {
     ensure!(!param.addr.is_empty(), "Missing email address.");
 
@@ -418,33 +316,14 @@ async fn get_configured_param(
         param.smtp.password.clone()
     };
 
-    let mut addr = param.addr.clone();
-    if param.oauth2 {
-        // the used oauth2 addr may differ, check this.
-        // if get_oauth2_addr() is not available in the oauth2 implementation, just use the given one.
-        progress!(ctx, 10);
-        if let Some(oauth2_addr) = get_oauth2_addr(ctx, &param.addr, &param.imap.password)
-            .await?
-            .and_then(|e| e.parse().ok())
-        {
-            info!(ctx, "Authorized address is {}", oauth2_addr);
-            addr = oauth2_addr;
-            ctx.sql
-                .set_raw_config("addr", Some(param.addr.as_str()))
-                .await?;
-        }
-        progress!(ctx, 20);
-    }
-    // no oauth? - just continue it's no error
+    let addr = param.addr.clone();
 
     let parsed = EmailAddress::new(&param.addr).context("Bad email-address")?;
     let param_domain = parsed.domain;
 
     progress!(ctx, 200);
 
-    let provider;
-    let param_autoconfig;
-    if param.imap.server.is_empty()
+    let param_autoconfig = if param.imap.server.is_empty()
         && param.imap.port == 0
         && param.imap.security == Socket::Automatic
         && param.imap.user.is_empty()
@@ -452,52 +331,17 @@ async fn get_configured_param(
         && param.smtp.port == 0
         && param.smtp.security == Socket::Automatic
         && param.smtp.user.is_empty()
+        && !skip_network
     {
-        // no advanced parameters entered by the user: query provider-database or do Autoconfig
-        info!(
-            ctx,
-            "checking internal provider-info for offline autoconfig"
-        );
-
-        provider = provider::get_provider_info(&param_domain);
-        if let Some(provider) = provider {
-            if provider.server.is_empty() {
-                info!(ctx, "Offline autoconfig found, but no servers defined.");
-                param_autoconfig = None;
-            } else {
-                info!(ctx, "Offline autoconfig found.");
-                let servers = provider
-                    .server
-                    .iter()
-                    .map(|s| ServerParams {
-                        protocol: s.protocol,
-                        socket: s.socket,
-                        hostname: s.hostname.to_string(),
-                        port: s.port,
-                        username: match s.username_pattern {
-                            UsernamePattern::Email => param.addr.to_string(),
-                            UsernamePattern::Emaillocalpart => {
-                                if let Some(at) = param.addr.find('@') {
-                                    param.addr.split_at(at).0.to_string()
-                                } else {
-                                    param.addr.to_string()
-                                }
-                            }
-                        },
-                    })
-                    .collect();
-
-                param_autoconfig = Some(servers)
-            }
-        } else {
-            // Try receiving autoconfig
-            info!(ctx, "No offline autoconfig found.");
-            param_autoconfig = get_autoconfig(ctx, param, &param_domain).await;
+        // No advanced parameters entered by the user:
+        // do Autoconfig unless the domain has hard-coded legacy servers.
+        match provider::legacy_settings_for_addr(&param.addr)?.autoconfig_servers {
+            Some(servers) => Some(servers),
+            None => get_autoconfig(ctx, param, &param_domain).await,
         }
     } else {
-        provider = None;
-        param_autoconfig = None;
-    }
+        None
+    };
 
     progress!(ctx, 500);
 
@@ -576,7 +420,6 @@ async fn get_configured_param(
             .collect(),
         smtp_user: param.smtp.user.clone(),
         smtp_password,
-        provider,
         certificate_checks: match param.certificate_checks {
             EnteredCertificateChecks::Automatic => ConfiguredCertificateChecks::Automatic,
             EnteredCertificateChecks::Strict => ConfiguredCertificateChecks::Strict,
@@ -585,83 +428,87 @@ async fn get_configured_param(
                 ConfiguredCertificateChecks::AcceptInvalidCertificates
             }
         },
-        oauth2: param.oauth2,
     };
     Ok(configured_login_param)
 }
 
-async fn configure(ctx: &Context, param: &EnteredLoginParam) -> Result<Option<&'static Provider>> {
+pub(crate) async fn configure(
+    ctx: &Context,
+    param: &EnteredLoginParam,
+    skip_network: bool,
+) -> Result<()> {
     progress!(ctx, 1);
 
-    let configured_param = get_configured_param(ctx, param).await?;
+    let configured_param = get_configured_param(ctx, param, skip_network).await?;
     let proxy_config = ProxyConfig::load(ctx).await?;
-    let strict_tls = configured_param.strict_tls(proxy_config.is_some());
+    let strict_tls = configured_param.strict_tls(proxy_config.is_some())?;
 
     progress!(ctx, 550);
 
-    // Spawn SMTP configuration task
-    // to try SMTP while connecting to IMAP.
-    let context_smtp = ctx.clone();
-    let smtp_param = configured_param.smtp.clone();
-    let smtp_password = configured_param.smtp_password.clone();
-    let smtp_addr = configured_param.addr.clone();
+    if !skip_network {
+        // Spawn SMTP configuration task
+        // to try SMTP while connecting to IMAP.
+        let context_smtp = ctx.clone();
+        let smtp_param = configured_param.smtp.clone();
+        let smtp_password = configured_param.smtp_password.clone();
+        let smtp_addr = configured_param.addr.clone();
 
-    let proxy_config2 = proxy_config.clone();
-    let smtp_config_task = task::spawn(async move {
-        let mut smtp = Smtp::new();
-        smtp.connect(
-            &context_smtp,
-            &smtp_param,
-            &smtp_password,
-            &proxy_config2,
-            &smtp_addr,
-            strict_tls,
-            configured_param.oauth2,
-        )
-        .await?;
+        let proxy_config2 = proxy_config.clone();
+        let smtp_config_task = task::spawn(async move {
+            let mut smtp = Smtp::new();
+            smtp.connect(
+                &context_smtp,
+                &smtp_param,
+                &smtp_password,
+                &proxy_config2,
+                &smtp_addr,
+                strict_tls,
+            )
+            .await?;
 
-        Ok::<(), anyhow::Error>(())
-    });
+            Ok::<(), anyhow::Error>(())
+        });
 
-    progress!(ctx, 600);
+        progress!(ctx, 600);
 
-    // Configure IMAP
+        // Configure IMAP
 
-    let transport_id = 0;
-    let (_s, r) = async_channel::bounded(1);
-    let mut imap = Imap::new(ctx, transport_id, configured_param.clone(), r).await?;
-    let configuring = true;
-    let imap_session = match imap.connect(ctx, configuring).await {
-        Ok(imap_session) => imap_session,
-        Err(err) => {
-            bail!("{}", nicer_configuration_error(ctx, format!("{err:#}")));
+        let transport_id = 0;
+        let (_s, r) = async_channel::bounded(1);
+        let mut imap = Imap::new(ctx, transport_id, configured_param.clone(), r).await?;
+        let imap_session = match imap.connect(ctx).await {
+            Ok(imap_session) => imap_session,
+            Err(err) => {
+                bail!("{}", nicer_configuration_error(ctx, format!("{err:#}")));
+            }
+        };
+
+        progress!(ctx, 850);
+
+        // Wait for SMTP configuration
+        smtp_config_task.await??;
+
+        progress!(ctx, 900);
+
+        let is_configured = ctx.is_configured().await?;
+        if !ctx.get_config_bool(Config::FixIsChatmail).await? {
+            if imap_session.is_chatmail() {
+                ctx.sql.set_raw_config("is_chatmail", Some("1")).await?;
+            } else if !is_configured {
+                // Reset the setting that may have been set
+                // during failed configuration.
+                ctx.sql.set_raw_config("is_chatmail", Some("0")).await?;
+            }
         }
-    };
 
-    progress!(ctx, 850);
-
-    // Wait for SMTP configuration
-    smtp_config_task.await??;
-
-    progress!(ctx, 900);
-
-    let is_configured = ctx.is_configured().await?;
-    if !ctx.get_config_bool(Config::FixIsChatmail).await? {
-        if imap_session.is_chatmail() {
-            ctx.sql.set_raw_config("is_chatmail", Some("1")).await?;
-        } else if !is_configured {
-            // Reset the setting that may have been set
-            // during failed configuration.
-            ctx.sql.set_raw_config("is_chatmail", Some("0")).await?;
-        }
+        // Drop the imap connection explicitly
+        // to make sure that it's not forgotten in a future refactoring
+        drop(imap_session);
+        drop(imap);
     }
-
-    drop(imap_session);
-    drop(imap);
 
     progress!(ctx, 910);
 
-    let provider = configured_param.provider;
     configured_param
         .clone()
         .save_to_transports_table(ctx, param, time())
@@ -683,7 +530,7 @@ async fn configure(ctx: &Context, param: &EnteredLoginParam) -> Result<Option<&'
     ctx.sql.set_raw_config_bool("configured", true).await?;
     ctx.emit_event(EventType::AccountsItemChanged);
 
-    Ok(provider)
+    Ok(())
 }
 
 /// Retrieve available autoconfigurations.
@@ -721,12 +568,12 @@ async fn get_autoconfig(
     }
     progress!(ctx, 300);
 
+    // `?emailaddress=` query string is excluded on purpose.
+    // It is not part of the URL according to <https://datatracker.ietf.org/doc/draft-ietf-mailmaint-autoconfig/06/>.
+    // Related discussion confirming this is at <https://github.com/benbucksch/autoconfig-spec/issues/17>.
     if let Ok(res) = moz_autoconfigure(
         ctx,
-        // the doc does not mention `emailaddress=`, however, Thunderbird adds it, see <https://releases.mozilla.org/pub/thunderbird/>,  which makes some sense
-        &format!(
-            "https://{param_domain}/.well-known/autoconfig/mail/config-v1.1.xml?emailaddress={param_addr_urlencoded}"
-        ),
+        &format!("https://{param_domain}/.well-known/autoconfig/mail/config-v1.1.xml"),
         &param.addr,
         accept_invalid_certificates,
     )
@@ -811,9 +658,11 @@ pub enum Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::autorelay::login_param_from_host;
     use crate::config::Config;
     use crate::login_param::EnteredImapLoginParam;
-    use crate::test_utils::TestContext;
+    use crate::test_utils::{TestContext, TestContextManager};
+    use crate::transport::add_pseudo_transport;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_no_panic_on_bad_credentials() {
@@ -823,6 +672,32 @@ mod tests {
             .unwrap();
         t.set_config(Config::MailPw, Some("123456")).await.unwrap();
         assert!(t.configure().await.is_err());
+
+        t.assert_warns_or_errors(&["DNS resolution"]).await;
+    }
+
+    /// Tests that a configuration failing
+    /// before the first login attempt is still reported as a failure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_early_configure_failure_is_reported() -> Result<()> {
+        let t = TestContext::new().await;
+        let mut param = login_param_from_host("example.org");
+
+        // An ongoing process, e.g. a backup import,
+        // makes configuration fail without ever contacting a relay.
+        let _ongoing = t.alloc_ongoing().await?;
+        assert!(t.add_or_update_transport(&mut param).await.is_err());
+
+        let event = t
+            .evtracker
+            .get_matching(|evt| matches!(evt, EventType::ConfigureProgress { .. }))
+            .await;
+        assert!(matches!(
+            event,
+            EventType::ConfigureProgress { progress: 0, .. }
+        ));
+
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -839,9 +714,71 @@ mod tests {
 
             ..Default::default()
         };
-        let configured_param = get_configured_param(t, &entered_param).await?;
+        let skip_network = false;
+        let configured_param = get_configured_param(t, &entered_param, skip_network).await?;
         assert_eq!(configured_param.imap_user, "alice@example.net");
         assert_eq!(configured_param.smtp_user, "");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_relay_limit() -> Result<()> {
+        let mut tcm = TestContextManager::new();
+        let t = &tcm.unconfigured().await;
+
+        // Setting ConfiguredAddr on an unconfigured account creates a pseudo transport
+        t.set_config(Config::ConfiguredAddr, Some("primary@example.org"))
+            .await?;
+        assert_eq!(t.count_transports().await?, 1);
+        t.check_relay_limit().await?;
+
+        for i in 0..(MAX_RELAYS - 1) {
+            add_pseudo_transport(t, &format!("transport{i}@example.org")).await?;
+        }
+        assert_eq!(t.count_transports().await?, MAX_RELAYS);
+        assert_eq!(
+            t.check_relay_limit().await.unwrap_err().to_string(),
+            format!("You have reached the maximum number of relays ({MAX_RELAYS})")
+        );
+
+        t.delete_transport("transport0@example.org").await?;
+        t.check_relay_limit().await?;
+
+        Ok(())
+    }
+
+    /// Tests that if Alice adds maximum number of transports,
+    /// Bob sends messages to all of them.
+    ///
+    /// This way we don't need to care about the order
+    /// of addresses advertised in the public key.
+    /// Previously the number of addresses
+    /// taken from the key was less than the maximum
+    /// number of advertised addresses.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_can_send_to_max_relays() -> Result<()> {
+        let mut tcm = TestContextManager::new();
+
+        let alice = &tcm.alice().await;
+        let bob = &tcm.bob().await;
+
+        // One relay is added already by default.
+        for i in 1..MAX_RELAYS {
+            add_pseudo_transport(alice, &format!("transport{i}@example.org")).await?;
+        }
+        assert_eq!(alice.count_transports().await?, MAX_RELAYS);
+
+        let bob_chat_id = bob.create_chat_id(alice).await;
+
+        bob.set_config_bool(Config::BccSelf, false).await?;
+        let sent = bob.send_text(bob_chat_id, "Hello!").await;
+        assert_eq!(
+            sent.recipients.split(' ').count(),
+            MAX_RELAYS,
+            "List of recipients is {}",
+            sent.recipients
+        );
+
         Ok(())
     }
 }

@@ -201,7 +201,7 @@ impl Context {
         let chat = Chat::load_from_db(self, chat_id).await?;
         ensure!(
             chat.typ == Chattype::Single,
-            "Can only place calls in 1:1 chats"
+            "Can only place calls in single chats"
         );
         ensure!(!chat.is_self_talk(), "Cannot call self");
 
@@ -360,36 +360,40 @@ impl Context {
             };
 
             if call.is_incoming() {
+                let can_call_me = match who_can_call_me(self).await? {
+                    WhoCanCallMe::Contacts => ChatIdBlocked::lookup_by_contact(self, from_id)
+                        .await?
+                        .is_some_and(|chat_id_blocked| {
+                            match chat_id_blocked.blocked {
+                                Blocked::Not => true,
+                                Blocked::Yes | Blocked::Request => {
+                                    // Do not notify about incoming calls
+                                    // from contact requests and blocked contacts.
+                                    //
+                                    // User can still access the call and accept it
+                                    // via the chat in case of contact requests.
+                                    false
+                                }
+                            }
+                        }),
+                    WhoCanCallMe::Everybody => ChatIdBlocked::lookup_by_contact(self, from_id)
+                        .await?
+                        .is_none_or(|chat_id_blocked| chat_id_blocked.blocked != Blocked::Yes),
+                    WhoCanCallMe::Nobody => false,
+                };
                 if call.is_stale() {
                     let missed_call_str = stock_str::missed_call(self);
                     call.update_text(self, &missed_call_str).await?;
-                    self.emit_incoming_msg(call.msg.chat_id, call_id); // notify missed call
+                    let important = can_call_me;
+                    // notify missed call
+                    call.msg
+                        .chat_id
+                        .emit_msg_event(self, call.msg.id, important);
                 } else {
                     let incoming_call_str =
                         stock_str::incoming_call(self, call.has_video_initially());
                     call.update_text(self, &incoming_call_str).await?;
                     self.emit_msgs_changed(call.msg.chat_id, call_id); // ringing calls are not additionally notified
-                    let can_call_me = match who_can_call_me(self).await? {
-                        WhoCanCallMe::Contacts => ChatIdBlocked::lookup_by_contact(self, from_id)
-                            .await?
-                            .is_some_and(|chat_id_blocked| {
-                                match chat_id_blocked.blocked {
-                                    Blocked::Not => true,
-                                    Blocked::Yes | Blocked::Request => {
-                                        // Do not notify about incoming calls
-                                        // from contact requests and blocked contacts.
-                                        //
-                                        // User can still access the call and accept it
-                                        // via the chat in case of contact requests.
-                                        false
-                                    }
-                                }
-                            }),
-                        WhoCanCallMe::Everybody => ChatIdBlocked::lookup_by_contact(self, from_id)
-                            .await?
-                            .is_none_or(|chat_id_blocked| chat_id_blocked.blocked != Blocked::Yes),
-                        WhoCanCallMe::Nobody => false,
-                    };
                     if can_call_me {
                         self.emit_event(EventType::IncomingCall {
                             msg_id: call.msg.id,
@@ -617,7 +621,7 @@ pub async fn call_state(context: &Context, msg_id: MsgId) -> Result<CallState> {
 
 /// ICE server for JSON serialization.
 #[derive(Serialize, Debug, Clone, PartialEq)]
-struct IceServer {
+pub(crate) struct IceServer {
     /// STUN or TURN URLs.
     pub urls: Vec<String>,
 
@@ -655,7 +659,7 @@ pub(crate) async fn create_ice_servers_from_metadata(
 }
 
 /// STUN or TURN server with unresolved DNS name.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum UnresolvedIceServer {
     /// STUN server.
     Stun { hostname: String, port: u16 },
@@ -676,7 +680,7 @@ pub(crate) enum UnresolvedIceServer {
 pub(crate) async fn resolve_ice_servers(
     context: &Context,
     unresolved_ice_servers: Vec<UnresolvedIceServer>,
-) -> Result<String> {
+) -> Result<Vec<IceServer>> {
     let mut result: Vec<IceServer> = Vec::new();
 
     // Do not use cache because there is no TLS.
@@ -733,8 +737,7 @@ pub(crate) async fn resolve_ice_servers(
             },
         }
     }
-    let json = serde_json::to_string(&result)?;
-    Ok(json)
+    Ok(result)
 }
 
 /// Creates JSON with ICE servers when no TURN servers are known.
@@ -770,12 +773,19 @@ pub(crate) fn create_fallback_ice_servers() -> Vec<UnresolvedIceServer> {
 /// because it itself cannot utilize DNS. See
 /// <https://github.com/deltachat/deltachat-desktop/issues/5447>.
 pub async fn ice_servers(context: &Context) -> Result<String> {
-    if let Some(ref metadata) = *context.metadata.read().await {
-        let ice_servers = resolve_ice_servers(context, metadata.ice_servers.clone()).await?;
-        Ok(ice_servers)
-    } else {
-        Ok("[]".to_string())
-    }
+    let mut unresolved_ice_servers: Vec<UnresolvedIceServer> = context
+        .metadata
+        .read()
+        .await
+        .values()
+        .flat_map(|metadata| metadata.ice_servers.clone())
+        .collect();
+    unresolved_ice_servers.sort();
+    unresolved_ice_servers.dedup();
+
+    let ice_servers = resolve_ice_servers(context, unresolved_ice_servers).await?;
+    let json = serde_json::to_string(&ice_servers)?;
+    Ok(json)
 }
 
 /// "Who can call me" config options.

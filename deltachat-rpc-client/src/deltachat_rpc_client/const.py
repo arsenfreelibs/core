@@ -97,7 +97,7 @@ class ChatType(str, Enum):
     """Chat type."""
 
     SINGLE = "Single"
-    """1:1 chat, i.e. a direct chat with a single contact"""
+    """Single chat (a chat with a with a single contact)"""
 
     GROUP = "Group"
 
@@ -231,14 +231,6 @@ class KeyGenType(IntEnum):
     RSA4096 = 3
 
 
-# "Lp" means "login parameters"
-class LpAuthFlag(IntEnum):
-    """Authorization flags."""
-
-    OAUTH2 = 0x2
-    NORMAL = 0x4
-
-
 class MediaQuality(IntEnum):
     """Media quality setting."""
 
@@ -252,14 +244,6 @@ class ProviderStatus(IntEnum):
     OK = 1
     PREPARATION = 2
     BROKEN = 3
-
-
-class PushNotifyState(IntEnum):
-    """Push notifications state."""
-
-    NOT_CONNECTED = 0
-    HEARTBEAT = 1
-    CONNECTED = 2
 
 
 class ShowEmails(IntEnum):

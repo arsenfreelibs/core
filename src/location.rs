@@ -14,11 +14,11 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result, ensure};
 use async_channel::Receiver;
+use quick_xml::XmlVersion;
 use quick_xml::events::{BytesEnd, BytesStart, BytesText};
 use tokio::time::timeout;
 
 use crate::chat::{self, ChatId};
-use crate::constants::DC_CHAT_ID_TRASH;
 use crate::contact::ContactId;
 use crate::context::Context;
 use crate::events::EventType;
@@ -75,9 +75,6 @@ impl Location {
 /// <https://developers.google.com/kml> for documentation.
 #[derive(Debug, Clone, Default)]
 pub struct Kml {
-    /// Nonstandard `addr` attribute of the `Document` tag storing the user email address.
-    pub addr: Option<String>,
-
     /// Placemarks.
     pub locations: Vec<Location>,
 
@@ -140,8 +137,9 @@ impl Kml {
         if self.tag == KmlTag::PlacemarkTimestampWhen
             || self.tag == KmlTag::PlacemarkPointCoordinates
         {
-            let val = event.xml_content().unwrap_or_default();
-
+            let val = event
+                .xml_content(XmlVersion::Implicit1_0)
+                .unwrap_or_default();
             let val = val.replace(['\n', '\r', '\t', ' '], "");
 
             if self.tag == KmlTag::PlacemarkTimestampWhen && val.len() >= 19 {
@@ -219,19 +217,7 @@ impl Kml {
         let tag = String::from_utf8_lossy(event.name().as_ref())
             .trim()
             .to_lowercase();
-        if tag == "document" {
-            if let Some(addr) = event.attributes().filter_map(|a| a.ok()).find(|attr| {
-                String::from_utf8_lossy(attr.key.as_ref())
-                    .trim()
-                    .to_lowercase()
-                    == "addr"
-            }) {
-                self.addr = addr
-                    .decode_and_unescape_value(reader.decoder())
-                    .ok()
-                    .map(|a| a.into_owned());
-            }
-        } else if tag == "placemark" {
+        if tag == "placemark" {
             self.tag = KmlTag::Placemark;
             self.curr.timestamp = 0;
             self.curr.latitude = 0.0;
@@ -253,7 +239,7 @@ impl Kml {
                 })
             }) {
                 let v = acc
-                    .decode_and_unescape_value(reader.decoder())
+                    .decoded_and_normalized_value(XmlVersion::Implicit1_0, reader.decoder())
                     .unwrap_or_default();
 
                 self.curr.accuracy = v.trim().parse().unwrap_or_default();
@@ -517,16 +503,13 @@ pub(crate) async fn delete_orphaned_poi(context: &Context) -> Result<()> {
     (SELECT location_id from MSGS LEFT JOIN locations
      ON locations.id=location_id
      WHERE location_id>0 -- This check makes the query faster by not looking for locations with ID 0 that don't exist.
-     AND msgs.chat_id != ?)", (DC_CHAT_ID_TRASH,)).await?;
+     AND msgs.chat_id != ?)", (ChatId::TRASH,)).await?;
     Ok(())
 }
 
-/// Returns `location.kml` contents.
-#[expect(clippy::arithmetic_side_effects)]
-pub async fn get_kml(context: &Context, chat_id: ChatId) -> Result<Option<(String, u32)>> {
-    let mut last_added_location_id = 0;
-
-    let self_addr = context.get_primary_self_addr().await?;
+/// Returns `location.kml` contents and the largest location timestamp, if any.
+pub async fn get_kml(context: &Context, chat_id: ChatId) -> Result<Option<(String, i64)>> {
+    let mut last_added_location_timestamp: Option<i64> = None;
 
     let (locations_send_begin, locations_send_until, locations_last_sent) = context.sql.query_row(
         "SELECT locations_send_begin, locations_send_until, locations_last_sent  FROM chats  WHERE id=?;",
@@ -540,21 +523,18 @@ pub async fn get_kml(context: &Context, chat_id: ChatId) -> Result<Option<(Strin
         .await?;
 
     let now = time();
-    let mut location_count = 0;
     let mut ret = String::new();
     if locations_send_begin != 0 && now <= locations_send_until {
-        ret += &format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-            <kml xmlns=\"http://www.opengis.net/kml/2.2\">\n<Document addr=\"{self_addr}\">\n",
-        );
+        ret += "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+            <kml xmlns=\"http://www.opengis.net/kml/2.2\">\n<Document>\n";
 
         context
             .sql
             .query_map(
-                "SELECT id, latitude, longitude, accuracy, timestamp \
+                "SELECT latitude, longitude, accuracy, timestamp \
              FROM locations  WHERE from_id=? \
              AND timestamp>=? \
-             AND (timestamp>=? OR \
+             AND (timestamp>? OR \
                   timestamp=(SELECT MAX(timestamp) FROM locations WHERE from_id=?)) \
              AND independent=0 \
              GROUP BY timestamp \
@@ -566,25 +546,24 @@ pub async fn get_kml(context: &Context, chat_id: ChatId) -> Result<Option<(Strin
                     ContactId::SELF
                 ),
                 |row| {
-                    let location_id: i32 = row.get(0)?;
-                    let latitude: f64 = row.get(1)?;
-                    let longitude: f64 = row.get(2)?;
-                    let accuracy: f64 = row.get(3)?;
-                    let timestamp = get_kml_timestamp(row.get(4)?);
+                    let latitude: f64 = row.get(0)?;
+                    let longitude: f64 = row.get(1)?;
+                    let accuracy: f64 = row.get(2)?;
+                    let timestamp: i64 = row.get(3)?;
 
-                    Ok((location_id, latitude, longitude, accuracy, timestamp))
+                    Ok((latitude, longitude, accuracy, timestamp))
                 },
                 |rows| {
                     for row in rows {
-                        let (location_id, latitude, longitude, accuracy, timestamp) = row?;
+                        let (latitude, longitude, accuracy, timestamp) = row?;
+                        let kml_timestamp = get_kml_timestamp(timestamp);
                         ret += &format!(
                             "<Placemark>\
-                <Timestamp><when>{timestamp}</when></Timestamp>\
+                <Timestamp><when>{kml_timestamp}</when></Timestamp>\
                 <Point><coordinates accuracy=\"{accuracy}\">{longitude},{latitude}</coordinates></Point>\
                 </Placemark>\n"
                         );
-                        location_count += 1;
-                        last_added_location_id = location_id as u32;
+                        last_added_location_timestamp = std::cmp::max(last_added_location_timestamp, Some(timestamp));
                     }
                     Ok(())
                 },
@@ -593,11 +572,7 @@ pub async fn get_kml(context: &Context, chat_id: ChatId) -> Result<Option<(Strin
         ret += "</Document>\n</kml>";
     }
 
-    if location_count > 0 {
-        Ok(Some((ret, last_added_location_id)))
-    } else {
-        Ok(None)
-    }
+    Ok(last_added_location_timestamp.map(|ts| (ret, ts)))
 }
 
 fn get_kml_timestamp(utc: i64) -> String {
@@ -624,22 +599,6 @@ pub fn get_message_kml(timestamp: i64, latitude: f64, longitude: f64) -> String 
         longitude,
         latitude,
     )
-}
-
-/// Sets the timestamp of the last time location was sent in the chat.
-pub async fn set_kml_sent_timestamp(
-    context: &Context,
-    chat_id: ChatId,
-    timestamp: i64,
-) -> Result<()> {
-    context
-        .sql
-        .execute(
-            "UPDATE chats SET locations_last_sent=? WHERE id=?;",
-            (timestamp, chat_id),
-        )
-        .await?;
-    Ok(())
 }
 
 /// Sets the location of the message.
@@ -877,32 +836,35 @@ mod tests {
 
     #[test]
     fn test_kml_parse() {
-        let xml =
-            b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<kml xmlns=\"http://www.opengis.net/kml/2.2\">\n<Document addr=\"user@example.org\">\n<Placemark><Timestamp><when>2019-03-06T21:09:57Z</when></Timestamp><Point><coordinates accuracy=\"32.000000\">9.423110,53.790302</coordinates></Point></Placemark>\n<PlaceMARK>\n<Timestamp><WHEN > \n\t2018-12-13T22:11:12Z\t</WHEN></Timestamp><Point><coordinates aCCuracy=\"2.500000\"> 19.423110 \t , \n 63.790302\n </coordinates></Point></PlaceMARK>\n</Document>\n</kml>";
+        let xmls = [
+            &b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<kml xmlns=\"http://www.opengis.net/kml/2.2\">\n<Document>\n<Placemark><Timestamp><when>2019-03-06T21:09:57Z</when></Timestamp><Point><coordinates accuracy=\"32.000000\">9.423110,53.790302</coordinates></Point></Placemark>\n<PlaceMARK>\n<Timestamp><WHEN > \n\t2018-12-13T22:11:12Z\t</WHEN></Timestamp><Point><coordinates aCCuracy=\"2.500000\"> 19.423110 \t , \n 63.790302\n </coordinates></Point></PlaceMARK>\n</Document>\n</kml>"[..],
+            // Older version that included `addr` attribute with email address
+            // in the `Document` tag.
+            &b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<kml xmlns=\"http://www.opengis.net/kml/2.2\">\n<Document addr=\"user@example.org\">\n<Placemark><Timestamp><when>2019-03-06T21:09:57Z</when></Timestamp><Point><coordinates accuracy=\"32.000000\">9.423110,53.790302</coordinates></Point></Placemark>\n<PlaceMARK>\n<Timestamp><WHEN > \n\t2018-12-13T22:11:12Z\t</WHEN></Timestamp><Point><coordinates aCCuracy=\"2.500000\"> 19.423110 \t , \n 63.790302\n </coordinates></Point></PlaceMARK>\n</Document>\n</kml>"[..]
+        ];
 
-        let kml = Kml::parse(xml).expect("parsing failed");
+        for xml in xmls {
+            let kml = Kml::parse(xml).expect("parsing failed");
 
-        assert!(kml.addr.is_some());
-        assert_eq!(kml.addr.as_ref().unwrap(), "user@example.org",);
+            let locations_ref = &kml.locations;
+            assert_eq!(locations_ref.len(), 2);
 
-        let locations_ref = &kml.locations;
-        assert_eq!(locations_ref.len(), 2);
+            assert!(locations_ref[0].latitude > 53.6f64);
+            assert!(locations_ref[0].latitude < 53.8f64);
+            assert!(locations_ref[0].longitude > 9.3f64);
+            assert!(locations_ref[0].longitude < 9.5f64);
+            assert!(locations_ref[0].accuracy > 31.9f64);
+            assert!(locations_ref[0].accuracy < 32.1f64);
+            assert_eq!(locations_ref[0].timestamp, 1551906597);
 
-        assert!(locations_ref[0].latitude > 53.6f64);
-        assert!(locations_ref[0].latitude < 53.8f64);
-        assert!(locations_ref[0].longitude > 9.3f64);
-        assert!(locations_ref[0].longitude < 9.5f64);
-        assert!(locations_ref[0].accuracy > 31.9f64);
-        assert!(locations_ref[0].accuracy < 32.1f64);
-        assert_eq!(locations_ref[0].timestamp, 1551906597);
-
-        assert!(locations_ref[1].latitude > 63.6f64);
-        assert!(locations_ref[1].latitude < 63.8f64);
-        assert!(locations_ref[1].longitude > 19.3f64);
-        assert!(locations_ref[1].longitude < 19.5f64);
-        assert!(locations_ref[1].accuracy > 2.4f64);
-        assert!(locations_ref[1].accuracy < 2.6f64);
-        assert_eq!(locations_ref[1].timestamp, 1544739072);
+            assert!(locations_ref[1].latitude > 63.6f64);
+            assert!(locations_ref[1].latitude < 63.8f64);
+            assert!(locations_ref[1].longitude > 19.3f64);
+            assert!(locations_ref[1].longitude < 19.5f64);
+            assert!(locations_ref[1].accuracy > 2.4f64);
+            assert!(locations_ref[1].accuracy < 2.6f64);
+            assert_eq!(locations_ref[1].timestamp, 1544739072);
+        }
     }
 
     #[test]
@@ -986,7 +948,7 @@ Content-Disposition: attachment; filename="location.kml"
 
 <?xml version="1.0" encoding="UTF-8"?>
 <kml xmlns="http://www.opengis.net/kml/2.2">
-<Document addr="bob@example.net">
+<Document>
 <Placemark><Timestamp><when>2021-11-21T00:00:00Z</when></Timestamp><Point><coordinates accuracy="1.0000000000000000">10.00000000000000,20.00000000000000</coordinates></Point></Placemark>
 </Document>
 </kml>
@@ -1035,7 +997,7 @@ Content-Disposition: attachment; filename="location.kml"
 
 <?xml version="1.0" encoding="UTF-8"?>
 <kml xmlns="http://www.opengis.net/kml/2.2">
-<Document addr="bob@example.net">
+<Document>
 <Placemark><Timestamp><when>2021-11-21T00:00:00Z</when></Timestamp><Point><coordinates accuracy="1.0000000000000000">10.00000000000000,20.00000000000000</coordinates></Point></Placemark>
 </Document>
 </kml>
@@ -1128,7 +1090,7 @@ Content-Disposition: attachment; filename="location.kml"
         bob.evtracker.clear_events();
         bob.recv_msg_opt(&alice.pop_sent_msg().await).await;
         bob.evtracker
-            .get_matching_ex(
+            .get_matching_ext(
                 bob,
                 ExpectedEvents {
                     expected: |e| matches!(e, EventType::MsgsChanged { .. }),
@@ -1157,6 +1119,46 @@ Content-Disposition: attachment; filename="location.kml"
         delete_expired(bob, time()).await?;
         assert_eq!(get_range(alice, None, None, 0, 0).await?.len(), 0);
         assert_eq!(get_range(bob, None, None, 0, 0).await?.len(), 0);
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_last_sent_location_timestamp() -> Result<()> {
+        let mut tcm = TestContextManager::new();
+        let alice = &tcm.alice().await;
+        let bob = &tcm.bob().await;
+
+        let alice_chat = alice.create_chat(bob).await;
+
+        send_to_chat(alice, alice_chat.id, 600).await?;
+        bob.recv_msg(&alice.pop_sent_msg().await).await;
+
+        assert_eq!(set(alice, 10.0, 20.0, 1.0).await?, true);
+
+        SystemTime::shift(Duration::from_secs(60));
+
+        maybe_send(alice).await?;
+        bob.recv_msg_opt(&alice.pop_sent_msg().await).await;
+
+        let alice_locations = get_range(alice, None, None, 0, 0).await?;
+        assert_eq!(alice_locations.len(), 1);
+        assert_eq!(get_range(bob, None, None, 0, 0).await?.len(), 1);
+
+        let last_sent = alice
+            .sql
+            .query_row(
+                "SELECT locations_last_sent FROM chats WHERE id = ?",
+                (alice_chat.id,),
+                |row| {
+                    let last_sent: i64 = row.get(0)?;
+
+                    Ok(last_sent)
+                },
+            )
+            .await?;
+
+        assert_eq!(alice_locations[0].timestamp, last_sent);
 
         Ok(())
     }

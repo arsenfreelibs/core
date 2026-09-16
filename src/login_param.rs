@@ -13,7 +13,6 @@ use num_traits::ToPrimitive as _;
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
-use crate::constants::{DC_LP_AUTH_FLAGS, DC_LP_AUTH_OAUTH2};
 use crate::context::Context;
 pub use crate::net::proxy::ProxyConfig;
 pub use crate::provider::Socket;
@@ -38,9 +37,8 @@ use crate::tools::ToOption;
 #[repr(u32)]
 #[strum(serialize_all = "snake_case")]
 pub enum EnteredCertificateChecks {
-    /// `Automatic` means that provider database setting should be taken.
-    /// If there is no provider database setting for certificate checks,
-    /// check certificates strictly.
+    /// `Automatic` means strict certificate checks,
+    /// unless a legacy-domain override disables them.
     #[default]
     Automatic = 0,
 
@@ -117,16 +115,6 @@ pub struct EnteredSmtpLoginParam {
     pub password: String,
 }
 
-/// A transport, as shown in the "relays" list in the UI.
-#[derive(Debug)]
-pub struct TransportListEntry {
-    /// The login data entered by the user.
-    pub param: EnteredLoginParam,
-    /// Whether this transport is set to 'unpublished'.
-    /// See [`Context::set_transport_unpublished`] for details.
-    pub is_unpublished: bool,
-}
-
 /// Login parameters entered by the user.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnteredLoginParam {
@@ -143,7 +131,8 @@ pub struct EnteredLoginParam {
     /// invalid hostnames
     pub certificate_checks: EnteredCertificateChecks,
 
-    /// If true, login via OAUTH2 (not recommended anymore)
+    /// Deprecated 2026-07, always false
+    #[serde(default)]
     pub oauth2: bool,
 }
 
@@ -222,12 +211,6 @@ impl EnteredLoginParam {
             .await?
             .unwrap_or_default();
 
-        let server_flags = context
-            .get_config_parsed::<i32>(Config::ServerFlags)
-            .await?
-            .unwrap_or_default();
-        let oauth2 = matches!(server_flags & DC_LP_AUTH_FLAGS, DC_LP_AUTH_OAUTH2);
-
         Ok(EnteredLoginParam {
             addr,
             imap: EnteredImapLoginParam {
@@ -246,7 +229,7 @@ impl EnteredLoginParam {
                 password: send_pw,
             },
             certificate_checks,
-            oauth2,
+            oauth2: false,
         })
     }
 
@@ -303,15 +286,6 @@ impl EnteredLoginParam {
             )
             .await?;
 
-        let server_flags = if self.oauth2 {
-            Some(DC_LP_AUTH_OAUTH2.to_string())
-        } else {
-            None
-        };
-        context
-            .set_config(Config::ServerFlags, server_flags.as_deref())
-            .await?;
-
         Ok(())
     }
 }
@@ -323,7 +297,7 @@ impl fmt::Display for EnteredLoginParam {
 
         write!(
             f,
-            "{} imap:{}:{}:{}:{}:{}:{} smtp:{}:{}:{}:{}:{}:{} cert_{}",
+            "{} imap:{}:{}:{}:{}:{} smtp:{}:{}:{}:{}:{} cert_{}",
             unset_empty(&self.addr),
             unset_empty(&self.imap.user),
             if !self.imap.password.is_empty() {
@@ -334,7 +308,6 @@ impl fmt::Display for EnteredLoginParam {
             unset_empty(&self.imap.server),
             self.imap.port,
             self.imap.security,
-            if self.oauth2 { "OAUTH2" } else { "AUTH_NORMAL" },
             unset_empty(&self.smtp.user),
             if !self.smtp.password.is_empty() {
                 pw
@@ -344,7 +317,6 @@ impl fmt::Display for EnteredLoginParam {
             unset_empty(&self.smtp.server),
             self.smtp.port,
             self.smtp.security,
-            if self.oauth2 { "OAUTH2" } else { "AUTH_NORMAL" },
             self.certificate_checks
         )
     }

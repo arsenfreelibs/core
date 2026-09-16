@@ -196,7 +196,7 @@ If the messenger finds a valid but not existent group-id,
 the messenger MAY create a new group.
 If no group-id is found,
 the message MAY be assigned
-to a normal single-user chat with the email-address given in `From`.
+to a single chat with the email-address given in `From`.
 
 
 ## Add and remove members
@@ -594,24 +594,6 @@ END:VCARD
 It is fine if messengers do include a full vCard parser
 and e.g. simply search for the line starting with `EMAIL`
 in order to get the email address.
-
-
-# Verifications
-
-Keys obtained using [SecureJoin](https://securejoin.readthedocs.io) protocol
-and corresponding contacts
-are considered "verified".
-
-As an extension to `Autocrypt-Gossip` header,
-chatmail clients can add `_verified=1` attribute
-(underscore marks the attribute as non-critical)
-to indicate that they have the gossiped key
-and the corresponding contact marked as verified.
-
-When receiving such `Autocrypt-Gossip` header
-in a message signed by a verified key,
-chatmail clients mark the gossiped key
-as indirectly verified.
 
 
 # Miscellaneous

@@ -3,20 +3,29 @@
 mod connect;
 pub mod send;
 
+use std::collections::BTreeSet;
+
 use anyhow::{Context as _, Error, Result, bail, format_err};
 use async_smtp::response::{Category, Code, Detail};
 use async_smtp::{EmailAddress, SmtpTransport};
+use pgp::composed::SignedPublicKey;
+use rusqlite::OptionalExtension as _;
 use tokio::task;
 
+use crate::chat;
 use crate::chat::{ChatId, add_info_msg_with_cmd};
 use crate::config::Config;
 use crate::contact::{Contact, ContactId};
 use crate::context::Context;
 use crate::events::EventType;
+use crate::key;
+use crate::key::DcKey;
 use crate::log::{LogExt, warn};
 use crate::message::Message;
 use crate::message::{self, MsgId};
+use crate::mimefactory;
 use crate::mimefactory::MimeFactory;
+use crate::mimefactory::QueuedMail;
 use crate::net::proxy::ProxyConfig;
 use crate::net::session::SessionBufStream;
 use crate::scheduler::connectivity::ConnectivityStore;
@@ -99,14 +108,12 @@ impl Smtp {
             &lp.smtp_password,
             &proxy_config,
             &lp.addr,
-            lp.strict_tls(proxy_config.is_some()),
-            lp.oauth2,
+            lp.strict_tls(proxy_config.is_some())?,
         )
         .await
     }
 
     /// Connect using the provided login params.
-    #[expect(clippy::too_many_arguments)]
     pub async fn connect(
         &mut self,
         context: &Context,
@@ -115,7 +122,6 @@ impl Smtp {
         proxy_config: &Option<ProxyConfig>,
         addr: &str,
         strict_tls: bool,
-        oauth2: bool,
     ) -> Result<()> {
         if self.is_connected() {
             warn!(context, "SMTP already connected.");
@@ -136,8 +142,6 @@ impl Smtp {
                 proxy_config,
                 strict_tls,
                 lp.connection.clone(),
-                oauth2,
-                addr,
                 &lp.user,
                 password,
             )
@@ -332,6 +336,22 @@ pub(crate) async fn smtp_send(
     status
 }
 
+/// Inserts a tombstone for `rfc724_mid`
+/// and queues the message for SMTP sending.
+pub(crate) async fn insert_into_smtp(
+    context: &Context,
+    rfc724_mid: &str,
+    queued_msg: &QueuedMail,
+) -> Result<()> {
+    let now = tools::time();
+    let msg_id = message::insert_tombstone(context, rfc724_mid).await?;
+    context
+        .sql
+        .transaction(|transaction| chat::enqueue_mail(transaction, now, msg_id, queued_msg, None))
+        .await?;
+    Ok(())
+}
+
 /// Sends message identified by `smtp` table rowid over SMTP connection.
 ///
 /// Removes row if the message should not be retried, otherwise increments retry count.
@@ -355,23 +375,31 @@ pub(crate) async fn send_msg_to_smtp(
     // database.
     context
         .sql
-        .execute("UPDATE smtp SET retries=retries+1 WHERE id=?", (rowid,))
+        .execute("UPDATE smtp2 SET retries=retries+1 WHERE id=?", (rowid,))
         .await
         .context("failed to update retries count")?;
 
-    let Some((body, recipients, msg_id, retries)) = context
+    let Some((queued_mail, msg_id, retries)) = context
         .sql
-        .query_row_optional(
-            "SELECT mime, recipients, msg_id, retries FROM smtp WHERE id=?",
-            (rowid,),
-            |row| {
-                let mime: String = row.get(0)?;
-                let recipients: String = row.get(1)?;
-                let msg_id: MsgId = row.get(2)?;
-                let retries: i64 = row.get(3)?;
-                Ok((mime, recipients, msg_id, retries))
-            },
-        )
+        .transaction_ext(true, |transaction| {
+            let Some((msg_id, retries)) = transaction
+                .query_row(
+                    "SELECT msg_id, retries FROM smtp2 WHERE id=?",
+                    (rowid,),
+                    |row| {
+                        let msg_id: MsgId = row.get(0)?;
+                        let retries: i64 = row.get(1)?;
+                        Ok((msg_id, retries))
+                    },
+                )
+                .optional()?
+            else {
+                return Ok(None);
+            };
+            let queued_mail = load_queued_mail(transaction, rowid)
+                .with_context(|| format!("Failed to load queued mail for {rowid}"))?;
+            Ok(Some((queued_mail, msg_id, retries)))
+        })
         .await?
     else {
         return Ok(());
@@ -379,7 +407,7 @@ pub(crate) async fn send_msg_to_smtp(
     if retries > 6 {
         context
             .sql
-            .execute("DELETE FROM smtp WHERE id=?", (rowid,))
+            .execute("DELETE FROM smtp2 WHERE id=?", (rowid,))
             .await
             .context("Failed to remove message with exceeded retry limit from smtp table")?;
         if let Some(mut msg) = Message::load_from_db_optional(context, msg_id).await? {
@@ -388,13 +416,22 @@ pub(crate) async fn send_msg_to_smtp(
         }
         return Ok(());
     }
-    info!(
-        context,
-        "Try number {retries} to send message {msg_id} (entry {rowid}) over SMTP."
-    );
 
+    let mut recipients = queued_mail.recipients.clone();
+    if queued_mail.bcc_self {
+        add_self_recipients(
+            context,
+            &mut recipients,
+            queued_mail.encryption.is_encrypted(),
+        )
+        .await
+        .context("Failed to add self recipients")?;
+    }
+    let mut sent_to_set: BTreeSet<String> =
+        BTreeSet::from_iter(queued_mail.sent_to.iter().cloned());
     let recipients_list = recipients
-        .split(' ')
+        .into_iter()
+        .filter(|addr| !sent_to_set.contains(AsRef::<str>::as_ref(addr)))
         .filter_map(
             |addr| match async_smtp::EmailAddress::new(addr.to_string()) {
                 Ok(addr) => Some(addr),
@@ -406,14 +443,61 @@ pub(crate) async fn send_msg_to_smtp(
         )
         .collect::<Vec<_>>();
 
-    let status = smtp_send(context, &recipients_list, body.as_str(), smtp, Some(msg_id)).await;
+    let public_key = key::load_self_public_key(context).await?;
+    let secret_key = key::load_self_secret_key(context).await?;
+    let from_addr = smtp
+        .from
+        .as_ref()
+        .context("No From address available, likely not connected")?
+        .to_string();
+
+    let rendered_mail =
+        mimefactory::render_queued_mail(queued_mail, &public_key, &secret_key, from_addr)?;
+    let body = rendered_mail.message;
+
+    info!(
+        context,
+        "Try number {retries} to send message {msg_id} (entry {rowid}) over SMTP."
+    );
+
+    let chunk_size = context.get_max_smtp_rcpt_to().await?.max(1);
+    let mut unsent = recipients_list.as_slice();
+    let status = loop {
+        let unsent_len = u32::try_from(unsent.len()).context("Too many SMTP recipients")?;
+        let split_index = usize::try_from(chunk_size.min(unsent_len))
+            .context("Failed to convert SMTP chunk size")?;
+        let (chunk, rest) = unsent.split_at(split_index);
+        let status = smtp_send(context, chunk, body.as_str(), smtp, Some(msg_id)).await;
+        if !matches!(status, SendResult::Success) || rest.is_empty() {
+            break status;
+        }
+        for sent_to_addr in chunk {
+            let sent_to_addr_string = sent_to_addr.to_string();
+            if !sent_to_set.insert(sent_to_addr_string) {
+                error!(context, "Attempted to send to {sent_to_addr} twice.");
+            }
+        }
+        let sent_to_str = sent_to_set
+            .iter()
+            .map(|a| a.as_ref())
+            .collect::<Vec<&str>>()
+            .join(" ");
+        context
+            .sql
+            .execute(
+                "UPDATE smtp2 SET sent_to=? WHERE id=?",
+                (sent_to_str, rowid),
+            )
+            .await?;
+        unsent = rest;
+    };
 
     match status {
         SendResult::Retry => {}
         SendResult::Success => {
             context
                 .sql
-                .execute("DELETE FROM smtp WHERE id=?", (rowid,))
+                .execute("DELETE FROM smtp2 WHERE id=?", (rowid,))
                 .await?;
         }
         SendResult::Failure(ref err) => {
@@ -457,7 +541,7 @@ pub(crate) async fn send_msg_to_smtp(
             }
             context
                 .sql
-                .execute("DELETE FROM smtp WHERE id=?", (rowid,))
+                .execute("DELETE FROM smtp2 WHERE id=?", (rowid,))
                 .await?;
         }
     };
@@ -480,7 +564,7 @@ pub(crate) async fn msg_has_pending_smtp_job(
 ) -> Result<bool, Error> {
     context
         .sql
-        .exists("SELECT COUNT(*) FROM smtp WHERE msg_id=?", (msg_id,))
+        .exists("SELECT COUNT(*) FROM smtp2 WHERE msg_id=?", (msg_id,))
         .await
 }
 
@@ -513,7 +597,7 @@ pub(crate) async fn send_smtp_messages(context: &Context, connection: &mut Smtp)
 
     let rowids = context
         .sql
-        .query_map_vec("SELECT id FROM smtp ORDER BY id ASC", (), |row| {
+        .query_map_vec("SELECT id FROM smtp2 ORDER BY id ASC", (), |row| {
             let rowid: i64 = row.get(0)?;
             Ok(rowid)
         })
@@ -580,13 +664,14 @@ async fn send_mdn_rfc724_mid(
     )
     .await?;
     let encrypted = mimefactory.will_be_encrypted();
+    let mut recipients = if contact_id == ContactId::SELF {
+        Vec::new()
+    } else {
+        mimefactory.recipients()
+    };
     let rendered_msg = Box::pin(mimefactory.render(context)).await?;
     let body = rendered_msg.message;
 
-    let mut recipients = Vec::new();
-    if contact_id != ContactId::SELF {
-        recipients.push(contact.get_addr().to_string());
-    }
     if context.get_config_bool(Config::BccSelf).await? {
         add_self_recipients(context, &mut recipients, encrypted).await?;
     }
@@ -632,12 +717,6 @@ async fn send_mdn_rfc724_mid(
 
 /// Tries to send a single MDN. Returns true if more MDNs should be sent.
 async fn send_mdn(context: &Context, smtp: &mut Smtp) -> Result<bool> {
-    if !context.should_send_mdns().await? {
-        context.sql.execute("DELETE FROM smtp_mdns", []).await?;
-        return Ok(false);
-    }
-    info!(context, "Sending MDNs.");
-
     context
         .sql
         .execute("DELETE FROM smtp_mdns WHERE retries > 6", [])
@@ -699,12 +778,15 @@ pub(crate) async fn add_self_recipients(
     recipients: &mut Vec<String>,
     encrypted: bool,
 ) -> Result<()> {
-    // Avoid sending unencrypted messages to all transports, chatmail relays won't accept
-    // them. Normally the user should have a non-chatmail primary transport to send unencrypted
-    // messages.
+    // Avoid sending unencrypted messages to all transports,
+    // chatmail relays won't accept them. Normally the user should have
+    // a non-chatmail sending transport to send unencrypted messages.
+    let from = context.get_primary_self_addr().await?;
     if encrypted {
-        for addr in context.get_published_secondary_self_addrs().await? {
-            recipients.push(addr);
+        for addr in context.get_self_addrs().await? {
+            if addr != from {
+                recipients.push(addr);
+            }
         }
     }
     // `from` must be the last addr
@@ -713,8 +795,129 @@ pub(crate) async fn add_self_recipients(
     // This helps with marking messages as delivered
     // if the server is slow and we never get an `OK` response
     // before the connection times out.
-    let from = context.get_primary_self_addr().await?;
     recipients.push(from);
 
     Ok(())
+}
+
+/// Returns true if SMTP queue is empty.
+pub(crate) async fn is_queue_empty(context: &Context) -> Result<bool> {
+    let sending_finished = !context.sql.exists("SELECT COUNT(*) FROM smtp2", ()).await?;
+    Ok(sending_finished)
+}
+
+/// Loads the queued mail from `smtp2` table and the list of recipients.
+pub(crate) fn load_queued_mail(
+    transaction: &mut rusqlite::Transaction<'_>,
+    row_id: i64,
+) -> Result<QueuedMail> {
+    let (mut queued_mail, encryption_fingerprints) = transaction
+        .query_row_and_then(
+            "
+SELECT display_name,
+       rfc724_mid,
+       mime,
+       should_attach_pubkey,
+       should_compress,
+       should_sign,
+       is_encrypted,
+       shared_secret,
+       encryption_fingerprints,
+       recipients,
+       sent_to,
+       bcc_self
+FROM smtp2 WHERE id = ?
+",
+            (row_id,),
+            |row| {
+                let display_name: String = row.get(0)?;
+                let rfc724_mid: String = row.get(1)?;
+                let raw_message: Vec<u8> = row.get(2)?;
+                let should_attach_pubkey: bool = row.get(3)?;
+                let should_compress: bool = row.get(4)?;
+                let should_sign: bool = row.get(5)?;
+                let is_encrypted: bool = row.get(6)?;
+                let shared_secret: String = row.get(7)?;
+                let encryption_fingerprints: String = row.get(8)?;
+                let encryption_fingerprints: Vec<String> = if encryption_fingerprints.is_empty() {
+                    Vec::new()
+                } else {
+                    encryption_fingerprints
+                        .split(' ')
+                        .map(|s| s.to_string())
+                        .collect()
+                };
+                let recipients: String = row.get(9)?;
+                let recipients: Vec<String> = if recipients.is_empty() {
+                    Vec::new()
+                } else {
+                    recipients.split(' ').map(|s| s.to_string()).collect()
+                };
+                debug_assert!(!recipients.iter().any(|s| s.is_empty()));
+                let sent_to: String = row.get(10)?;
+                let sent_to: Vec<String> = if sent_to.is_empty() {
+                    Vec::new()
+                } else {
+                    sent_to.split(' ').map(|s| s.to_string()).collect()
+                };
+                let bcc_self: bool = row.get(11)?;
+
+                let encryption = match (
+                    is_encrypted,
+                    shared_secret.is_empty(),
+                    encryption_fingerprints.is_empty(),
+                ) {
+                    (false, true, true) => mimefactory::QueuedEncryption::No,
+                    (true, false, true) => {
+                        mimefactory::QueuedEncryption::Symmetric { shared_secret }
+                    }
+                    (true, true, _) => mimefactory::QueuedEncryption::Asymmetric {
+                        // Public keys are loaded below based on the encryption fingerprints.
+                        encryption_pubkeys: Vec::new(),
+                    },
+                    _ => bail!("Invalid encryption in smtp2 row"),
+                };
+                Ok::<_, anyhow::Error>((
+                    QueuedMail {
+                        raw_message,
+                        display_name,
+                        rfc724_mid,
+                        encryption,
+                        should_attach_pubkey,
+                        should_compress,
+                        should_sign,
+                        recipients,
+                        sent_to,
+                        bcc_self,
+                    },
+                    encryption_fingerprints,
+                ))
+            },
+        )
+        .with_context(|| format!("Failed to select row {row_id} from smtp2 table"))?;
+
+    if let mimefactory::QueuedEncryption::Asymmetric {
+        ref mut encryption_pubkeys,
+    } = queued_mail.encryption
+    {
+        for fingerprint in encryption_fingerprints {
+            let public_key_bytes: Option<Vec<u8>> = transaction
+                .query_row(
+                    "SELECT public_key FROM public_keys WHERE fingerprint=?",
+                    (fingerprint,),
+                    |row| {
+                        let bytes: Vec<u8> = row.get(0)?;
+                        Ok(bytes)
+                    },
+                )
+                .optional()
+                .context("Failed to select public key by fingerprint")?;
+            if let Some(public_key_bytes) = public_key_bytes {
+                let public_key = SignedPublicKey::from_slice(&public_key_bytes)?;
+                encryption_pubkeys.push(public_key);
+            }
+        }
+    }
+
+    Ok(queued_mail)
 }

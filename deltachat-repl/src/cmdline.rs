@@ -5,9 +5,10 @@ use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;
 
-use anyhow::{bail, ensure, Result};
+use anyhow::{Result, bail, ensure};
 use deltachat::chat::{self, Chat, ChatId, ChatItem, ChatVisibility, MuteDuration};
 use deltachat::chatlist::*;
+use deltachat::config;
 use deltachat::constants::*;
 use deltachat::contact::*;
 use deltachat::context::*;
@@ -24,7 +25,6 @@ use deltachat::reaction::send_reaction;
 use deltachat::receive_imf::*;
 use deltachat::sql;
 use deltachat::tools::*;
-use deltachat::{config, provider};
 use tokio::fs;
 
 /// Reset database tables.
@@ -228,7 +228,7 @@ async fn log_msg(context: &Context, prefix: impl AsRef<str>, msg: &Message) {
 async fn log_msglist(context: &Context, msglist: &[MsgId]) -> Result<()> {
     let mut lines_out = 0;
     for &msg_id in msglist {
-        if msg_id == MsgId::new(DC_MSG_ID_DAYMARKER) {
+        if msg_id == MsgId::DAYMARKER {
             println!(
                 "--------------------------------------------------------------------------------"
             );
@@ -259,19 +259,13 @@ async fn log_contactlist(context: &Context, contacts: &[ContactId]) -> Result<()
         let contact = Contact::get_by_id(context, *contact_id).await?;
         let name = contact.get_display_name();
         let addr = contact.get_addr();
-        let verified_str = if contact.is_verified(context).await? {
-            " √"
-        } else {
-            ""
-        };
         let line = format!(
-            "{}{} <{}>",
+            "{} <{}>",
             if !name.is_empty() {
                 name
             } else {
                 "<name unset>"
             },
-            verified_str,
             if !addr.is_empty() { addr } else { "addr unset" }
         );
 
@@ -319,7 +313,6 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
                  info\n\
                  set <configuration-key> [<value>]\n\
                  get <configuration-key>\n\
-                 oauth2\n\
                  configure\n\
                  connect\n\
                  disconnect\n\
@@ -396,7 +389,6 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
                  joinqr <qr-content>\n\
                  setqr <qr-content>\n\
                  createqrsvg <qr-content>\n\
-                 providerinfo <addr>\n\
                  fileinfo <file>\n\
                  estimatedeletion <seconds>\n\
                  clear -- clear screen\n\
@@ -618,7 +610,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
             let sel_chat = sel_chat.as_ref().unwrap();
 
             let time_start = std::time::SystemTime::now();
-            let msglist = chat::get_chat_msgs_ex(
+            let msglist = chat::get_chat_msgs_ext(
                 &context,
                 sel_chat.get_id(),
                 chat::MessageListOptions {
@@ -632,7 +624,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
                 .into_iter()
                 .map(|x| match x {
                     ChatItem::Message { msg_id } => msg_id,
-                    ChatItem::DayMarker { .. } => MsgId::new(DC_MSG_ID_DAYMARKER),
+                    ChatItem::DayMarker { .. } => MsgId::DAYMARKER,
                 })
                 .collect();
 
@@ -1205,33 +1197,14 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
             fs::write(&file, svg).await?;
             println!("{file:#?} written.");
         }
-        "providerinfo" => {
-            ensure!(!arg1.is_empty(), "Argument <addr> missing.");
-            match provider::get_provider_info(arg1) {
-                Some(info) => {
-                    println!("Information for provider belonging to {arg1}:");
-                    println!("status: {}", info.status as u32);
-                    println!("before_login_hint: {}", info.before_login_hint);
-                    println!("after_login_hint: {}", info.after_login_hint);
-                    println!("overview_page: {}", info.overview_page);
-                    for server in info.server.iter() {
-                        println!("server: {}:{}", server.hostname, server.port,);
-                    }
-                }
-                None => {
-                    println!("No information for provider belonging to {arg1} found.");
-                }
-            }
-        }
         "fileinfo" => {
             ensure!(!arg1.is_empty(), "Argument <file> missing.");
 
-            if let Ok(buf) = read_file(&context, Path::new(arg1)).await {
-                let (width, height) = get_filemeta(&buf)?;
-                println!("width={width}, height={height}");
-            } else {
+            let Ok(buf) = read_file(&context, Path::new(arg1)).await else {
                 bail!("Command failed.");
-            }
+            };
+            let (width, height) = get_filemeta(&buf)?;
+            println!("width={width}, height={height}");
         }
         "estimatedeletion" => {
             ensure!(!arg1.is_empty(), "Argument <seconds> missing");

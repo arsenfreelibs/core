@@ -5,32 +5,31 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::{collections::HashMap, str::FromStr};
 
-use anyhow::{anyhow, bail, ensure, Context, Result};
+use anyhow::{Context, Result, anyhow, bail, ensure};
+use deltachat::EventEmitter;
 pub use deltachat::accounts::Accounts;
 use deltachat::blob::BlobObject;
 use deltachat::calls::ice_servers;
 use deltachat::chat::{
-    self, add_contact_to_chat, forward_msgs, forward_msgs_2ctx, get_chat_media, get_chat_msgs,
-    get_chat_msgs_ex, markfresh_chat, marknoticed_all_chats, marknoticed_chat,
-    remove_contact_from_chat, Chat, ChatId, ChatItem, MessageListOptions,
+    self, Chat, ChatId, ChatItem, MessageListOptions, add_contact_to_chat, forward_msgs,
+    forward_msgs_2ctx, get_chat_media, get_chat_msgs, get_chat_msgs_ext, markfresh_chat,
+    marknoticed_all_chats, marknoticed_chat, remove_contact_from_chat,
 };
 use deltachat::chatlist::Chatlist;
-use deltachat::config::{get_all_ui_config_keys, Config};
-use deltachat::constants::DC_MSG_ID_DAYMARKER;
-use deltachat::contact::{may_be_valid_addr, Contact, ContactId, Origin};
+use deltachat::config::{Config, get_all_ui_config_keys};
+use deltachat::contact::{Contact, ContactId, Origin, may_be_valid_addr};
 use deltachat::context::get_info;
 use deltachat::ephemeral::Timer;
 use deltachat::imex;
 use deltachat::key::{DcKey, load_self_public_key, load_self_secret_key};
 use deltachat::location;
 use deltachat::message::{
-    self, delete_msgs_ex, get_existing_msg_ids, get_msg_read_receipt_count, get_msg_read_receipts,
-    markseen_msgs, Message, MessageState, MsgId, Viewtype,
+    self, Message, MessageState, MsgId, Viewtype, delete_msgs_ext, get_existing_msg_ids,
+    get_msg_read_receipt_count, get_msg_read_receipts, markseen_msgs,
 };
 use deltachat::peer_channels::{
     leave_webxdc_realtime, send_webxdc_realtime_advertisement, send_webxdc_realtime_data,
 };
-use deltachat::provider::get_provider_info;
 use deltachat::qr::{self, Qr};
 use deltachat::qr_code_generator::{create_qr_svg, generate_backup_qr, get_securejoin_qr_svg};
 use deltachat::reaction::{get_msg_reactions, send_reaction};
@@ -38,10 +37,9 @@ use deltachat::securejoin;
 use deltachat::stock_str::StockMessage;
 use deltachat::storage_usage::{get_blobdir_storage_usage, get_storage_usage};
 use deltachat::webxdc::StatusUpdateSerial;
-use deltachat::EventEmitter;
 use sanitize_filename::is_sanitized;
 use tokio::fs;
-use tokio::sync::{watch, Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, watch};
 use types::login_param::EnteredLoginParam;
 use yerpc::rpc;
 
@@ -55,8 +53,6 @@ use types::contact::{ContactObject, VcardContact};
 use types::events::Event;
 use types::http::HttpResponse;
 use types::message::{MessageData, MessageObject, MessageReadReceipt};
-use types::notify_state::JsonrpcNotifyState;
-use types::provider_info::ProviderInfo;
 use types::reactions::JsonrpcReactions;
 use types::webxdc::WebxdcMessageInfo;
 
@@ -68,8 +64,8 @@ use self::types::{
         JsonrpcMessageListItem, MessageNotificationInfo, MessageSearchResult, MessageViewtype,
     },
 };
-use crate::api::types::chat_list::{get_chat_list_item_by_id, ChatListItemFetchResult};
-use crate::api::types::login_param::TransportListEntry;
+use crate::api::types::appversions::JsonrpcAppSource;
+use crate::api::types::chat_list::{ChatListItemFetchResult, get_chat_list_item_by_id};
 use crate::api::types::qr::{QrObject, SecurejoinSource, SecurejoinUiPath};
 
 #[derive(Debug)]
@@ -158,7 +154,7 @@ impl CommandApi {
     }
 }
 
-#[rpc(all_positional, ts_outdir = "typescript/generated")]
+#[rpc(all_positional)]
 impl CommandApi {
     /// Test function.
     async fn sleep(&self, delay: f64) {
@@ -283,7 +279,8 @@ impl CommandApi {
 
     /// Performs a background fetch for all accounts in parallel with a timeout.
     ///
-    /// The `AccountsBackgroundFetchDone` event is emitted at the end even in case of timeout.
+    /// The `AccountsBackgroundFetchDone` event is emitted at the end even in case of timeout,
+    /// and immediately if another background fetch is already running.
     /// Process all events until you get this one and you can safely return to the background
     /// without forgetting to create notifications caused by timing race conditions.
     async fn background_fetch(&self, timeout_in_seconds: f64) -> Result<()> {
@@ -331,12 +328,6 @@ impl CommandApi {
         }
     }
 
-    /// Get the current push notification state.
-    async fn get_push_state(&self, account_id: u32) -> Result<JsonrpcNotifyState> {
-        let ctx = self.get_context(account_id).await?;
-        Ok(ctx.push_state().await.into())
-    }
-
     /// Get the combined filesize of an account in bytes
     async fn get_account_file_size(&self, account_id: u32) -> Result<u64> {
         let ctx = self.get_context(account_id).await?;
@@ -344,21 +335,6 @@ impl CommandApi {
         let total_size = get_blobdir_storage_usage(&ctx);
 
         Ok(dbfile + total_size)
-    }
-
-    /// Returns provider for the given domain.
-    ///
-    /// This function looks up domain in offline database.
-    ///
-    /// For compatibility, email address can be passed to this function
-    /// instead of the domain.
-    async fn get_provider_info(
-        &self,
-        _account_id: u32,
-        email: String,
-    ) -> Result<Option<ProviderInfo>> {
-        let provider_info = get_provider_info(email.split('@').next_back().unwrap_or(""));
-        Ok(ProviderInfo::from_dc_type(provider_info))
     }
 
     /// Checks if the context is already configured.
@@ -528,7 +504,6 @@ impl CommandApi {
     ///   from a server encoded in a QR code.
     /// - [Self::list_transports()] to get a list of all configured transports.
     /// - [Self::delete_transport()] to remove a transport.
-    /// - [Self::set_transport_unpublished()] to set whether contacts see this transport.
     async fn add_or_update_transport(
         &self,
         account_id: u32,
@@ -553,24 +528,8 @@ impl CommandApi {
 
     /// Returns the list of all email accounts that are used as a transport in the current profile.
     /// Use [Self::add_or_update_transport()] to add or change a transport
-    /// and [Self::delete_transport()] to delete a transport.
-    /// Use [Self::list_transports_ex()] to additionally query
-    /// whether the transports are marked as 'unpublished'.
+    /// and [Self::delete_transport()] to remove a transport.
     async fn list_transports(&self, account_id: u32) -> Result<Vec<EnteredLoginParam>> {
-        let ctx = self.get_context(account_id).await?;
-        let res = ctx
-            .list_transports()
-            .await?
-            .into_iter()
-            .map(|t| t.param.into())
-            .collect();
-        Ok(res)
-    }
-
-    /// Returns the list of all email accounts that are used as a transport in the current profile.
-    /// Use [Self::add_or_update_transport()] to add or change a transport
-    /// and [Self::delete_transport()] to delete a transport.
-    async fn list_transports_ex(&self, account_id: u32) -> Result<Vec<TransportListEntry>> {
         let ctx = self.get_context(account_id).await?;
         let res = ctx
             .list_transports()
@@ -581,31 +540,15 @@ impl CommandApi {
         Ok(res)
     }
 
-    /// Removes the transport with the specified email address
-    /// (i.e. [EnteredLoginParam::addr]).
+    /// Removes a transport.
+    /// UIs should call this function when the user removes a relay.
+    ///
+    /// The last transport cannot be removed.
+    /// If the removed transport was the one used for sending,
+    /// another one is chosen automatically.
     async fn delete_transport(&self, account_id: u32, addr: String) -> Result<()> {
         let ctx = self.get_context(account_id).await?;
         ctx.delete_transport(&addr).await
-    }
-
-    /// Change whether the transport is unpublished.
-    ///
-    /// Unpublished transports are not advertised to contacts,
-    /// and self-sent messages are not sent there,
-    /// so that we don't cause extra messages to the corresponding inbox,
-    /// but can still receive messages from contacts who don't know our new transport addresses yet.
-    ///
-    /// The default is false, but when the user updates from a version that didn't have this flag,
-    /// existing secondary transports are set to unpublished,
-    /// so that an existing transport address doesn't suddenly get spammed with a lot of messages.
-    async fn set_transport_unpublished(
-        &self,
-        account_id: u32,
-        addr: String,
-        unpublished: bool,
-    ) -> Result<()> {
-        let ctx = self.get_context(account_id).await?;
-        ctx.set_transport_unpublished(&addr, unpublished).await
     }
 
     /// Signal an ongoing process to stop.
@@ -881,7 +824,7 @@ impl CommandApi {
     /// - The chat or the contact is **not blocked**, so new messages from the user/the group may appear as a contact request
     ///   and the user may create the chat again.
     /// - **Groups are not left** - this would
-    ///   be unexpected as (1) deleting a normal chat also does not prevent new mails
+    ///   be unexpected as (1) deleting a single chat also does not prevent new mails
     ///   from arriving, (2) leaving a group requires sending a message to
     ///   all group members - especially for groups not used for a longer time, this is
     ///   really unexpected when deletion results in contacting all members again,
@@ -905,6 +848,8 @@ impl CommandApi {
 
     /// Get QR code text that will offer a [SecureJoin](https://securejoin.delta.chat/) invitation.
     ///
+    /// To reset invitations, pass the link to `set_config_from_qr()`.
+    ///
     /// If `chat_id` is a group chat ID, SecureJoin QR code for the group is returned.
     /// If `chat_id` is unset, setup contact QR code is returned.
     async fn get_chat_securejoin_qr_code(
@@ -918,20 +863,19 @@ impl CommandApi {
         Ok(qr)
     }
 
-    /// Get QR code (text and SVG) that will offer a Setup-Contact or Verified-Group invitation.
+    /// Get QR code (text and SVG) that will offer a SecureJoin invitation.
     /// The QR code is compatible to the OPENPGP4FPR format
     /// so that a basic fingerprint comparison also works e.g. with OpenKeychain.
     ///
     /// The scanning device will pass the scanned content to `checkQr()` then;
     /// if `checkQr()` returns `askVerifyContact` or `askVerifyGroup`
-    /// an out-of-band-verification can be joined using `secure_join()`
+    /// the securejoin protocol can be started using `secure_join()`
     ///
     /// @deprecated as of 2026-03; use create_qr_svg(get_chat_securejoin_qr_code()) instead.
     ///
     /// chat_id: If set to a group-chat-id,
-    ///     the Verified-Group-Invite protocol is offered in the QR code;
-    ///     works for protected groups as well as for normal groups.
-    ///     If not set, the Setup-Contact protocol is offered in the QR code.
+    ///     the SecureJoin QR code for the group is returned.
+    ///     If not set, the setup contact QR code is returned.
     ///     See https://securejoin.delta.chat/ for details about both protocols.
     ///
     /// return format: `[code, svg]`
@@ -947,7 +891,7 @@ impl CommandApi {
         Ok((qr, svg))
     }
 
-    /// Continue a Setup-Contact or Verified-Group-Invite protocol
+    /// Continue the SecureJoin protocol
     /// started on another device with `get_chat_securejoin_qr_code_svg()`.
     /// This function is typically called when `check_qr()` returns
     /// type=AskVerifyContact or type=AskVerifyGroup.
@@ -965,7 +909,6 @@ impl CommandApi {
     ///     to `check_qr()`.
     ///
     /// **returns**: The chat ID of the joined chat, the UI may redirect to the this chat.
-    ///         A returned chat ID does not guarantee that the chat is protected or the belonging contact is verified.
     ///
     async fn secure_join(&self, account_id: u32, qr: String) -> Result<u32> {
         let ctx = self.get_context(account_id).await?;
@@ -1031,8 +974,6 @@ impl CommandApi {
     /// If the group is already _promoted_ (any message was sent to the group),
     /// all group members are informed by a special status message that is sent automatically by this function.
     ///
-    /// If the group has group protection enabled, only verified contacts can be added to the group.
-    ///
     /// Sends out #DC_EVENT_CHAT_MODIFIED and #DC_EVENT_MSGS_CHANGED if a status message was sent.
     async fn add_contact_to_chat(
         &self,
@@ -1046,7 +987,7 @@ impl CommandApi {
 
     /// Get the contact IDs belonging to a chat.
     ///
-    /// - for normal chats, the function always returns exactly one contact,
+    /// - for single chats, the function always returns exactly one contact,
     ///   DC_CONTACT_ID_SELF is returned only for SELF-chats.
     ///
     /// - for group chats all members are returned, DC_CONTACT_ID_SELF is returned
@@ -1374,7 +1315,7 @@ impl CommandApi {
     /// The concrete action depends on the type of the chat and on the users settings
     /// (dc_msgs_presented() may be a better name therefore, but well. :)
     ///
-    /// - For normal chats, the IMAP state is updated, MDN is sent
+    /// - For single chats, the IMAP state is updated, MDN is sent
     ///   (if set_config()-options `mdns_enabled` is set)
     ///   and the internal state is changed to @ref DC_STATE_IN_SEEN to reflect these actions.
     ///
@@ -1412,7 +1353,7 @@ impl CommandApi {
     ///
     /// * chat_id The chat ID of which the messages IDs should be queried.
     /// * _info_only: Deprecated, pass `false` here.
-    /// * `add_daymarker` - If `true`, add day markers as `DC_MSG_ID_DAYMARKER` to the result,
+    /// * `add_daymarker` - If `true`, add day markers as `MsgId::DAYMARKER` to the result,
     ///   e.g. [1234, 1237, 9, 1239]. The day marker timestamp is the midnight one for the
     ///   corresponding (following) day in the local timezone.
     async fn get_message_ids(
@@ -1423,7 +1364,7 @@ impl CommandApi {
         add_daymarker: bool,
     ) -> Result<Vec<u32>> {
         let ctx = self.get_context(account_id).await?;
-        let msg = get_chat_msgs_ex(
+        let msg = get_chat_msgs_ext(
             &ctx,
             ChatId::new(chat_id),
             MessageListOptions { add_daymarker },
@@ -1434,7 +1375,7 @@ impl CommandApi {
             .map(|chat_item| -> u32 {
                 match chat_item {
                     deltachat::chat::ChatItem::Message { msg_id } => msg_id.to_u32(),
-                    deltachat::chat::ChatItem::DayMarker { .. } => DC_MSG_ID_DAYMARKER,
+                    deltachat::chat::ChatItem::DayMarker { .. } => MsgId::DAYMARKER.to_u32(),
                 }
             })
             .collect())
@@ -1472,7 +1413,7 @@ impl CommandApi {
         add_daymarker: bool,
     ) -> Result<Vec<JsonrpcMessageListItem>> {
         let ctx = self.get_context(account_id).await?;
-        let msg = get_chat_msgs_ex(
+        let msg = get_chat_msgs_ext(
             &ctx,
             ChatId::new(chat_id),
             MessageListOptions { add_daymarker },
@@ -1538,12 +1479,32 @@ impl CommandApi {
         MessageNotificationInfo::from_msg_id(&ctx, MsgId::new(message_id)).await
     }
 
+    /// Sets the "pinned" state for a message.
+    async fn set_pinned_message_state(
+        &self,
+        account_id: u32,
+        message_id: u32,
+        pinned_state: bool,
+    ) -> Result<()> {
+        let ctx = self.get_context(account_id).await?;
+        deltachat::pinned_messages::set_pinned_state(&ctx, MsgId::new(message_id), pinned_state)
+            .await
+    }
+
+    /// Returns all pinned messages of a chat.
+    async fn get_pinned_messages(&self, account_id: u32, chat_id: u32) -> Result<Vec<u32>> {
+        let ctx = self.get_context(account_id).await?;
+        let msg_ids =
+            deltachat::pinned_messages::get_pinned_messages(&ctx, ChatId::new(chat_id)).await?;
+        Ok(msg_ids.into_iter().map(|id| id.to_u32()).collect())
+    }
+
     /// Delete messages. The messages are deleted on the current device and
     /// on the IMAP server.
     async fn delete_messages(&self, account_id: u32, message_ids: Vec<u32>) -> Result<()> {
         let ctx = self.get_context(account_id).await?;
         let msgs: Vec<MsgId> = message_ids.into_iter().map(MsgId::new).collect();
-        delete_msgs_ex(&ctx, &msgs, false).await
+        delete_msgs_ext(&ctx, &msgs, false).await
     }
 
     /// Delete messages. The messages are deleted on the current device,
@@ -1551,7 +1512,7 @@ impl CommandApi {
     async fn delete_messages_for_all(&self, account_id: u32, message_ids: Vec<u32>) -> Result<()> {
         let ctx = self.get_context(account_id).await?;
         let msgs: Vec<MsgId> = message_ids.into_iter().map(MsgId::new).collect();
-        delete_msgs_ex(&ctx, &msgs, true).await
+        delete_msgs_ext(&ctx, &msgs, true).await
     }
 
     /// Get an informational text for a single message. The text is multiline and may
@@ -1834,7 +1795,7 @@ impl CommandApi {
 
     /// Get encryption info for a contact.
     /// Get a multi-line encryption info, containing your fingerprint and the
-    /// fingerprint of the contact, used e.g. to compare the fingerprints for a simple out-of-band verification.
+    /// fingerprint of the contact, used e.g. to compare the fingerprints out-of-band.
     async fn get_contact_encryption_info(
         &self,
         account_id: u32,
@@ -1916,7 +1877,7 @@ impl CommandApi {
     //                   chat
     // ---------------------------------------------
 
-    /// Returns the [`ChatId`] for the 1:1 chat with `contact_id` if it exists.
+    /// Returns the [`ChatId`] for the single chat with `contact_id` if it exists.
     ///
     /// If it does not exist, `None` is returned.
     async fn get_chat_id_by_contact_id(
@@ -2099,15 +2060,20 @@ impl CommandApi {
         Ok(())
     }
 
+    /// Waits until all transports are idle or failed and no background work is left.
+    /// Never returns unless I/O is started. Must ONLY be used by tests.
+    async fn wait_for_all_work_done(&self, account_id: u32) -> Result<()> {
+        let ctx = self.get_context(account_id).await?;
+        ctx.wait_for_all_work_done().await;
+        Ok(())
+    }
+
     /// Get the current connectivity, i.e. whether the device is connected to the IMAP server.
     /// One of:
-    /// - DC_CONNECTIVITY_NOT_CONNECTED (1000-1999): Show e.g. the string "Not connected" or a red dot
-    /// - DC_CONNECTIVITY_CONNECTING (2000-2999): Show e.g. the string "Connecting…" or a yellow dot
-    /// - DC_CONNECTIVITY_WORKING (3000-3999): Show e.g. the string "Getting new messages" or a spinning wheel
-    /// - DC_CONNECTIVITY_CONNECTED (>=4000): Show e.g. the string "Connected" or a green dot
-    ///
-    /// We don't use exact values but ranges here so that we can split up
-    /// states into multiple states in the future.
+    /// - DC_CONNECTIVITY_NOT_CONNECTED (1000): Show e.g. the string "Not connected" or a red dot
+    /// - DC_CONNECTIVITY_CONNECTING (2000): Show e.g. the string "Connecting…" or a yellow dot
+    /// - DC_CONNECTIVITY_WORKING (3000): Show e.g. the string "Getting new messages" or a spinning wheel
+    /// - DC_CONNECTIVITY_CONNECTED (4000): Show e.g. the string "Connected" or a green dot
     ///
     /// Meant as a rough overview that can be shown
     /// e.g. in the title of the main screen.
@@ -2291,6 +2257,9 @@ impl CommandApi {
     /// Get blob encoded as base64 from a webxdc message
     ///
     /// path is the path of the file within webxdc archive
+    ///
+    /// If the file is `icon.png` or `icon.jpg`,
+    /// loading it may fail if dimensions are unexpectedly large.
     async fn get_webxdc_blob(
         &self,
         account_id: u32,
@@ -2301,7 +2270,7 @@ impl CommandApi {
         let message = Message::load_from_db(&ctx, MsgId::new(instance_msg_id)).await?;
         let blob = message.get_webxdc_blob(&ctx, &path).await?;
 
-        use base64::{engine::general_purpose, Engine as _};
+        use base64::{Engine as _, engine::general_purpose};
         Ok(general_purpose::STANDARD_NO_PAD.encode(blob))
     }
 
@@ -2471,6 +2440,7 @@ impl CommandApi {
     }
 
     /// Returns reactions to the message.
+    /// `None` when there are no reactions.
     async fn get_message_reactions(
         &self,
         account_id: u32,
@@ -2801,6 +2771,48 @@ impl CommandApi {
         } else {
             Err(anyhow!("chat with id {chat_id} doesn't have draft message"))
         }
+    }
+
+    /// Get version information of a specific client and source
+    /// across all configured accounts and transports.
+    ///
+    /// Returns the source with the highest `version_integer`.
+    /// If no matching version information is available at all, `None` is returned.
+    ///
+    /// UIs shall call the function after a reasonable time after app start,
+    /// when most relays have reported the information they have, say 30 seconds.
+    /// After that, once a day.
+    /// (it is accepted if by the simple approach an update message is delayed.
+    /// an event was considered, but that seemed more complex for few benefit:
+    /// as we do not know if "late" relays will report "better" versions,
+    /// also there we would work with timeouts etc.)
+    ///
+    /// If the reported `version_integer` is larger than the running app version,
+    /// the UI shall report to the user, that an update is available,
+    /// and, if possible, offer a direct update by the given URL.
+    ///
+    /// Security note: consumers need to verify themselves
+    /// that downloaded app files are valid before installing them.
+    async fn get_app_version(
+        &self,
+        client_id: String,
+        source_id: String,
+    ) -> Result<Option<JsonrpcAppSource>> {
+        let accounts = self.accounts.read().await;
+        Ok(
+            deltachat::appversions::get_app_version(&accounts, &client_id, &source_id)
+                .await?
+                .map(JsonrpcAppSource::from_core_type),
+        )
+    }
+
+    /// Returns true if all accounts have empty outgoing message queue.
+    ///
+    /// This API is intended to be used by UIs
+    /// to request that operating system does not put the application in background
+    /// while there are still outgoing messages that are not sent out.
+    async fn is_sending_finished(&self) -> Result<bool> {
+        self.accounts.read().await.is_sending_finished().await
     }
 }
 

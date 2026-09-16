@@ -90,7 +90,7 @@ async fn test_send_webxdc_instance() -> Result<()> {
     let mut instance = Message::new(Viewtype::Webxdc);
     instance.set_file_from_bytes(&t, "index.html", b"<html>ola!</html>", None)?;
     assert!(send_msg(&t, chat_id, &mut instance).await.is_err());
-
+    t.assert_warn("cannot be opened as zip-file").await;
     Ok(())
 }
 
@@ -119,7 +119,8 @@ async fn test_send_invalid_webxdc() -> Result<()> {
         None,
     )?;
     assert!(send_msg(&t, chat_id, &mut instance).await.is_err());
-
+    t.assert_warn("cannot be opened as zip-file").await;
+    t.assert_warn("cannot be opened as zip-file").await;
     Ok(())
 }
 
@@ -1079,6 +1080,60 @@ async fn test_get_webxdc_blob() -> Result<()> {
     Ok(())
 }
 
+/// Tests that valid webxdc icon can be loaded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_get_webxdc_blob_icon() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let chat_id = create_group(alice, "chat").await?;
+
+    {
+        let mut instance = create_webxdc_instance(
+            alice,
+            "with-png-icon.xdc",
+            include_bytes!("../../test-data/webxdc/with-png-icon.xdc"),
+        )?;
+        send_msg(alice, chat_id, &mut instance).await?;
+        let buf = instance.get_webxdc_blob(alice, "icon.png").await?;
+        assert_eq!(buf.len(), 103);
+    }
+
+    {
+        let mut instance = create_webxdc_instance(
+            alice,
+            "with-jpg-icon.xdc",
+            include_bytes!("../../test-data/webxdc/with-jpg-icon.xdc"),
+        )?;
+        send_msg(alice, chat_id, &mut instance).await?;
+        let buf = instance.get_webxdc_blob(alice, "icon.jpg").await?;
+        assert_eq!(buf.len(), 286);
+    }
+
+    {
+        // Webxdc with icon.png than is in fact a text file.
+        let mut instance = create_webxdc_instance(
+            alice,
+            "with-broken-png-icon.xdc",
+            include_bytes!("../../test-data/webxdc/with-broken-png-icon.xdc"),
+        )?;
+        send_msg(alice, chat_id, &mut instance).await?;
+        assert!(instance.get_webxdc_blob(alice, "icon.png").await.is_err());
+    }
+
+    {
+        // Webxdc with icon.png than is a 9999x9999 PNG image.
+        let mut instance = create_webxdc_instance(
+            alice,
+            "with-too-large-png-icon.xdc",
+            include_bytes!("../../test-data/webxdc/with-too-large-png-icon.xdc"),
+        )?;
+        send_msg(alice, chat_id, &mut instance).await?;
+        assert!(instance.get_webxdc_blob(alice, "icon.png").await.is_err());
+    }
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_get_webxdc_blob_default_icon() -> Result<()> {
     let t = TestContext::new_alice().await;
@@ -1216,7 +1271,7 @@ async fn test_webxdc_min_api_too_large() -> Result<()> {
 
     let instance = t.get_last_msg().await;
     let html = instance.get_webxdc_blob(&t, "index.html").await?;
-    assert!(String::from_utf8_lossy(&html).contains("requires a newer Delta Chat version"));
+    assert!(String::from_utf8_lossy(&html).contains("requires a newer Alt Chat version"));
 
     Ok(())
 }
@@ -1298,6 +1353,7 @@ async fn test_get_webxdc_info() -> Result<()> {
     let result = msg.get_webxdc_info(&t).await;
     assert!(result.is_err());
 
+    t.assert_warn("empty name given in manifest").await;
     Ok(())
 }
 
@@ -1695,6 +1751,7 @@ async fn test_webxdc_reject_updates_from_non_groupmembers() -> Result<()> {
         status,
         r#"[{"payload":7,"info":"i","summary":"s","serial":1,"max_serial":1}]"#
     );
+    alice.assert_warn("not a member of chat").await;
     Ok(())
 }
 

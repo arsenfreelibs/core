@@ -4,16 +4,6 @@ use serde::Deserialize;
 use serde::Serialize;
 use yerpc::TypeDef;
 
-#[derive(Serialize, TypeDef, schemars::JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct TransportListEntry {
-    /// The login data entered by the user.
-    pub param: EnteredLoginParam,
-    /// Whether this transport is set to 'unpublished'.
-    /// See `set_transport_unpublished` / `setTransportUnpublished` for details.
-    pub is_unpublished: bool,
-}
-
 /// Login parameters entered by the user.
 ///
 /// Usually it will be enough to only set `addr` and `password`,
@@ -66,19 +56,6 @@ pub struct EnteredLoginParam {
     /// invalid hostnames.
     /// Default: Automatic
     pub certificate_checks: Option<EnteredCertificateChecks>,
-
-    /// If true, login via OAUTH2 (not recommended anymore).
-    /// Default: false
-    pub oauth2: Option<bool>,
-}
-
-impl From<dc::TransportListEntry> for TransportListEntry {
-    fn from(transport: dc::TransportListEntry) -> Self {
-        TransportListEntry {
-            param: transport.param.into(),
-            is_unpublished: transport.is_unpublished,
-        }
-    }
 }
 
 impl From<dc::EnteredLoginParam> for EnteredLoginParam {
@@ -100,7 +77,6 @@ impl From<dc::EnteredLoginParam> for EnteredLoginParam {
             smtp_user: param.smtp.user.into_option(),
             smtp_password: param.smtp.password.into_option(),
             certificate_checks: certificate_checks.into_option(),
-            oauth2: param.oauth2.into_option(),
         }
     }
 }
@@ -127,7 +103,7 @@ impl TryFrom<EnteredLoginParam> for dc::EnteredLoginParam {
                 password: param.smtp_password.unwrap_or_default(),
             },
             certificate_checks: param.certificate_checks.unwrap_or_default().into(),
-            oauth2: param.oauth2.unwrap_or_default(),
+            oauth2: false,
         })
     }
 }
@@ -174,9 +150,8 @@ impl From<Socket> for dc::Socket {
 #[derive(Serialize, Deserialize, TypeDef, schemars::JsonSchema, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub enum EnteredCertificateChecks {
-    /// `Automatic` means that provider database setting should be taken.
-    /// If there is no provider database setting for certificate checks,
-    /// check certificates strictly.
+    /// `Automatic` means strict certificate checks,
+    /// unless a legacy-domain override disables them.
     #[default]
     Automatic,
 

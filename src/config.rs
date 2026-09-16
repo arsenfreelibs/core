@@ -17,10 +17,9 @@ use crate::context::Context;
 use crate::events::EventType;
 use crate::log::LogExt;
 use crate::mimefactory::RECOMMENDED_FILE_SIZE;
-use crate::provider::Provider;
 use crate::sync::{self, Sync::*, SyncData};
 use crate::tools::{get_abs_path, time};
-use crate::transport::{ConfiguredLoginParam, add_pseudo_transport, send_sync_transports};
+use crate::transport::{add_pseudo_transport, send_sync_transports, transport_addrs};
 use crate::{constants, stats};
 
 /// The available configuration keys.
@@ -118,15 +117,6 @@ pub enum Config {
     /// SMTP server security (e.g. TLS, STARTTLS).
     SendSecurity,
 
-    /// Deprecated(2026-04).
-    /// Use EnteredLoginParam and add_transport{from_qr}()/list_transports() instead.
-    ///
-    /// Whether to use OAuth 2.
-    ///
-    /// Historically contained other bitflags, which are now deprecated.
-    /// Should not be extended in the future, create new config keys instead.
-    ServerFlags,
-
     /// True if proxy is enabled.
     ///
     /// Can be used to disable proxy without erasing known URLs.
@@ -187,6 +177,9 @@ pub enum Config {
 
     /// True if Message Delivery Notifications (read receipts) should
     /// be sent and requested.
+    ///
+    /// MDNs to self used for seen status synchronization between devices
+    /// are sent in any case when multi-device mode (bcc_self) is enabled.
     #[strum(props(default = "1"))]
     MdnsEnabled,
 
@@ -202,7 +195,9 @@ pub enum Config {
     #[strum(props(default = "0"))]
     DeleteDeviceAfter,
 
-    /// The primary email address.
+    /// The address of the transport used for sending.
+    ///
+    /// Device-local, other devices choose their own sending transport.
     ConfiguredAddr,
 
     /// Deprecated(2026-04).
@@ -298,20 +293,11 @@ pub enum Config {
     /// Configured SMTP server password.
     ConfiguredSendPw,
 
-    /// Deprecated(2026-04).
-    /// Use ConfiguredLoginParam and add_transport{from_qr}()/list_transports() instead.
-    ///
-    /// Whether OAuth 2 is used with configured provider.
-    ConfiguredServerFlags,
-
     /// Configured folder for incoming messages.
     ConfiguredInboxFolder,
 
     /// Unix timestamp of the last successful configuration.
     ConfiguredTimestamp,
-
-    /// ID of the configured provider from the provider database.
-    ConfiguredProvider,
 
     /// Deprecated(2026-04).
     /// Use [`Context::is_configured()`] instead.
@@ -357,16 +343,30 @@ pub enum Config {
     #[strum(props(default = "0"))]
     SkipStartMessages,
 
-    /// Whether we send a warning if the password is wrong (set to false when we send a warning
-    /// because we do not want to send a second warning)
-    #[strum(props(default = "0"))]
-    NotifyAboutWrongPw,
-
     /// Timestamp of the last time housekeeping was run
     LastHousekeeping,
 
+    /// Timestamp of the last time accumulated broadcast channel reactions were sent
+    LastReactionsBroadcast,
+
     /// Timestamp of the last `CantDecryptOutgoingMsgs` notification.
     LastCantDecryptOutgoingMsgs,
+
+    /// Timestamp of the last time automatic relay management was run
+    LastAutorelay,
+
+    /// Whether to automatically add/remove transports
+    Autorelay,
+
+    /// Whether automatic relay management successfully added the desired number of relays
+    AutorelayFinished,
+
+    /// Sorted, space-separated relay list for which no keyupdate is due.
+    KeyupdateBaseline,
+
+    /// For tests only: keyupdate debounce window in seconds.
+    #[strum(props(default = "30"))]
+    KeyupdateDebounce,
 
     /// Whether to avoid using IMAP IDLE even if the server supports it.
     ///
@@ -629,16 +629,6 @@ impl Context {
         self.get_config_bool(Config::MdnsEnabled).await
     }
 
-    /// Gets the configured provider.
-    ///
-    /// The provider is determined by the current primary transport.
-    pub async fn get_configured_provider(&self) -> Result<Option<&'static Provider>> {
-        let provider = ConfiguredLoginParam::load(self)
-            .await?
-            .and_then(|(_transport_id, param)| param.provider);
-        Ok(provider)
-    }
-
     /// Gets configured "delete_device_after" value.
     ///
     /// `None` means never delete the message, `Some(x)` means delete
@@ -662,7 +652,7 @@ impl Context {
             _ => Some(value),
         };
         match key.is_synced() {
-            true => self.set_config_ex(Nosync, *key, value).await,
+            true => self.set_config_ext(Nosync, *key, value).await,
             false => Ok(()),
         }
     }
@@ -675,7 +665,6 @@ impl Context {
             | Config::MdnsEnabled
             | Config::Configured
             | Config::Bot
-            | Config::NotifyAboutWrongPw
             | Config::SyncMsgs
             | Config::DisableIdle => {
                 ensure!(
@@ -712,10 +701,10 @@ impl Context {
     }
 
     pub(crate) async fn set_config_internal(&self, key: Config, value: Option<&str>) -> Result<()> {
-        self.set_config_ex(Sync, key, value).await
+        self.set_config_ext(Sync, key, value).await
     }
 
-    pub(crate) async fn set_config_ex(
+    pub(crate) async fn set_config_ext(
         &self,
         sync: sync::Sync,
         key: Config,
@@ -805,35 +794,28 @@ impl Context {
                                 (addr,),
                             )?;
 
-                            // Update the timestamp for the primary transport
-                            // so it becomes the first in `get_all_self_addrs()` list
-                            // and the list of relays distributed in the public key.
-                            // This ensures that messages will be sent
-                            // to the primary relay by the contacts
-                            // and will be fetched in background_fetch()
-                            // which only fetches from the primary transport.
+                            // The timestamp must strictly increase because
+                            // other devices ignore the row update otherwise,
+                            // and contacts only adopt the re-signed key
+                            // if its signature timestamp increases.
                             transaction
                                 .execute(
-                                    "UPDATE transports SET add_timestamp=?, is_published=1 WHERE addr=?",
+                                    "UPDATE transports
+                                     SET add_timestamp=MAX(?, add_timestamp+1)
+                                     WHERE addr=?",
                                     (time(), addr),
                                 )
                                 .context(
-                                    "Failed to update add_timestamp for the new primary transport",
+                                    "Failed to update add_timestamp for the new sending transport",
                                 )?;
-
-                            // Clean up SMTP and IMAP APPEND queue.
-                            //
-                            // The messages in the queue have a different
-                            // From address so we cannot send them over
-                            // the new SMTP transport.
-                            transaction.execute("DELETE FROM smtp", ())?;
-                            transaction.execute("DELETE FROM imap_send", ())?;
 
                             Ok(())
                         })
                         .await?;
-                    send_sync_transports(self).await?;
+                    // Invalidate the cache so the sync message
+                    // cannot read a stale sending address.
                     self.sql.uncache_raw_config("configured_addr").await;
+                    send_sync_transports(self).await?;
                 }
             }
             _ => {
@@ -923,14 +905,13 @@ impl Context {
             return Ok(true);
         }
         Ok(self
-            .get_all_self_addrs()
+            .get_self_addrs()
             .await?
             .iter()
             .any(|a| addr_cmp(addr, a)))
     }
 
-    /// Sets `primary_new` as the new primary self address and saves the old
-    /// primary address (if exists) as a secondary address.
+    /// Sets `primary_new` as the address used for sending.
     ///
     /// This should only be used by test code and during configure.
     #[cfg(test)] // AEAP is disabled, but there are still tests for it
@@ -945,53 +926,14 @@ impl Context {
     }
 
     /// Returns all self addresses, newest first.
-    pub(crate) async fn get_all_self_addrs(&self) -> Result<Vec<String>> {
+    pub(crate) async fn get_self_addrs(&self) -> Result<Vec<String>> {
+        let query_only = true;
         self.sql
-            .query_map_vec(
-                "SELECT addr FROM transports ORDER BY add_timestamp DESC, id DESC",
-                (),
-                |row| {
-                    let addr: String = row.get(0)?;
-                    Ok(addr)
-                },
-            )
+            .transaction_ext(query_only, |transaction| transport_addrs(transaction))
             .await
     }
 
-    /// Returns all published self addresses, newest first.
-    /// See `[Context::set_transport_unpublished]`
-    pub(crate) async fn get_published_self_addrs(&self) -> Result<Vec<String>> {
-        self.sql
-            .query_map_vec(
-                "SELECT addr FROM transports WHERE is_published=1 ORDER BY add_timestamp DESC, id DESC",
-                (),
-                |row| {
-                    let addr: String = row.get(0)?;
-                    Ok(addr)
-                },
-            )
-            .await
-    }
-
-    /// Returns all published secondary self addresses.
-    /// See `[Context::set_transport_unpublished]`
-    pub(crate) async fn get_published_secondary_self_addrs(&self) -> Result<Vec<String>> {
-        self.sql
-            .query_map_vec(
-                "SELECT addr FROM transports
-                WHERE is_published
-                AND addr NOT IN (SELECT value FROM config WHERE keyname='configured_addr')
-                ORDER BY add_timestamp DESC, id DESC",
-                (),
-                |row| {
-                    let addr: String = row.get(0)?;
-                    Ok(addr)
-                },
-            )
-            .await
-    }
-
-    /// Returns the primary self address.
+    /// Returns the address of the transport used for sending.
     /// Returns an error if no self addr is configured.
     pub async fn get_primary_self_addr(&self) -> Result<String> {
         self.get_config(Config::ConfiguredAddr)

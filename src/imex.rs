@@ -18,7 +18,7 @@ use crate::chat::delete_and_reset_all_device_msgs;
 use crate::config::Config;
 use crate::context::Context;
 use crate::events::EventType;
-use crate::key::{self, DcKey, SignedSecretKey};
+use crate::key::{self, DcKey, SignedSecretKey, self_fingerprint};
 use crate::log::{LogExt, warn};
 use crate::qr::DCBACKUP_VERSION;
 use crate::sql;
@@ -413,7 +413,7 @@ async fn import_backup_stream_inner<R: tokio::io::AsyncRead + Unpin>(
 /// it can be renamed to dest_path. This guarantees that the backup is complete.
 fn get_next_backup_path(
     folder: &Path,
-    addr: &str,
+    fingerprint: &str,
     backup_time: i64,
 ) -> Result<(PathBuf, PathBuf, PathBuf)> {
     let folder = PathBuf::from(folder);
@@ -426,13 +426,13 @@ fn get_next_backup_path(
     // 64 backup files per day should be enough for everyone
     for i in 0..64 {
         let mut tempdbfile = folder.clone();
-        tempdbfile.push(format!("{stem}-{i:02}-{addr}.db"));
+        tempdbfile.push(format!("{stem}-{i:02}-{fingerprint}.db"));
 
         let mut tempfile = folder.clone();
-        tempfile.push(format!("{stem}-{i:02}-{addr}.tar.part"));
+        tempfile.push(format!("{stem}-{i:02}-{fingerprint}.tar.part"));
 
         let mut destfile = folder.clone();
-        destfile.push(format!("{stem}-{i:02}-{addr}.tar"));
+        destfile.push(format!("{stem}-{i:02}-{fingerprint}.tar"));
 
         if !tempdbfile.exists() && !tempfile.exists() && !destfile.exists() {
             return Ok((tempdbfile, tempfile, destfile));
@@ -448,12 +448,12 @@ fn get_next_backup_path(
 async fn export_backup(context: &Context, dir: &Path, passphrase: String) -> Result<()> {
     // get a fine backup file name (the name includes the date so that multiple backup instances are possible)
     let now = time();
-    let self_addr = context.get_primary_self_addr().await?;
-    let (temp_db_path, temp_path, dest_path) = get_next_backup_path(dir, &self_addr, now)?;
+    let fingerprint = self_fingerprint(context).await?;
+    let (temp_db_path, temp_path, dest_path) = get_next_backup_path(dir, fingerprint, now)?;
     let temp_db_path = TempPathGuard::new(temp_db_path);
     let temp_path = TempPathGuard::new(temp_path);
 
-    export_database(context, &temp_db_path, passphrase, now)
+    export_database(context, &temp_db_path, passphrase)
         .await
         .context("could not export database")?;
 
@@ -671,23 +671,22 @@ async fn export_self_keys(context: &Context, dir: &Path) -> Result<()> {
             },
         )
         .await?;
-    let self_addr = context.get_primary_self_addr().await?;
     for (id, private_key, is_default) in keys {
-        let id = Some(id).filter(|_| is_default == 0);
+        let id = (is_default == 0).then_some(id);
 
         let Ok(private_key) = private_key else {
             export_errors += 1;
             continue;
         };
 
-        if let Err(err) = export_key_to_asc_file(context, dir, &self_addr, id, &private_key).await {
+        if let Err(err) = export_key_to_asc_file(context, dir, id, &private_key).await {
             error!(context, "Failed to export private key: {:#}.", err);
             export_errors += 1;
         }
 
         let public_key = private_key.to_public_key();
 
-        if let Err(err) = export_key_to_asc_file(context, dir, &self_addr, id, &public_key).await {
+        if let Err(err) = export_key_to_asc_file(context, dir, id, &public_key).await {
             error!(context, "Failed to export public key: {:#}.", err);
             export_errors += 1;
         }
@@ -701,7 +700,6 @@ async fn export_self_keys(context: &Context, dir: &Path) -> Result<()> {
 async fn export_key_to_asc_file<T>(
     context: &Context,
     dir: &Path,
-    addr: &str,
     id: Option<i64>,
     key: &T,
 ) -> Result<String>
@@ -715,7 +713,7 @@ where
         };
         let id = id.map_or("default".into(), |i| i.to_string());
         let fp = key.dc_fingerprint().hex();
-        format!("{kind}-key-{addr}-{id}-{fp}.asc")
+        format!("{kind}-key-{id}-{fp}.asc")
     };
     let path = dir.join(&file_name);
     info!(context, "Exporting key to {}.", path.display());
@@ -737,17 +735,11 @@ where
 /// overwritten.
 ///
 /// This also verifies that IO is not running during the export.
-async fn export_database(
-    context: &Context,
-    dest: &Path,
-    passphrase: String,
-    timestamp: i64,
-) -> Result<()> {
+async fn export_database(context: &Context, dest: &Path, passphrase: String) -> Result<()> {
     ensure!(
         !context.scheduler.is_running().await,
         "cannot export backup, IO is running"
     );
-    let timestamp = timestamp.try_into().context("32-bit UNIX time overflow")?;
 
     // TODO: Maybe introduce camino crate for UTF-8 paths where we need them.
     let dest = dest
@@ -755,10 +747,6 @@ async fn export_database(
         .with_context(|| format!("path {} is not valid unicode", dest.display()))?;
 
     context.set_config(Config::BccSelf, Some("1")).await?;
-    context
-        .sql
-        .set_raw_config_int("backup_time", timestamp)
-        .await?;
     context
         .sql
         .set_raw_config_int("backup_version", DCBACKUP_VERSION)
@@ -812,10 +800,10 @@ mod tests {
         let context = TestContext::new().await;
         let key = alice_keypair().to_public_key();
         let blobdir = Path::new("$BLOBDIR");
-        let filename = export_key_to_asc_file(&context.ctx, blobdir, "a@b", None, &key)
+        let filename = export_key_to_asc_file(&context.ctx, blobdir, None, &key)
             .await
             .unwrap();
-        assert!(filename.starts_with("public-key-a@b-default-"));
+        assert!(filename.starts_with("public-key-default-"));
         assert!(filename.ends_with(".asc"));
         let blobdir = context.ctx.get_blobdir().to_str().unwrap();
         let filename = format!("{blobdir}/{filename}");
@@ -829,11 +817,11 @@ mod tests {
         let context = TestContext::new().await;
         let key = alice_keypair();
         let blobdir = Path::new("$BLOBDIR");
-        let filename = export_key_to_asc_file(&context.ctx, blobdir, "a@b", None, &key)
+        let filename = export_key_to_asc_file(&context.ctx, blobdir, None, &key)
             .await
             .unwrap();
         let fingerprint = filename
-            .strip_prefix("private-key-a@b-default-")
+            .strip_prefix("private-key-default-")
             .unwrap()
             .strip_suffix(".asc")
             .unwrap();
@@ -877,6 +865,7 @@ mod tests {
         {
             panic!("got error on import: {err:#}");
         }
+        context2.assert_warn("Failed to import secret key").await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -884,7 +873,7 @@ mod tests {
         let alice = &TestContext::new_alice().await;
         let chat = alice.create_chat(alice).await;
         let sent = alice.send_text(chat.id, "Encrypted with old key").await;
-        let export_dir = tempfile::tempdir().unwrap();
+        let export_dir = tempfile::tempdir()?;
 
         let alice = &TestContext::new().await;
         alice.configure_addr("alice@example.org").await;
@@ -902,13 +891,21 @@ mod tests {
         // Importing a second key is not allowed anymore,
         // even as a non-default key.
         assert_eq!(key::load_self_secret_key(alice).await?, old_key);
-
         assert_eq!(key::load_self_secret_keyring(alice).await?, vec![old_key]);
 
         let msg = alice.recv_msg(&sent).await;
         assert!(msg.get_showpadlock());
         assert_eq!(msg.chat_id, alice.get_self_chat().await.id);
         assert_eq!(msg.get_text(), "Encrypted with old key");
+
+        alice
+            .assert_warns_or_errors(&[
+                "rPGP error: unexpected block type: PGP PUBLIC KEY BLOCK",
+                "UNIQUE constraint failed",
+                "IMEX failed to complete",
+                "No private keys found in",
+            ])
+            .await;
 
         Ok(())
     }
@@ -949,6 +946,8 @@ mod tests {
             .await
             .is_err()
         );
+        context2.assert_error("file is not a database").await;
+        context2.assert_warn("IMEX failed to complete").await;
 
         assert!(
             imex(&context2, ImexMode::ImportBackup, backup.as_ref(), None)
@@ -1062,18 +1061,15 @@ mod tests {
         let err = imex(&context2, ImexMode::ImportBackup, &modified_backup, None)
             .await
             .unwrap_err();
-        assert!(err.to_string().starts_with("This profile is from a newer version of Alt Chat. Please update Alt Chat and try again"));
+        assert!(err.to_string().starts_with(
+            "This profile is from a newer version of Alt Chat. Please update Alt Chat and try again"
+        ));
 
         // Some UIs show the error from the event to the user.
         // Therefore, it must also be a user-facing string, rather than some technical info:
-        let err_event = context2
-            .evtracker
-            .get_matching(|evt| matches!(evt, EventType::Error(_)))
-            .await;
-        let EventType::Error(err_msg) = err_event else {
-            unreachable!()
-        };
-        assert!(err_msg.starts_with("This profile is from a newer version of Alt Chat. Please update Alt Chat and try again"));
+        context2.assert_error("This profile is from a newer version of Alt Chat. Please update Alt Chat and try again").await;
+
+        context2.assert_warn("IMEX failed to complete").await;
 
         context2
             .evtracker

@@ -22,8 +22,10 @@ ALL = "1:*"
 class DirectImap:
     """Internal Python-level IMAP handling."""
 
-    def __init__(self, account: Account) -> None:
+    def __init__(self, account: Account, addr=None, password=None) -> None:
         self.account = account
+        self.addr = addr or account.get_config("addr")
+        self.password = password or account.get_config("mail_pw")
         self.logid = account.get_config("displayname") or id(account)
         self._idling = False
         self.connect()
@@ -33,11 +35,15 @@ class DirectImap:
         host = self.account.get_config("configured_mail_server")
         port = 993
 
-        user = self.account.get_config("addr")
+        user = self.addr
         host = user.rsplit("@")[-1]
-        pw = self.account.get_config("mail_pw")
+        pw = self.password
 
-        self.conn = MailBox(host, port, ssl_context=ssl.create_default_context())
+        ssl_context = ssl.create_default_context()
+        if host.startswith("_"):
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+        self.conn = MailBox(host, port, ssl_context=ssl_context)
         self.conn.login(user, pw)
 
         self.select_folder("INBOX")

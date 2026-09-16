@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Union
 
@@ -34,6 +35,15 @@ class Account:
             next_event = AttrDict(self._rpc.wait_for_event(self.id))
             if event_type is None or next_event.kind == event_type:
                 return next_event
+
+    def wait_for_realtime_data(self, msg_id: int) -> bytes:
+        """Wait for the next realtime data received for the given webxdc message and return it."""
+        logging.info(f"account {self.id}: waiting for realtime data for msg {msg_id}")
+        while True:
+            event = self.wait_for_event(EventType.WEBXDC_REALTIME_DATA)
+            if event.msg_id == msg_id:
+                logging.info(f"account {self.id}: got realtime data for msg {msg_id}: {event.data[:20]}")
+                return bytes(event.data)
 
     def clear_all_events(self):
         """Remove all queued-up events for a given account.
@@ -140,9 +150,10 @@ class Account:
         return transports
 
     def bring_online(self):
-        """Start I/O and wait until IMAP becomes IDLE."""
+        """Start I/O, wait until all transports became IDLE and drop the events seen so far."""
         self.start_io()
-        self.wait_for_event(EventType.IMAP_INBOX_IDLE)
+        self._rpc.wait_for_all_work_done(self.id)
+        self.clear_all_events()
 
     def create_contact(self, obj: Union[int, str, Contact, "Account"], name: Optional[str] = None) -> Contact:
         """Create a new Contact or return an existing one.
@@ -182,7 +193,7 @@ class Account:
         return [Contact(self, contact_id) for contact_id in contact_ids]
 
     def create_chat(self, account: "Account") -> Chat:
-        """Create a 1:1 chat with another account."""
+        """Create a single chat with another account."""
         return self.create_contact(account).create_chat()
 
     def get_device_chat(self) -> Chat:
@@ -218,7 +229,7 @@ class Account:
         return [AttrDict(contact=Contact(self, contact["id"]), **contact) for contact in contacts]
 
     def get_chat_by_contact(self, contact: Union[int, Contact]) -> Optional[Chat]:
-        """Return 1:1 chat for a contact if it exists."""
+        """Return single chat for a contact if it exists."""
         if isinstance(contact, Contact):
             assert contact.account == self
             contact_id = contact.id
@@ -261,7 +272,7 @@ class Account:
         return Contact(self, SpecialContactId.SELF)
 
     @property
-    def device_contact(self) -> Chat:
+    def device_contact(self) -> Contact:
         """Account's device contact."""
         return Contact(self, SpecialContactId.DEVICE)
 
@@ -349,7 +360,7 @@ class Account:
         return Chat(self, chat_id)
 
     def secure_join(self, qrdata: str) -> Chat:
-        """Continue a Setup-Contact or Verified-Group-Invite protocol started on another device.
+        """Continue the SecureJoin protocol started on another device.
 
         The function returns immediately and the handshake runs in background, sending
         and receiving several messages.

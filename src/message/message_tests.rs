@@ -212,8 +212,8 @@ async fn test_get_original_msg_id() -> Result<()> {
     let bob = TestContext::new_bob().await;
 
     // normal sending of messages does not have an original ID
-    let one2one_chat = alice.create_chat(&bob).await;
-    let sent = alice.send_text(one2one_chat.id, "foo").await;
+    let single_chat = alice.create_chat(&bob).await;
+    let sent = alice.send_text(single_chat.id, "foo").await;
     let orig_msg = Message::load_from_db(&alice, sent.sender_msg_id).await?;
     assert!(orig_msg.get_original_msg_id(&alice).await?.is_none());
     assert!(orig_msg.parent(&alice).await?.is_none());
@@ -232,8 +232,8 @@ async fn test_get_original_msg_id() -> Result<()> {
     assert!(saved_msg.quoted_message(&alice).await?.is_none());
 
     // forwarding from "Saved Messages" back to another chat, detaches original ID
-    forward_msgs(&alice, &[saved_msg.get_id()], one2one_chat.get_id()).await?;
-    let forwarded_msg = alice.get_last_msg_in(one2one_chat.get_id()).await;
+    forward_msgs(&alice, &[saved_msg.get_id()], single_chat.get_id()).await?;
+    let forwarded_msg = alice.get_last_msg_in(single_chat.get_id()).await;
     assert_ne!(forwarded_msg.get_id(), saved_msg.get_id());
     assert_ne!(forwarded_msg.get_id(), orig_msg.get_id());
     assert!(forwarded_msg.get_original_msg_id(&alice).await?.is_none());
@@ -275,7 +275,7 @@ async fn test_markseen_msgs() -> Result<()> {
     bob_chat_id.accept(&bob).await.unwrap();
 
     // bob sends to alice,
-    // alice knows bob and messages appear in normal chat
+    // alice knows bob and messages appear in single chat
     let mut msg = Message::new_text("this is the text!".to_string());
     let msg1 = alice
         .recv_msg(&bob.send_msg(bob_chat_id, &mut msg).await)
@@ -338,7 +338,7 @@ async fn test_msg_seen_on_imap_when_downloaded() -> Result<()> {
     let rcvd_msg = receive_imf(alice, sent_msg.payload().as_bytes(), seen)
         .await?
         .unwrap();
-    assert_eq!(rcvd_msg.chat_id, DC_CHAT_ID_TRASH);
+    assert_eq!(rcvd_msg.chat_id, ChatId::TRASH);
     let msg = Message::load_from_db(alice, msg.id).await?;
     assert_eq!(msg.download_state, DownloadState::Done);
     assert!(msg.param.get_bool(Param::WantsMdn).unwrap_or_default());
@@ -350,20 +350,20 @@ async fn test_msg_seen_on_imap_when_downloaded() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_pre_and_post_msgs_deleted() -> Result<()> {
     let reorder = false;
-    test_pre_and_post_msgs_deleted_ex(reorder).await
+    test_pre_and_post_msgs_deleted_ext(reorder).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_reordered_pre_and_post_msgs_deleted() -> Result<()> {
     let reorder = true;
-    test_pre_and_post_msgs_deleted_ex(reorder).await
+    test_pre_and_post_msgs_deleted_ext(reorder).await
 }
 
-async fn test_pre_and_post_msgs_deleted_ex(reorder: bool) -> Result<()> {
+async fn test_pre_and_post_msgs_deleted_ext(reorder: bool) -> Result<()> {
     let mut tcm = TestContextManager::new();
     let alice = &tcm.alice().await;
     let bob = &tcm.bob().await;
-    let alice_chat_id = alice.create_group_with_members("", &[bob]).await;
+    let alice_chat_id = alice.create_group_with_members("group", &[bob]).await;
 
     let file_bytes = include_bytes!("../../test-data/image/screenshot.gif");
     let mut msg = Message::new(Viewtype::Image);
@@ -438,6 +438,7 @@ async fn test_get_state() -> Result<()> {
 
     set_msg_failed(&alice, &mut alice_msg, "badly failed").await?;
     assert_state(&alice, alice_msg.id, MessageState::OutFailed).await;
+    alice.assert_warn("badly failed").await;
 
     // check incoming message states on receiver side
     let bob_msg = bob.recv_msg(&payload).await;
@@ -625,7 +626,7 @@ async fn test_delete_msgs_offline() -> Result<()> {
     let chat_id = alice.create_chat_id(bob).await;
     let mut msg = Message::new_text("hi".to_string());
     assert!(chat::send_msg_sync(alice, chat_id, &mut msg).await.is_err());
-    let stmt = "SELECT COUNT(*) FROM smtp WHERE msg_id=?";
+    let stmt = "SELECT COUNT(*) FROM smtp2 WHERE msg_id=?";
     assert!(alice.sql.exists(stmt, (msg.id,)).await?);
     delete_msgs(alice, &[msg.id]).await?;
     assert!(!alice.sql.exists(stmt, (msg.id,)).await?);

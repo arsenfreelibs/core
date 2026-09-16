@@ -30,6 +30,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::Poll;
+use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail, format_err};
 use futures_lite::FutureExt;
@@ -47,7 +48,7 @@ use crate::log::warn;
 use crate::message::Message;
 use crate::qr::Qr;
 use crate::stock_str::backup_transfer_msg_body;
-use crate::tools::{TempPathGuard, create_id, time};
+use crate::tools::{TempPathGuard, create_id};
 
 use super::{DBFILE_BACKUP_NAME, export_backup_stream, export_database, import_backup_stream};
 
@@ -96,12 +97,14 @@ impl BackupProvider {
     /// [`Accounts::stop_io`]: crate::accounts::Accounts::stop_io
     pub async fn prepare(context: &Context) -> Result<Self> {
         let relay_mode = RelayMode::Disabled;
-        let endpoint = Endpoint::builder()
-            .tls_x509() // For compatibility with iroh <0.34.0
-            .alpns(vec![BACKUP_ALPN.to_vec()])
-            .relay_mode(relay_mode)
-            .bind()
-            .await?;
+        let endpoint = Box::pin(
+            Endpoint::builder()
+                .tls_x509() // For compatibility with iroh <0.34.0
+                .alpns(vec![BACKUP_ALPN.to_vec()])
+                .relay_mode(relay_mode)
+                .bind(),
+        )
+        .await?;
         let node_addr = endpoint.node_addr().await?;
 
         // Acquire global "ongoing" mutex.
@@ -129,7 +132,7 @@ impl BackupProvider {
 
         let passphrase = String::new();
 
-        export_database(context, &dbfile, passphrase, time())
+        export_database(context, &dbfile, passphrase)
             .await
             .context("Database export failed")?;
 
@@ -305,11 +308,16 @@ pub async fn get_backup2(
 ) -> Result<()> {
     let relay_mode = RelayMode::Disabled;
 
-    let endpoint = Endpoint::builder()
-        .tls_x509() // For compatibility with iroh <0.34.0
-        .relay_mode(relay_mode)
-        .bind()
-        .await?;
+    let mut transport_config = iroh::endpoint::TransportConfig::default();
+    transport_config.max_idle_timeout(Some(Duration::from_secs(60).try_into()?));
+    let endpoint = Box::pin(
+        Endpoint::builder()
+            .tls_x509() // For compatibility with iroh <0.34.0
+            .relay_mode(relay_mode)
+            .transport_config(transport_config)
+            .bind(),
+    )
+    .await?;
 
     let conn = endpoint.connect(node_addr, BACKUP_ALPN).await?;
     let (mut send_stream, mut recv_stream) = conn.open_bi().await?;
@@ -480,11 +488,15 @@ mod tests {
         // Try to overwrite an existing profile.
         let err = get_backup(ctx1, provider.qr()).await.unwrap_err();
         assert!(format!("{err:#}").contains("Cannot import backups to accounts in use"));
+        ctx1.assert_error("Cannot import backups to accounts in use")
+            .await;
 
         // ctx0 is supposed to also finish, and emit an error:
         provider.await.unwrap();
         ctx0.evtracker
             .get_matching(|e| matches!(e, EventType::Error(_)))
+            .await;
+        ctx0.assert_error("Error while handling backup connection")
             .await;
 
         assert_eq!(ctx1.get_primary_self_addr().await?, "bob@example.net");

@@ -9,8 +9,8 @@ use rusqlite::{Connection, OpenFlags, Row, config::DbConfig, types::ValueRef};
 use tokio::sync::RwLock;
 
 use crate::blob::BlobObject;
+use crate::chat::ChatId;
 use crate::config::Config;
-use crate::constants::DC_CHAT_ID_TRASH;
 use crate::context::Context;
 use crate::debug_logging::set_debug_logging_xdc;
 use crate::ephemeral::start_ephemeral_timers;
@@ -448,7 +448,7 @@ impl Sql {
         G: Send + FnOnce(&mut rusqlite::Transaction<'_>) -> Result<H>,
     {
         let query_only = false;
-        self.transaction_ex(query_only, callback).await
+        self.transaction_ext(query_only, callback).await
     }
 
     /// Execute the function inside a transaction.
@@ -465,7 +465,7 @@ impl Sql {
     ///
     /// If the function returns an error, the transaction will be rolled back. If it does not return
     /// an error, the transaction will be committed.
-    pub async fn transaction_ex<G, H>(&self, query_only: bool, callback: G) -> Result<H>
+    pub async fn transaction_ext<G, H>(&self, query_only: bool, callback: G) -> Result<H>
     where
         H: Send + 'static,
         G: Send + FnOnce(&mut rusqlite::Transaction<'_>) -> Result<H>,
@@ -642,11 +642,6 @@ impl Sql {
         self.set_raw_config(key, value).await
     }
 
-    /// Sets configuration for the given key to 64-bit signed integer value.
-    pub async fn set_raw_config_int64(&self, key: &str, value: i64) -> Result<()> {
-        self.set_raw_config(key, Some(&format!("{value}"))).await
-    }
-
     /// Returns 64-bit signed integer configuration value for the given key.
     pub async fn get_raw_config_int64(&self, key: &str) -> Result<Option<i64>> {
         self.get_raw_config(key)
@@ -782,7 +777,7 @@ async fn incremental_vacuum(context: &Context) -> Result<()> {
 
 /// Cleanup the account to restore some storage and optimize the database.
 pub async fn housekeeping(context: &Context) -> Result<()> {
-    let Ok(_housekeeping_lock) = context.housekeeping_mutex.try_lock() else {
+    let Ok(_housekeeping_lock) = context.background_task_mutex.try_lock() else {
         // Housekeeping is already running in another thread, do nothing.
         return Ok(());
     };
@@ -844,7 +839,7 @@ pub async fn housekeeping(context: &Context) -> Result<()> {
         .execute(
             "DELETE FROM msgs_mdns WHERE msg_id NOT IN \
             (SELECT id FROM msgs WHERE chat_id!=?)",
-            (DC_CHAT_ID_TRASH,),
+            (ChatId::TRASH,),
         )
         .await
         .context("failed to remove old MDNs")
@@ -856,7 +851,7 @@ pub async fn housekeeping(context: &Context) -> Result<()> {
         .execute(
             "DELETE FROM msgs_status_updates WHERE msg_id NOT IN \
             (SELECT id FROM msgs WHERE chat_id!=?)",
-            (DC_CHAT_ID_TRASH,),
+            (ChatId::TRASH,),
         )
         .await
         .context("failed to remove old webxdc status updates")
@@ -908,8 +903,42 @@ pub async fn housekeeping(context: &Context) -> Result<()> {
         .log_err(context)
         .ok();
 
+    remove_old_pending_reactions(context)
+        .await
+        .context("Failed to remove old pending reactions")
+        .log_err(context)
+        .ok();
+
     info!(context, "Housekeeping done.");
     Ok(())
+}
+
+/// Removes pending reactions that weren't applied for 90 days.
+async fn remove_old_pending_reactions(context: &Context) -> Result<usize> {
+    let three_months_ago = time().saturating_sub(60 * 60 * 24 * 90);
+    context
+        .sql
+        .execute(
+            "DELETE FROM pending_reactions WHERE timestamp < ?",
+            (three_months_ago,),
+        )
+        .await
+}
+
+/// Updates the transport's `last_rcvd_timestamp` with the current time.
+pub(crate) async fn update_transport_last_rcvd_timestamp(
+    context: &Context,
+    transport_id: u32,
+) -> Result<usize> {
+    context
+        .sql
+        .execute(
+            "UPDATE transports
+            SET last_rcvd_timestamp=?1
+            WHERE id=?2",
+            (time(), transport_id),
+        )
+        .await
 }
 
 /// Get the value of a column `idx` of the `row` as `Vec<u8>`.
@@ -943,10 +972,17 @@ pub async fn remove_unused_files(context: &Context) -> Result<()> {
         Param::ProfileImage,
     )
     .await?;
+
+    // Only non-special contacts are selected
+    // because special contacts don't store profile image in parameters.
+    // ContactId::DEVICE has a hardcoded profile image
+    // and ContactId::SELF has the avatar stored in Config::Selfavatar.
+    // If some special contact has a profile image set
+    // e.g due to a bug, the file can be safely deleted.
     maybe_add_from_param(
         &context.sql,
         &mut files_in_use,
-        "SELECT param FROM contacts;",
+        "SELECT param FROM contacts WHERE id > 9;",
         Param::ProfileImage,
     )
     .await?;
@@ -1150,7 +1186,7 @@ async fn prune_tombstones(sql: &Sql) -> Result<()> {
          AND NOT EXISTS (
          SELECT * FROM imap WHERE msgs.rfc724_mid=rfc724_mid AND target!=''
          )",
-        (DC_CHAT_ID_TRASH, timestamp_max),
+        (ChatId::TRASH, timestamp_max),
     )
     .await?;
     Ok(())

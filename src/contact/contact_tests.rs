@@ -152,6 +152,16 @@ async fn test_get_contacts() -> Result<()> {
     assert_eq!(contacts.len(), 1);
     let contacts = Contact::get_all(&context, 0, Some("δ")).await?;
     assert_eq!(contacts.len(), 1);
+
+    // Searching for another self address finds "Me".
+    crate::transport::add_pseudo_transport(&context, "bob@second.example").await?;
+    let contacts = Contact::get_all(
+        &context,
+        constants::DC_GCL_ADD_SELF,
+        Some("bob@second.example"),
+    )
+    .await?;
+    assert_eq!(contacts, vec![ContactId::SELF]);
     Ok(())
 }
 
@@ -162,7 +172,7 @@ async fn test_search_contacts_from_group() -> Result<()> {
     let bob = &tcm.bob().await;
     let fiona = &tcm.fiona().await;
 
-    let alice_chat_id = chat::create_group(alice, "").await?;
+    let alice_chat_id = chat::create_group(alice, "group").await?;
     let qr = get_securejoin_qr(alice, Some(alice_chat_id)).await?;
     let bob_chat_id = tcm.exec_securejoin_qr(bob, alice, &qr).await;
     tcm.exec_securejoin_qr(fiona, alice, &qr).await;
@@ -224,6 +234,7 @@ async fn test_add_or_lookup() {
         "\nWonderland, Alice <alice@w.de>\n",
     );
     assert_eq!(Contact::add_address_book(&t, book).await.unwrap(), 4);
+    t.assert_warn(r#"invalid address "+1234567890""#).await;
 
     // check first added contact, this modifies authname because it is empty
     let (contact_id, sth_modified) = Contact::add_or_lookup(
@@ -337,7 +348,7 @@ async fn test_contact_name_changes() -> Result<()> {
     let t = TestContext::new_alice().await;
     t.allow_unencrypted().await?;
 
-    // first message creates contact and one-to-one-chat without name set
+    // first message creates contact and single-chat without name set
     receive_imf(
         &t,
         b"From: f@example.org\n\
@@ -1000,6 +1011,32 @@ async fn test_selfavatar_changed_event() -> Result<()> {
     Ok(())
 }
 
+/// Tests that for self contact avatar is not loaded from the params.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_selfavatar_no_param() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+
+    let alice = &tcm.alice().await;
+
+    // SELF contact should not have the avatar set
+    // because avatar path is stored in `selfavatar` config,
+    // but apparently some older profiles have it,
+    // possibly due to a bug.
+    let mut self_contact = Contact::get_by_id(alice, ContactId::SELF).await?;
+    self_contact
+        .param
+        .set(Param::ProfileImage, "$BLOBDIR/avatar.jpg");
+    self_contact.update_param(alice).await?;
+
+    assert_eq!(alice.get_config(Config::Selfavatar).await?, None);
+    let self_contact = Contact::get_by_id(alice, ContactId::SELF).await?;
+
+    // Profile image parameter is ignored for self contact.
+    assert_eq!(self_contact.get_profile_image(alice).await?, None);
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_last_seen() -> Result<()> {
     let mut tcm = TestContextManager::new();
@@ -1081,10 +1118,15 @@ async fn test_was_seen_recently_event() -> Result<()> {
             .get_matching(|evt| matches!(evt, EventType::ContactsChanged { .. }))
             .await;
     }
+    // this warning is only printed when `RecentlySeenLoop` is dropped,
+    // so we can't assert it otherwise.
+    drop(recently_seen_loop);
+    bob.assert_warn("receiving from an empty and closed channel")
+        .await;
     Ok(())
 }
 
-async fn test_lookup_id_by_addr_recent_ex(accept_unencrypted_chat: bool) -> Result<()> {
+async fn test_lookup_id_by_addr_recent_ext(accept_unencrypted_chat: bool) -> Result<()> {
     let mut tcm = TestContextManager::new();
     let bob = &tcm.bob().await;
     bob.allow_unencrypted().await?;
@@ -1120,34 +1162,13 @@ Hi"#
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_lookup_id_by_addr_recent() -> Result<()> {
     let accept_unencrypted_chat = true;
-    test_lookup_id_by_addr_recent_ex(accept_unencrypted_chat).await
+    test_lookup_id_by_addr_recent_ext(accept_unencrypted_chat).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_lookup_id_by_addr_recent_accepted() -> Result<()> {
     let accept_unencrypted_chat = false;
-    test_lookup_id_by_addr_recent_ex(accept_unencrypted_chat).await
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_verified_by_none() -> Result<()> {
-    let mut tcm = TestContextManager::new();
-    let alice = tcm.alice().await;
-    let bob = tcm.bob().await;
-
-    let contact_id = Contact::create(&alice, "Bob", "bob@example.net").await?;
-    let contact = Contact::get_by_id(&alice, contact_id).await?;
-    assert!(contact.get_verifier_id(&alice).await?.is_none());
-
-    // Receive a message from Bob to save the public key.
-    let chat = bob.create_chat(&alice).await;
-    let sent_msg = bob.send_text(chat.id, "moin").await;
-    alice.recv_msg(&sent_msg).await;
-
-    let contact = Contact::get_by_id(&alice, contact_id).await?;
-    assert!(contact.get_verifier_id(&alice).await?.is_none());
-
-    Ok(())
+    test_lookup_id_by_addr_recent_ext(accept_unencrypted_chat).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1349,13 +1370,11 @@ async fn test_import_vcard_key_change() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_self_is_verified() -> Result<()> {
+async fn test_self_is_key_contact() -> Result<()> {
     let mut tcm = TestContextManager::new();
     let alice = tcm.alice().await;
 
     let contact = Contact::get_by_id(&alice, ContactId::SELF).await?;
-    assert_eq!(contact.is_verified(&alice).await?, true);
-    assert!(contact.get_verifier_id(&alice).await?.is_none());
     assert!(contact.is_key_contact());
 
     Ok(())
@@ -1434,6 +1453,77 @@ async fn test_name_changes() -> Result<()> {
     bob.recv_msg(&sent_msg).await;
     let bob_alice_contact = Contact::get_by_id(bob, bob_alice_id).await?;
     assert_eq!(bob_alice_contact.get_display_name(), "Renamed");
+
+    Ok(())
+}
+
+/// Tests that ChatlistItemChanged event is not emitted if the same contact avatar is received.
+///
+/// We don't test ContactsChanged event because it is emitted in any case due to "last seen" update.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_same_avatar_no_changed_event() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+    let bob2 = &tcm.bob().await;
+
+    // Create chat with Bob.
+    // No messages will be sent to it,
+    // but it should be updated when Bob's avatar changes.
+    let alice_bob_chat = alice.create_chat(bob).await;
+
+    async fn wait_for_chatlist_event(context: &TestContext, expected_chat_id: ChatId) {
+        context
+            .evtracker
+            .get_matching(|evt| {
+                matches!(evt, EventType::ChatlistItemChanged { chat_id } if *chat_id == Some(expected_chat_id))
+            })
+            .await;
+    }
+
+    // One event is for adding E2EE notice ("Messages are end-to-end encrypted")
+    // and another event is for creating the chat itself.
+    wait_for_chatlist_event(alice, alice_bob_chat.id).await;
+    wait_for_chatlist_event(alice, alice_bob_chat.id).await;
+
+    // Create a group chat and single chat with Bob.
+    // Bob will send messages to group chat,
+    // but single chat should get ChatlistItemChanged event
+    // when avatar changes.
+    let alice_group_id = alice.create_group_with_members("test group", &[bob]).await;
+    let alice_sent_msg = alice.send_text(alice_group_id, "testing").await;
+    let bob_group_id = bob.recv_msg(&alice_sent_msg).await.chat_id;
+    bob_group_id.accept(bob).await?;
+    let bob2_group_id = bob2.recv_msg(&alice_sent_msg).await.chat_id;
+    bob2_group_id.accept(bob2).await?;
+
+    // Bob sets the same avatar on two devices at the same time.
+    // Receiving the same avatar should only emit the event about contact change once.
+    for profile in &[bob, bob2] {
+        let avatar_src = profile.get_blobdir().join("avatar.png");
+        tokio::fs::write(&avatar_src, test_utils::AVATAR_900x900_BYTES).await?;
+        profile
+            .set_config(Config::Selfavatar, Some(avatar_src.to_str().unwrap()))
+            .await?;
+    }
+
+    // Avatar is changed by a group message,
+    // so chatlist item for single chat should be refreshed.
+    let sent = bob.send_text(bob_group_id, "Avatar change").await;
+    alice.recv_msg(&sent).await;
+    wait_for_chatlist_event(alice, alice_bob_chat.id).await;
+
+    // Avatar is the same, so single chat is not updated.
+    let sent2 = bob2.send_text(bob2_group_id, "No avatar change").await;
+    alice.recv_msg(&sent2).await;
+    let event_opt = alice
+        .evtracker
+        .get_matching_opt(alice, |evt| {
+            matches!(evt, EventType::ChatlistItemChanged { chat_id } if *chat_id == Some(alice_bob_chat.id))
+        })
+        .await;
+    assert_eq!(event_opt, None);
 
     Ok(())
 }

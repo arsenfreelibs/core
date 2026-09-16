@@ -1,15 +1,11 @@
-use std::time::Duration;
-
 use deltachat_contact_tools::EmailAddress;
 use regex::Regex;
 
 use super::*;
-use crate::chat::{CantSendReason, add_contact_to_chat, remove_contact_from_chat};
+use crate::chat::{CantSendReason, ChatId, add_contact_to_chat, remove_contact_from_chat};
 use crate::chatlist::Chatlist;
 use crate::constants::Chattype;
-use crate::constants::DC_CHAT_ID_TRASH;
 use crate::key::self_fingerprint;
-use crate::mimeparser::{GossipedKey, SystemMessage};
 use crate::qr::Qr;
 use crate::receive_imf::receive_imf;
 use crate::stock_str::{self, messages_e2ee_info_msg};
@@ -17,7 +13,6 @@ use crate::test_utils::{
     AVATAR_64x64_BYTES, AVATAR_64x64_DEDUPLICATED, TestContext, TestContextManager,
     TimeShiftFalsePositiveNote, get_chat_msg, sync,
 };
-use crate::tools::SystemTime;
 
 #[derive(PartialEq)]
 enum SetupContactCase {
@@ -29,25 +24,26 @@ enum SetupContactCase {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_setup_contact_basic() {
-    test_setup_contact_ex(SetupContactCase::Normal).await
+    test_setup_contact_ext(SetupContactCase::Normal).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_setup_contact_wrong_alice_gossip() {
-    test_setup_contact_ex(SetupContactCase::WrongAliceGossip).await
+    let (alice, _) = test_setup_contact_ext(SetupContactCase::WrongAliceGossip).await;
+    alice.assert_warn("No self addr+pubkey gossip found").await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_setup_contact_alice_is_bot() {
-    test_setup_contact_ex(SetupContactCase::AliceIsBot).await
+    test_setup_contact_ext(SetupContactCase::AliceIsBot).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_setup_contact_alice_has_name() {
-    test_setup_contact_ex(SetupContactCase::AliceHasName).await
+    test_setup_contact_ext(SetupContactCase::AliceHasName).await;
 }
 
-async fn test_setup_contact_ex(case: SetupContactCase) {
+async fn test_setup_contact_ext(case: SetupContactCase) -> (TestContext, TestContext) {
     let _n = TimeShiftFalsePositiveNote;
 
     let mut tcm = TestContextManager::new();
@@ -63,13 +59,12 @@ async fn test_setup_contact_ex(case: SetupContactCase) {
     bob.set_config(Config::Displayname, Some("Bob Examplenet"))
         .await
         .unwrap();
-    let alice_auto_submitted_hdr: bool;
-    match case {
+    let alice_auto_submitted_hdr = match case {
         SetupContactCase::AliceIsBot => {
             alice.set_config_bool(Config::Bot, true).await.unwrap();
-            alice_auto_submitted_hdr = true;
+            true
         }
-        _ => alice_auto_submitted_hdr = false,
+        _ => false,
     };
 
     assert_eq!(
@@ -125,6 +120,8 @@ async fn test_setup_contact_ex(case: SetupContactCase) {
         "vc-request-pubkey"
     );
     assert!(msg.get_header(HeaderDef::SecureJoinAuth).is_some());
+    let encrypted_payload = String::from_utf8(msg.decoded_data.clone()).unwrap();
+    assert!(!encrypted_payload.contains("Bob Examplenet"));
     assert!(!msg.header_exists(HeaderDef::AutoSubmitted));
 
     tcm.section("Step 3: Alice receives vc-request-pubkey, sends vc-pubkey");
@@ -143,6 +140,8 @@ async fn test_setup_contact_ex(case: SetupContactCase) {
     let msg = bob.parse_msg(&sent).await;
     assert!(msg.was_encrypted());
     assert_eq!(msg.get_header(HeaderDef::SecureJoin).unwrap(), "vc-pubkey");
+    let encrypted_payload = String::from_utf8(msg.decoded_data.clone()).unwrap();
+    assert!(!encrypted_payload.contains("Alice Exampleorg"));
     assert_eq!(
         msg.get_header(HeaderDef::AutoSubmitted),
         alice_auto_submitted_hdr.then_some("auto-generated")
@@ -190,10 +189,7 @@ async fn test_setup_contact_ex(case: SetupContactCase) {
     );
 
     if case == SetupContactCase::WrongAliceGossip {
-        let wrong_pubkey = GossipedKey {
-            public_key: load_self_public_key(&bob).await.unwrap(),
-            verified: false,
-        };
+        let wrong_pubkey = load_self_public_key(&bob).await.unwrap();
         let alice_pubkey = msg
             .gossiped_keys
             .insert(alice_addr.to_string(), wrong_pubkey)
@@ -203,7 +199,6 @@ async fn test_setup_contact_ex(case: SetupContactCase) {
             .await
             .unwrap();
         assert_eq!(handshake_msg, HandshakeMessage::Ignore);
-        assert_eq!(contact_bob.is_verified(&alice).await.unwrap(), false);
 
         msg.gossiped_keys
             .insert(alice_addr.to_string(), alice_pubkey)
@@ -212,26 +207,23 @@ async fn test_setup_contact_ex(case: SetupContactCase) {
             .await
             .unwrap();
         assert_eq!(handshake_msg, HandshakeMessage::Ignore);
-        assert!(contact_bob.is_verified(&alice).await.unwrap());
-        return;
+        return (alice, bob);
     }
 
-    // Alice should not yet have Bob verified
     let contact_bob = alice.add_or_lookup_contact_no_key(&bob).await;
     let contact_bob_id = contact_bob.id;
     assert_eq!(contact_bob.is_key_contact(), true);
-    assert_eq!(contact_bob.is_verified(&alice).await.unwrap(), false);
     assert_eq!(contact_bob.get_authname(), "");
 
     tcm.section("Step 5+6: Alice receives vc-request-with-auth, sends vc-contact-confirm");
     alice.recv_msg_trash(&sent).await;
-    assert_eq!(contact_bob.is_verified(&alice).await.unwrap(), true);
+    assert_eq!(contact_bob.e2ee_avail(&alice).await.unwrap(), true);
     let contact_bob = Contact::get_by_id(&alice, contact_bob_id).await.unwrap();
     assert_eq!(contact_bob.get_authname(), "Bob Examplenet");
     assert!(contact_bob.get_name().is_empty());
     assert_eq!(contact_bob.is_bot(), false);
 
-    // exactly one one-to-one chat should be visible for both now
+    // exactly one single chat should be visible for both now
     // (check this before calling alice.get_chat() explicitly below)
     assert_eq!(
         Chatlist::try_load(&alice, 0, None, None)
@@ -245,7 +237,7 @@ async fn test_setup_contact_ex(case: SetupContactCase) {
         1
     );
 
-    // Check Alice got the verified message in her 1:1 chat.
+    // Check Alice got the message in her single chat.
     {
         let chat = alice.get_chat(&bob).await;
         let msg = get_chat_msg(&alice, chat.get_id(), 0, 1).await;
@@ -277,14 +269,14 @@ async fn test_setup_contact_ex(case: SetupContactCase) {
         "vc-contact-confirm"
     );
 
-    // Bob has verified Alice already.
+    // Bob has Alice's key already.
     //
-    // Alice may not have verified Bob yet.
-    assert_eq!(contact_alice.is_verified(&bob.ctx).await.unwrap(), true);
+    // Alice may not have Bob's key yet.
+    assert_eq!(contact_alice.e2ee_avail(&bob.ctx).await.unwrap(), true);
 
     // Step 7: Bob receives vc-contact-confirm
     bob.recv_msg_trash(&sent).await;
-    assert_eq!(contact_alice.is_verified(&bob.ctx).await.unwrap(), true);
+    assert_eq!(contact_alice.e2ee_avail(&bob.ctx).await.unwrap(), true);
     let contact_alice = Contact::get_by_id(&bob.ctx, contact_alice_id)
         .await
         .unwrap();
@@ -296,6 +288,8 @@ async fn test_setup_contact_ex(case: SetupContactCase) {
     let msg = get_chat_msg(&bob, bob_chat.get_id(), 0, 1).await;
     assert!(msg.is_info());
     assert_eq!(msg.get_text(), messages_e2ee_info_msg(&bob));
+
+    (alice, bob)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -303,6 +297,8 @@ async fn test_setup_contact_bad_qr() {
     let bob = TestContext::new_bob().await;
     let ret = join_securejoin(&bob.ctx, "not a qr code").await;
     assert!(ret.is_err());
+    bob.assert_warn("Unsupported QR type").await;
+    bob.assert_error("QR process failed").await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -352,13 +348,11 @@ async fn test_setup_contact_bob_knows_alice() -> Result<()> {
         bob_fp.hex()
     );
 
-    // Alice should not yet have Bob verified
     let contact_bob = alice.add_or_lookup_contact_no_key(bob).await;
-    assert_eq!(contact_bob.is_verified(alice).await?, false);
 
     tcm.section("Step 5+6: Alice receives vc-request-with-auth, sends vc-contact-confirm");
     alice.recv_msg_trash(&sent).await;
-    assert_eq!(contact_bob.is_verified(alice).await?, true);
+    assert_eq!(contact_bob.e2ee_avail(alice).await?, true);
 
     // Check Alice signalled success via the SecurejoinInviterProgress event.
     let event = alice
@@ -392,16 +386,14 @@ async fn test_setup_contact_bob_knows_alice() -> Result<()> {
         "vc-contact-confirm"
     );
 
-    // Bob has verified Alice already.
+    // Bob has Alice's key already.
     let contact_alice = bob.add_or_lookup_contact_no_key(alice).await;
-    assert_eq!(contact_alice.is_verified(bob).await?, true);
+    assert_eq!(contact_alice.e2ee_avail(bob).await?, true);
 
-    // Alice confirms that Bob is now verified.
-    //
     // This does not change anything for Bob.
     tcm.section("Step 7: Bob receives vc-contact-confirm");
     bob.recv_msg_trash(&sent).await;
-    assert_eq!(contact_alice.is_verified(bob).await?, true);
+    assert_eq!(contact_alice.e2ee_avail(bob).await?, true);
 
     Ok(())
 }
@@ -441,18 +433,18 @@ async fn test_setup_contact_concurrent_calls() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_secure_join_group_legacy() -> Result<()> {
-    test_secure_join_group_ex(false, false).await
+    test_secure_join_group_ext(false, false).await
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_secure_join_group_v3() -> Result<()> {
-    test_secure_join_group_ex(true, false).await
+    test_secure_join_group_ext(true, false).await
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_secure_join_group_v3_without_invite() -> Result<()> {
-    test_secure_join_group_ex(true, true).await
+    test_secure_join_group_ext(true, true).await
 }
 
-async fn test_secure_join_group_ex(v3: bool, remove_invite: bool) -> Result<()> {
+async fn test_secure_join_group_ext(v3: bool, remove_invite: bool) -> Result<()> {
     let mut tcm = TestContextManager::new();
     let alice = tcm.alice().await;
     let bob = tcm.bob().await;
@@ -486,6 +478,11 @@ async fn test_secure_join_group_ex(v3: bool, remove_invite: bool) -> Result<()> 
             "vg-request"
         }
     );
+    if !v3 {
+        // Legacy {vc,vg}-request should be sent as multipart/mixed
+        // to pass chatmail relay filters.
+        assert!(sent.payload.contains("Content-Type: multipart/mixed"));
+    }
     assert_eq!(msg.get_header(HeaderDef::SecureJoinAuth).is_some(), v3);
     assert_eq!(
         msg.get_header(HeaderDef::SecureJoinInvitenumber).is_some(),
@@ -555,13 +552,11 @@ async fn test_secure_join_group_ex(v3: bool, remove_invite: bool) -> Result<()> 
         bob_fp
     );
 
-    // Alice should not yet have Bob verified
     let contact_bob = alice.add_or_lookup_contact_no_key(&bob).await;
-    assert_eq!(contact_bob.is_verified(&alice).await?, false);
 
     tcm.section("Step 5+6: Alice receives vg-request-with-auth, sends vg-member-added");
     alice.recv_msg_trash(&sent).await;
-    assert_eq!(contact_bob.is_verified(&alice).await?, true);
+    assert_eq!(contact_bob.e2ee_avail(&alice).await?, true);
 
     // Check Alice signalled success via the SecurejoinInviterProgress event.
     let event = alice
@@ -603,7 +598,7 @@ async fn test_secure_join_group_ex(v3: bool, remove_invite: bool) -> Result<()> 
     assert!(msg.get_header(HeaderDef::AutocryptGossip).is_some());
 
     {
-        // Now Alice's chat with Bob should still be hidden, the verified message should
+        // Now Alice's chat with Bob should still be hidden, the member-added message should
         // appear in the group chat.
         if v3 {
             assert!(
@@ -616,7 +611,7 @@ async fn test_secure_join_group_ex(v3: bool, remove_invite: bool) -> Result<()> 
             assert_eq!(
                 chat.blocked,
                 Blocked::Yes,
-                "Alice's 1:1 chat with Bob is not hidden"
+                "Alice's single chat with Bob is not hidden"
             );
         }
 
@@ -629,22 +624,22 @@ async fn test_secure_join_group_ex(v3: bool, remove_invite: bool) -> Result<()> 
         assert_eq!(msg.get_text(), expected_text);
     }
 
-    // Bob has verified Alice already.
+    // Bob has Alice's key already.
     //
-    // Alice may not have verified Bob yet.
+    // Alice may not have Bob's key yet.
     let contact_alice = bob.add_or_lookup_contact_no_key(&alice).await;
-    assert_eq!(contact_alice.is_verified(&bob).await?, true);
+    assert_eq!(contact_alice.e2ee_avail(&bob).await?, true);
 
     tcm.section("Step 7: Bob receives vg-member-added");
     bob.recv_msg(&sent).await;
     {
-        // Bob has Alice verified, message shows up in the group chat.
-        assert_eq!(contact_alice.is_verified(&bob).await?, true);
+        // The message shows up in the group chat.
+        assert_eq!(contact_alice.e2ee_avail(&bob).await?, true);
         let chat = bob.get_chat(&alice).await;
         assert_eq!(
             chat.blocked,
             Blocked::Yes,
-            "Bob's 1:1 chat with Alice is not hidden"
+            "Bob's single chat with Alice is not hidden"
         );
         for item in chat::get_chat_msgs(&bob.ctx, bob_chatid).await.unwrap() {
             if let chat::ChatItem::Message { msg_id } = item {
@@ -663,12 +658,12 @@ async fn test_secure_join_group_ex(v3: bool, remove_invite: bool) -> Result<()> 
     assert_eq!(chat::get_chat_contacts(&bob, bob_chatid).await?.len(), 2);
 
     // On this "happy path", Alice and Bob get only a group-chat where all information are added to.
-    // The one-to-one chats are used internally for the hidden handshake messages,
+    // The single chats are used internally for the hidden handshake messages,
     // however, should not be visible in the UIs.
     assert_eq!(Chatlist::try_load(&alice, 0, None, None).await?.len(), 1);
     assert_eq!(Chatlist::try_load(&bob, 0, None, None).await?.len(), 1);
 
-    // If Bob then sends a direct message to alice, however, the one-to-one with Alice should appear.
+    // If Bob then sends a single chat message to alice, however, the single chat with Alice should appear.
     let bobs_chat_with_alice = bob.create_chat(&alice).await;
     let sent = bob.send_text(bobs_chat_with_alice.id, "Hello").await;
     alice.recv_msg(&sent).await;
@@ -680,18 +675,18 @@ async fn test_secure_join_group_ex(v3: bool, remove_invite: bool) -> Result<()> 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_secure_join_broadcast_legacy() -> Result<()> {
-    test_secure_join_broadcast_ex(false, false).await
+    test_secure_join_broadcast_ext(false, false).await
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_secure_join_broadcast_v3() -> Result<()> {
-    test_secure_join_broadcast_ex(true, false).await
+    test_secure_join_broadcast_ext(true, false).await
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_secure_join_broadcast_v3_without_invite() -> Result<()> {
-    test_secure_join_broadcast_ex(true, true).await
+    test_secure_join_broadcast_ext(true, true).await
 }
 
-async fn test_secure_join_broadcast_ex(v3: bool, remove_invite: bool) -> Result<()> {
+async fn test_secure_join_broadcast_ext(v3: bool, remove_invite: bool) -> Result<()> {
     let mut tcm = TestContextManager::new();
     let alice = &tcm.alice().await;
     let bob = &tcm.bob().await;
@@ -712,18 +707,18 @@ async fn test_secure_join_broadcast_ex(v3: bool, remove_invite: bool) -> Result<
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_setup_contact_compatibility_legacy() -> Result<()> {
-    test_setup_contact_compatibility_ex(false, false).await
+    test_setup_contact_compatibility_ext(false, false).await
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_setup_contact_compatibility_v3() -> Result<()> {
-    test_setup_contact_compatibility_ex(true, false).await
+    test_setup_contact_compatibility_ext(true, false).await
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_setup_contact_compatibility_v3_without_invite() -> Result<()> {
-    test_setup_contact_compatibility_ex(true, true).await
+    test_setup_contact_compatibility_ext(true, true).await
 }
 
-async fn test_setup_contact_compatibility_ex(v3: bool, remove_invite: bool) -> Result<()> {
+async fn test_setup_contact_compatibility_ext(v3: bool, remove_invite: bool) -> Result<()> {
     let mut tcm = TestContextManager::new();
     let alice = &tcm.alice().await;
     let bob = &tcm.bob().await;
@@ -787,6 +782,7 @@ First thread."#;
     let chat_id = msg.chat_id;
 
     assert!(get_securejoin_qr(&alice, Some(chat_id)).await.is_err());
+    alice.assert_error("Can't generate QR code").await;
     Ok(())
 }
 
@@ -819,11 +815,7 @@ async fn test_unknown_sender() -> Result<()> {
     Ok(())
 }
 
-/// Tests that Bob gets Alice as verified
-/// if `vc-contact-confirm` is lost.
-/// Previously `vc-contact-confirm` was used
-/// to confirm backward verification,
-/// but backward verification is not tracked anymore.
+/// Tests that Bob gets Alice's key if `vc-contact-confirm` is lost.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_lost_contact_confirm() {
     let mut tcm = TestContextManager::new();
@@ -845,16 +837,16 @@ async fn test_lost_contact_confirm() {
     let sent = bob.pop_sent_msg().await;
     alice.recv_msg_trash(&sent).await;
 
-    // Alice has Bob verified now.
+    // Alice has Bob's key now.
     let contact_bob = alice.add_or_lookup_contact_no_key(&bob).await;
-    assert_eq!(contact_bob.is_verified(&alice).await.unwrap(), true);
+    assert_eq!(contact_bob.e2ee_avail(&alice).await.unwrap(), true);
 
     // Alice sends vc-contact-confirm, but it gets lost.
     let _sent_vc_contact_confirm = alice.pop_sent_msg().await;
 
-    // Bob has alice as verified too, even though vc-contact-confirm is lost.
+    // Bob has Alice's key too, even though vc-contact-confirm is lost.
     let contact_alice = bob.add_or_lookup_contact_no_key(&alice).await;
-    assert_eq!(contact_alice.is_verified(&bob).await.unwrap(), true);
+    assert_eq!(contact_alice.e2ee_avail(&bob).await.unwrap(), true);
 }
 
 /// Tests Bob joining two groups by scanning two QR codes
@@ -961,7 +953,7 @@ async fn test_parallel_setup_contact(bob_deletes_fiona_contact: bool) -> Result<
 
         bob.recv_msg_trash(&sent_fiona_vc_contact_confirm).await;
         let bob_fiona_contact = Contact::get_by_id(bob, bob_fiona_contact_id).await.unwrap();
-        assert_eq!(bob_fiona_contact.is_verified(bob).await.unwrap(), true);
+        assert_eq!(bob_fiona_contact.e2ee_avail(bob).await.unwrap(), true);
     }
 
     // Alice gets online and previously started SecureJoin process finishes.
@@ -977,7 +969,14 @@ async fn test_parallel_setup_contact(bob_deletes_fiona_contact: bool) -> Result<
     bob.recv_msg_trash(&sent_alice_vc_contact_confirm).await;
     let bob_alice_contact_id = bob.add_or_lookup_contact_id(alice).await;
     let bob_alice_contact = Contact::get_by_id(bob, bob_alice_contact_id).await.unwrap();
-    assert_eq!(bob_alice_contact.is_verified(bob).await.unwrap(), true);
+    assert_eq!(bob_alice_contact.e2ee_avail(bob).await.unwrap(), true);
+
+    bob.assert_warn("Message does not match expected fingerprint")
+        .await;
+    if bob_deletes_fiona_contact {
+        bob.assert_warn("Message does not match expected fingerprint")
+            .await;
+    }
 
     Ok(())
 }
@@ -1007,9 +1006,7 @@ async fn test_wrong_auth_token() -> Result<()> {
 
     alice.recv_msg_trash(&sent).await;
 
-    let alice_bob_contact = alice.add_or_lookup_contact(bob).await;
-    assert!(!alice_bob_contact.is_verified(alice).await?);
-
+    alice.assert_warn("invalid auth code").await;
     Ok(())
 }
 
@@ -1076,123 +1073,6 @@ async fn test_send_avatar_in_securejoin() -> Result<()> {
             AVATAR_64x64_DEDUPLICATED
         );
     }
-
-    Ok(())
-}
-
-/// Tests that scanning a QR code week later
-/// allows Bob to establish a contact with Alice,
-/// but does not mark Bob as verified for Alice.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_expired_contact_auth_token() -> Result<()> {
-    let mut tcm = TestContextManager::new();
-    let alice = &tcm.alice().await;
-    let bob = &tcm.bob().await;
-
-    // Alice creates a QR code.
-    let qr = get_securejoin_qr(alice, None).await?;
-
-    // One week passes, QR code expires.
-    SystemTime::shift(Duration::from_secs(7 * 24 * 3600));
-
-    // Bob scans the QR code.
-    join_securejoin(bob, &qr).await?;
-
-    // vc-request
-    alice.recv_msg_trash(&bob.pop_sent_msg().await).await;
-
-    // vc-auth-requried
-    bob.recv_msg_trash(&alice.pop_sent_msg().await).await;
-
-    // vc-request-with-auth
-    alice.recv_msg_trash(&bob.pop_sent_msg().await).await;
-
-    // Bob should not be verified for Alice.
-    let contact_bob = alice.add_or_lookup_contact_no_key(bob).await;
-    assert_eq!(contact_bob.is_verified(alice).await.unwrap(), false);
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_expired_group_auth_token() -> Result<()> {
-    let mut tcm = TestContextManager::new();
-    let alice = &tcm.alice().await;
-    let bob = &tcm.bob().await;
-
-    let alice_chat_id = chat::create_group(alice, "Group").await?;
-
-    // Alice creates a group QR code.
-    let qr = get_securejoin_qr(alice, Some(alice_chat_id)).await.unwrap();
-
-    // One week passes, QR code expires.
-    SystemTime::shift(Duration::from_secs(7 * 24 * 3600));
-
-    // Bob scans the QR code.
-    join_securejoin(bob, &qr).await?;
-
-    // vg-request
-    alice.recv_msg_trash(&bob.pop_sent_msg().await).await;
-
-    // vg-auth-requried
-    bob.recv_msg_trash(&alice.pop_sent_msg().await).await;
-
-    // vg-request-with-auth
-    alice.recv_msg_trash(&bob.pop_sent_msg().await).await;
-
-    // vg-member-added
-    let bob_member_added_msg = bob.recv_msg(&alice.pop_sent_msg().await).await;
-    assert!(bob_member_added_msg.is_info());
-    assert_eq!(
-        bob_member_added_msg.get_info_type(),
-        SystemMessage::MemberAddedToGroup
-    );
-
-    // Bob should not be verified for Alice.
-    let contact_bob = alice.add_or_lookup_contact_no_key(bob).await;
-    assert_eq!(contact_bob.is_verified(alice).await.unwrap(), false);
-
-    Ok(())
-}
-
-/// Tests that old token is considered expired
-/// even if sync message just arrived.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_expired_synced_auth_token() -> Result<()> {
-    let mut tcm = TestContextManager::new();
-    let alice = &tcm.alice().await;
-    let alice2 = &tcm.alice().await;
-    let bob = &tcm.bob().await;
-
-    alice.set_config_bool(Config::SyncMsgs, true).await?;
-    alice2.set_config_bool(Config::SyncMsgs, true).await?;
-
-    // Alice creates a QR code on the second device.
-    let qr = get_securejoin_qr(alice2, None).await?;
-
-    alice2.send_sync_msg().await.unwrap();
-    let sync_msg = alice2.pop_sent_msg().await;
-
-    // One week passes, QR code expires.
-    SystemTime::shift(Duration::from_secs(7 * 24 * 3600));
-
-    alice.recv_msg_trash(&sync_msg).await;
-
-    // Bob scans the QR code.
-    join_securejoin(bob, &qr).await?;
-
-    // vc-request
-    alice.recv_msg_trash(&bob.pop_sent_msg().await).await;
-
-    // vc-auth-requried
-    bob.recv_msg_trash(&alice.pop_sent_msg().await).await;
-
-    // vc-request-with-auth
-    alice.recv_msg_trash(&bob.pop_sent_msg().await).await;
-
-    // Bob should not be verified for Alice.
-    let contact_bob = alice.add_or_lookup_contact_no_key(bob).await;
-    assert_eq!(contact_bob.is_verified(alice).await.unwrap(), false);
 
     Ok(())
 }
@@ -1373,6 +1253,10 @@ async fn test_qr_no_implicit_inviter_addition() -> Result<()> {
     let charlie_chat_contacts = chat::get_chat_contacts(charlie, charlie_chat_id).await?;
     assert_eq!(charlie_chat_contacts.len(), 2);
 
+    bob.assert_error("self not in group").await;
+    bob.assert_warn("the account is not part of the group/broadcast")
+        .await;
+
     Ok(())
 }
 
@@ -1509,7 +1393,7 @@ gU6dGXsFMe/RpRHrIAkMAaM5xkxMDRuRJDxiUdS/X+Y8
     let received = receive_imf(alice, payload.as_bytes(), false)
         .await?
         .unwrap();
-    assert_eq!(received.chat_id, DC_CHAT_ID_TRASH);
+    assert_eq!(received.chat_id, ChatId::TRASH);
 
     // Test that Alice sends vc-auth-required after processing vc-request.
     let sent = alice.pop_sent_msg().await;
@@ -1584,6 +1468,9 @@ async fn test_auth_token_is_synchronized() -> Result<()> {
         .unwrap();
     assert_eq!(auth_count, 2);
 
+    bob.assert_warn("Could not find symmetric secret for session key")
+        .await;
+    bob.assert_warn("unencrypted message").await;
     Ok(())
 }
 
@@ -1627,7 +1514,7 @@ async fn test_deduplicate_member_added() -> Result<()> {
 
     let bob_rcvd = bob.recv_msg(&sent1).await;
     assert_eq!(bob_rcvd.chat_id, bob_chat_id);
-    assert_eq!(bob_rcvd.text, "Member Me added by alice@example.org.");
+    assert_eq!(bob_rcvd.text, "You were added by alice@example.org.");
 
     // Second message is a no-op, so it is trashed.
     bob.recv_msg_trash(&sent2).await;

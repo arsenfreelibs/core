@@ -23,9 +23,6 @@ pub(crate) use post_msg_metadata::PostMsgMetadata;
 /// KiB).
 pub(crate) const PRE_MSG_ATTACHMENT_SIZE_THRESHOLD: u64 = 140_000;
 
-/// Max size for pre messages. A warning is emitted when this is exceeded.
-pub(crate) const PRE_MSG_SIZE_WARNING_THRESHOLD: usize = 150_000;
-
 /// Download state of the message.
 #[derive(
     Debug,
@@ -132,7 +129,7 @@ impl Message {
 }
 
 /// Actually downloads a message partially downloaded before if the message is available on the
-/// session transport, in which case returns `Some`. If the message is available on another
+/// session transport, in which case returns `Some`. If the message is not available on this
 /// transport, returns `None`.
 ///
 /// Most messages are downloaded automatically on fetch instead.
@@ -145,30 +142,27 @@ pub(crate) async fn download_msg(
     let row = context
         .sql
         .query_row_optional(
-            "SELECT uid, folder, transport_id FROM imap
+            "SELECT uid, folder FROM imap
              WHERE rfc724_mid=? AND target!=''
-             ORDER BY transport_id=? DESC LIMIT 1",
+             AND transport_id=?
+             LIMIT 1",
             (&rfc724_mid, transport_id),
             |row| {
                 let server_uid: u32 = row.get(0)?;
                 let server_folder: String = row.get(1)?;
-                let msg_transport_id: u32 = row.get(2)?;
-                Ok((server_uid, server_folder, msg_transport_id))
+                Ok((server_uid, server_folder))
             },
         )
         .await?;
 
-    let Some((server_uid, server_folder, msg_transport_id)) = row else {
-        // No IMAP record found, we don't know the UID and folder.
+    let Some((server_uid, server_folder)) = row else {
+        // No IMAP record found, the message is not available on this transport.
         delete_from_available_post_msgs(context, &rfc724_mid).await?;
-        return Err(anyhow!(
-            "IMAP location for {rfc724_mid:?} post-message is unknown"
-        ));
-    };
-    if msg_transport_id != transport_id {
         return Ok(None);
-    }
-    Box::pin(session.fetch_single_msg(context, &server_folder, server_uid, rfc724_mid)).await?;
+    };
+    session
+        .fetch_single_msg(context, &server_folder, server_uid, rfc724_mid)
+        .await?;
 
     let bcc_self = context.get_config_bool(Config::BccSelf).await?;
     if ephemeral::should_delete_all_downloaded_messages(bcc_self, session.is_chatmail()) {
@@ -209,7 +203,7 @@ impl Session {
         let (sender, receiver) = async_channel::unbounded();
         {
             let _fetch_msgs_lock_guard = context.fetch_msgs_mutex.lock().await;
-            self.fetch_many_msgs(context, folder, vec![uid], &uid_message_ids, sender)
+            Box::pin(self.fetch_many_msgs(context, folder, vec![uid], &uid_message_ids, sender))
                 .await?;
         }
         if receiver.recv().await.is_err() {
@@ -283,35 +277,39 @@ pub(crate) async fn download_msgs(context: &Context, session: &mut Session) -> R
         .await?;
 
     for rfc724_mid in &rfc724_mids {
-        let res = download_msg(context, rfc724_mid.clone(), session).await;
-        if let Ok(Some(())) = res {
-            delete_from_downloads(context, rfc724_mid).await?;
-            delete_from_available_post_msgs(context, rfc724_mid).await?;
-        }
-        if let Err(err) = res {
-            warn!(
-                context,
-                "Failed to download message rfc724_mid={rfc724_mid}: {:#}.", err
-            );
-            if !msg_is_downloaded_for(context, rfc724_mid).await? {
-                // This is probably a classical email that vanished before we could download it
-                warn!(
-                    context,
-                    "{rfc724_mid} download failed and there is no downloaded pre-message."
-                );
-                delete_from_downloads(context, rfc724_mid).await?;
-            } else if available_post_msgs_contains_rfc724_mid(context, rfc724_mid).await? {
-                warn!(
-                    context,
-                    "{rfc724_mid} is in available_post_msgs table but we failed to fetch it,
-                    so set the message to DownloadState::Failure - probably it was deleted on the server in the meantime"
-                );
-                set_state_to_failure(context, rfc724_mid).await?;
+        match download_msg(context, rfc724_mid.clone(), session).await {
+            Ok(Some(())) => {
                 delete_from_downloads(context, rfc724_mid).await?;
                 delete_from_available_post_msgs(context, rfc724_mid).await?;
-            } else {
-                // leave the message in DownloadState::InProgress;
-                // it will be downloaded once it arrives.
+            }
+            Ok(None) => {
+                // The message is not available on this transport.
+            }
+            Err(err) => {
+                warn!(
+                    context,
+                    "Failed to download message rfc724_mid={rfc724_mid}: {:#}.", err
+                );
+                if !msg_is_downloaded_for(context, rfc724_mid).await? {
+                    // This is probably a classical email that vanished before we could download it
+                    warn!(
+                        context,
+                        "{rfc724_mid} download failed and there is no downloaded pre-message."
+                    );
+                    delete_from_downloads(context, rfc724_mid).await?;
+                } else if available_post_msgs_contains_rfc724_mid(context, rfc724_mid).await? {
+                    warn!(
+                        context,
+                        "{rfc724_mid} is in available_post_msgs table but we failed to fetch it,
+                        so set the message to DownloadState::Failure - probably it was deleted on the server in the meantime"
+                    );
+                    set_state_to_failure(context, rfc724_mid).await?;
+                    delete_from_downloads(context, rfc724_mid).await?;
+                    delete_from_available_post_msgs(context, rfc724_mid).await?;
+                } else {
+                    // leave the message in DownloadState::InProgress;
+                    // it will be downloaded once it arrives.
+                }
             }
         }
     }
