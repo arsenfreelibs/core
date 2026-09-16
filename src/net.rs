@@ -160,7 +160,14 @@ pub(crate) async fn connect_tls_inner(
 /// If all connection attempts fail, returns the first error.
 ///
 /// This functions starts with one connection attempt and maintains
-/// up to five parallel connection attempts if connecting takes time.
+/// up to three parallel connection attempts if connecting takes time.
+///
+/// alt.chat fork: capped at three (upstream: five). Russia's ТСПУ DPI freezes
+/// a session when more than three parallel TLS handshakes hit the same SNI in a
+/// short window (one of three "Siberian" behavioural-module signals, June 2026).
+/// Under whitelist/blackhole conditions attempts don't RST but hang to TIMEOUT,
+/// so an aggressive fan-out reliably trips this. Keeping <=3 concurrent stays
+/// under the trigger while still trying every resolved IP.
 pub(crate) async fn run_connection_attempts<O, I, F>(mut futures: I) -> Result<O>
 where
     I: Iterator<Item = F>,
@@ -169,15 +176,14 @@ where
 {
     let mut connection_attempt_set = JoinSet::new();
 
-    // Start additional connection attempts after 300 ms, 1 s, 5 s and 10 s.
-    // This way we can have up to 5 parallel connection attempts at the same time.
+    // Start additional connection attempts after 700 ms and 1.5 s.
+    // This way we can have up to 3 parallel connection attempts at the same time.
+    // alt.chat fork: two ramp delays instead of four (see fn doc), and spaced
+    // >400 ms apart so at most one new handshake to a given SNI starts within any
+    // single ТСПУ detection window (~350-400 ms). Remaining resolved IPs are still
+    // tried, but only as earlier attempts fail or time out.
     let mut delay_set = JoinSet::new();
-    for delay in [
-        Duration::from_millis(300),
-        Duration::from_secs(1),
-        Duration::from_secs(5),
-        Duration::from_secs(10),
-    ] {
+    for delay in [Duration::from_millis(700), Duration::from_millis(1500)] {
         delay_set.spawn(tokio::time::sleep(delay));
     }
 
