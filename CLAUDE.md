@@ -62,6 +62,7 @@ grep -rn "Delta Chat\|DeltaChat\|delta\.chat\|deltachat\.org\|delta@merlinux\|su
 | `src/stock_str.rs` | update reminder + donate | `get.delta.chat` → `get.alt-chat.me`, `delta.chat/donate` → `alt-chat.me/donate` |
 | `src/webxdc/webxdc_tests.rs` | test assertion | must expect "requires a newer Alt Chat version" |
 | `src/receive_imf/receive_imf_tests.rs` | test assertion | must expect "using Alt Chat on multiple devices" |
+| `src/contact/contact_tests.rs` | `test_get_contacts` | fork matches `addr` as substring (`alice@` → 1 result, upstream expects 0); keep the fork expectation |
 
 ---
 

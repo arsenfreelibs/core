@@ -86,7 +86,9 @@ async fn test_get_contacts() -> Result<()> {
     assert_eq!(contacts.len(), 1);
     assert_eq!(contacts.first(), Some(&id));
 
-    // Search by address is case-insensitive, but only returns direct matches.
+    // Search by address is case-insensitive.
+    // Alt Chat fork: the address is matched as a substring (upstream: exact match only)
+    // so that users can find contacts by a partial nick such as `alice@`.
     let contacts = Contact::get_all(&context, 0, Some("alice@example.org")).await?;
     assert_eq!(contacts.len(), 1);
     assert_eq!(contacts.first(), Some(&id));
@@ -94,7 +96,8 @@ async fn test_get_contacts() -> Result<()> {
     assert_eq!(contacts.len(), 1);
     assert_eq!(contacts.first(), Some(&id));
     let contacts = Contact::get_all(&context, 0, Some("alice@")).await?;
-    assert_eq!(contacts.len(), 0);
+    assert_eq!(contacts.len(), 1);
+    assert_eq!(contacts.first(), Some(&id));
 
     let contacts = Contact::get_all(&context, 0, Some("Foobar")).await?;
     assert_eq!(contacts.len(), 0);
